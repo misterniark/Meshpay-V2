@@ -14,3 +14,7 @@ test_app/sdkconfig.old
 .DS_Store
 .vscode/
 
+# Notes agents — sorties du suivi git (claude-mem peut écraser ces fichiers)
+/AGENTS.md
+/CLAUDE.md
+
