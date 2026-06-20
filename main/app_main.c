@@ -1731,6 +1731,13 @@ static uint8_t meshpay_select_radio_bearer(const rns_packet_t *packet,
     if (packet == NULL) {
         return 0;
     }
+#if CONFIG_MESHPAY_FORCE_ESPNOW_ONLY
+    /* Bascule provisoire : tout le trafic Reticulum (announce + DAG) passe par
+     * ESP-NOW. Le bearer LoRa reste initialisé mais ne reçoit aucun paquet.
+     * Réversible via Kconfig (MESHPAY_FORCE_ESPNOW_ONLY=n). */
+    (void)packet;
+    return RNS_RADIO_BEARER_ESPNOW;
+#endif
     if (packet->packet_type == RNS_PACKET_TYPE_ANNOUNCE) {
         return RNS_RADIO_BEARER_ESPNOW;
     }
@@ -1902,9 +1909,15 @@ static bool init_radio_if_available(const rns_node_callbacks_t *callbacks)
     } else {
         s_radio_backend = "lora";
     }
+#if CONFIG_MESHPAY_FORCE_ESPNOW_ONLY
+    ESP_LOGI(TAG,
+             "Reticulum radio ready backend=%s policy=all:espnow (lora off)",
+             s_radio_backend);
+#else
     ESP_LOGI(TAG,
              "Reticulum radio ready backend=%s policy=discovery:espnow dag:lora",
              s_radio_backend);
+#endif
     return true;
 #else
     (void)callbacks;

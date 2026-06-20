@@ -8,4 +8,15 @@ config MESHPAY_DAG_MONITOR_ONLY
         frames, updates monitor counters, and does not initialize the wallet
         runtime or Reticulum node transmitter path.
 
+config MESHPAY_FORCE_ESPNOW_ONLY
+    bool "Force all Reticulum traffic over ESP-NOW (temporary)"
+    depends on MESHPAY_RADIO_ESPNOW_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW
+    default n
+    help
+        Temporary override: route every Reticulum packet (announce and DAG
+        sync) over ESP-NOW only. The LoRa bearer stays initialized but never
+        carries traffic. Reversible by disabling this option (the default
+        announce:ESP-NOW / DAG:LoRa policy then resumes). Intended for the
+        Waveshare ESP32-S3 hybrid profile.
+
 endmenu
