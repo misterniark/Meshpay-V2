@@ -1,0 +1,43 @@
+{
+  "schema": "meshpay-rns-fixtures-v1",
+  "source": "local-port-c-fixtures",
+  "status": "local-port-generated",
+  "vectors": [
+    {
+      "name": "schema-canary-v1",
+      "kind": "schema_canary",
+      "hex": "4d50524e53465801"
+    },
+    {
+      "name": "meshpay-wallet-name-hash",
+      "kind": "destination_name_hash",
+      "full_name": "meshpay.wallet",
+      "hex": "049d9046c74de46b50a3"
+    },
+    {
+      "name": "meshpay-wallet-destination-hash",
+      "kind": "destination_hash",
+      "full_name": "meshpay.wallet",
+      "identity_private_hex": "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae3d55",
+      "hex": "8b61de206a0ebcae6542580479d843c4"
+    },
+    {
+      "name": "data-packet-type1-raw",
+      "kind": "packet_raw",
+      "hex": "0007101112131415161718191a1b1c1d1e1fab6869"
+    },
+    {
+      "name": "announce-meshpay-wallet-alice",
+      "kind": "announce_raw",
+      "random_hash_hex": "a0a1a2a3a4a5a6a7a8a9",
+      "app_data_hex": "416c696365",
+      "hex": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a700e2ce7c4b674427eab27ba820bcf6f0faebe68e09fe8564292114e41dc6a41049d9046c74de46b50a3a0a1a2a3a4a5a6a7a8a956f57401e5878bcdd07c2b87138188ac573715cb637b64477f433033ebcce39f10635e0d33c00521643d2a4679c9bbf97cc794059da2ab110d1eef3123075002416c696365"
+    },
+    {
+      "name": "encrypted-token-single",
+      "kind": "encrypted_token",
+      "plaintext_hex": "6d657368706179207265746963756c756d20656e637279707465642064617461",
+      "hex": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f000102030405060708090a0b0c0d0e0f4ac098edf465a84a53164515ddc1d0290c93981ce4d4654cd432b2a0026e0302b64f497ee1afdf078d906fbe616e86e22f656e98d479532c29aad69e185f7ff70dcbded7981af8d2219a39fc2a912678"
+    }
+  ]
+}

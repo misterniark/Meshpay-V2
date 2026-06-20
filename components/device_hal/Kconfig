@@ -1,0 +1,165 @@
+menu "MeshPay device HAL"
+
+choice MESHPAY_BOARD
+    prompt "MeshPay board profile"
+    default MESHPAY_BOARD_UNKNOWN
+
+    config MESHPAY_BOARD_UNKNOWN
+        bool "Unknown/generic board"
+
+    config MESHPAY_BOARD_CYD
+        bool "ESP32 CYD"
+
+    config MESHPAY_BOARD_WAVESHARE_S3_TOUCH
+        bool "Waveshare ESP32-S3 Touch LCD"
+
+    config MESHPAY_BOARD_LILYGO_T5S3_H752
+        bool "LilyGo T5 S3 Pro H752"
+endchoice
+
+choice MESHPAY_RADIO_BACKEND
+    prompt "Reticulum radio backend"
+    default MESHPAY_RADIO_ESPNOW
+
+    config MESHPAY_RADIO_DISABLED
+        bool "Disabled"
+
+    config MESHPAY_RADIO_ESPNOW
+        bool "ESP-NOW"
+
+    config MESHPAY_RADIO_LORA_UART
+        bool "LoRa UART raw/framed"
+
+    config MESHPAY_RADIO_LORA_CORE1262
+        bool "LoRa Core1262/SX1262 SPI"
+
+    config MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+        bool "ESP-NOW discovery + LoRa Core1262 DAG sync"
+endchoice
+
+config MESHPAY_ESPNOW_CHANNEL
+    int "ESP-NOW channel"
+    depends on MESHPAY_RADIO_ESPNOW || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    range 1 14
+    default 1
+
+config MESHPAY_LORA_UART_PORT
+    int "LoRa UART port"
+    depends on MESHPAY_RADIO_LORA_UART
+    range 0 2
+    default 1
+
+config MESHPAY_LORA_UART_TX_IO
+    int "LoRa UART TX GPIO"
+    depends on MESHPAY_RADIO_LORA_UART
+    default -1
+
+config MESHPAY_LORA_UART_RX_IO
+    int "LoRa UART RX GPIO"
+    depends on MESHPAY_RADIO_LORA_UART
+    default -1
+
+config MESHPAY_LORA_UART_BAUD
+    int "LoRa UART baud rate"
+    depends on MESHPAY_RADIO_LORA_UART
+    default 9600
+
+config MESHPAY_LORA_C1262_SPI_HOST
+    int "Core1262 SPI host"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    range 0 3
+    default 2
+
+config MESHPAY_LORA_C1262_PIN_SCK
+    int "Core1262 SCK GPIO"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    default 1
+
+config MESHPAY_LORA_C1262_PIN_MOSI
+    int "Core1262 MOSI GPIO"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    default 2
+
+config MESHPAY_LORA_C1262_PIN_MISO
+    int "Core1262 MISO GPIO"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    default 10
+
+config MESHPAY_LORA_C1262_PIN_NSS
+    int "Core1262 NSS/CS GPIO"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    default 4
+
+config MESHPAY_LORA_C1262_PIN_RESET
+    int "Core1262 RESET GPIO"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    default 5
+
+config MESHPAY_LORA_C1262_PIN_BUSY
+    int "Core1262 BUSY GPIO"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    default 6
+
+config MESHPAY_LORA_C1262_PIN_DIO1
+    int "Core1262 DIO1 GPIO"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    default 7
+
+config MESHPAY_LORA_C1262_PIN_RXEN
+    int "Core1262 RXEN GPIO"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    default 8
+
+config MESHPAY_LORA_C1262_PIN_TXEN
+    int "Core1262 TXEN GPIO"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    default 9
+
+config MESHPAY_LORA_C1262_PIN_AUX_CS
+    int "Shared SPI inactive CS GPIO"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    default -1
+    help
+        Optional chip-select on a device sharing the same SPI bus. Set to -1
+        when unused. On LilyGo H752 this is the SD card CS and must be held
+        high before LoRa transactions.
+
+config MESHPAY_LORA_C1262_FREQUENCY_HZ
+    int "Core1262 frequency in Hz"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    default 868100000
+
+config MESHPAY_LORA_C1262_TCXO_CTRL_VOLTAGE
+    int "Core1262 TCXO DIO3 voltage enum"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    range 0 7
+    default 2
+    help
+        Semtech SX126x DIO3 TCXO voltage enum: 2 means 1.8 V, 4 means
+        2.4 V. Waveshare Core1262 uses 1.8 V; LilyGo H752 examples use 2.4 V.
+
+config MESHPAY_LORA_C1262_CALIBRATE_IMAGE
+    bool "Core1262 image calibration during boot"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    default y
+    help
+        Include the SX126x image block in the boot-time Calibrate command.
+        Disable for boards where this block leaves BUSY asserted during
+        bring-up; the monitor can still use LoRa RX with the remaining
+        oscillator, PLL, and ADC calibration blocks.
+
+config MESHPAY_LORA_C1262_TX_POWER_DBM
+    int "Core1262 TX power dBm"
+    depends on MESHPAY_RADIO_LORA_CORE1262 || MESHPAY_RADIO_ESPNOW_LORA_CORE1262
+    default 14
+
+config MESHPAY_LILYGO_H752_TPS65185
+    bool "Enable TPS65185 writes on LilyGo H752"
+    depends on MESHPAY_BOARD_LILYGO_T5S3_H752
+    default n
+    help
+        Keep this disabled for the original H752 board. The H752-01 revision
+        adds a TPS65185 e-paper power chip, while the original H752 power path
+        must not blindly write TPS65185 registers to I2C address 0x6B.
+
+endmenu

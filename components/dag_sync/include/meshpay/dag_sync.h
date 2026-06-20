@@ -1,0 +1,71 @@
+#pragma once
+
+#include "esp_err.h"
+#include "meshpay/dag.h"
+#include "meshpay/rns/rns_resource.h"
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define MESHPAY_DAG_SYNC_MSG_SUMMARY 0x31
+#define MESHPAY_DAG_SYNC_MSG_REQUEST 0x32
+#define MESHPAY_DAG_SYNC_REQUEST_MIN_SIZE 3
+#define MESHPAY_DAG_SYNC_REQUEST_WITH_SOURCE_SIZE \
+    (MESHPAY_DAG_SYNC_REQUEST_MIN_SIZE + MESHPAY_TX_DESTINATION_HASH_SIZE)
+#define MESHPAY_DAG_SYNC_MAX_TIPS 2
+#define MESHPAY_DAG_SYNC_BATCH_MAX_SIZE RNS_RESOURCE_MAX_DATA_SIZE
+
+typedef struct {
+    uint16_t tx_count;
+    uint8_t tip_count;
+    uint8_t tips[MESHPAY_DAG_SYNC_MAX_TIPS][MESHPAY_TX_ID_SIZE];
+} meshpay_dag_sync_summary_t;
+
+esp_err_t meshpay_dag_sync_build_summary(
+    const meshpay_dag_t *dag,
+    const uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    rns_packet_t *packet);
+esp_err_t meshpay_dag_sync_parse_summary(const rns_packet_t *packet,
+                                         meshpay_dag_sync_summary_t *summary);
+
+esp_err_t meshpay_dag_sync_build_request(
+    const meshpay_dag_t *local_dag,
+    const uint8_t peer[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    rns_packet_t *packet);
+esp_err_t meshpay_dag_sync_build_request_from(
+    const meshpay_dag_t *local_dag,
+    const uint8_t peer[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    const uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    rns_packet_t *packet);
+esp_err_t meshpay_dag_sync_build_request_from_count(
+    uint16_t known_count,
+    const uint8_t peer[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    const uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    rns_packet_t *packet);
+esp_err_t meshpay_dag_sync_request_known_count(const rns_packet_t *packet,
+                                               uint16_t *known_count);
+esp_err_t meshpay_dag_sync_request_source(
+    const rns_packet_t *packet,
+    uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    bool *has_source);
+
+esp_err_t meshpay_dag_sync_build_batch_resource(
+    const meshpay_dag_t *source_dag,
+    uint16_t start_index,
+    const rns_link_t *link,
+    rns_packet_t *packets,
+    size_t max_packets,
+    size_t *packet_count);
+
+esp_err_t meshpay_dag_sync_apply_batch(meshpay_dag_t *target_dag,
+                                       const uint8_t *batch,
+                                       size_t batch_len,
+                                       size_t *merged_count);
+
+#ifdef __cplusplus
+}
+#endif

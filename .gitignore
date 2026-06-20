@@ -1,0 +1,16 @@
+# ESP-IDF build outputs
+build/
+build-*/
+test_app/build/
+test_app/build-*/
+
+# Generated ESP-IDF configuration
+sdkconfig
+sdkconfig.old
+test_app/sdkconfig
+test_app/sdkconfig.old
+
+# Local editor and OS files
+.DS_Store
+.vscode/
+

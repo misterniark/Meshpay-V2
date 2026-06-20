@@ -1,0 +1,11 @@
+menu "MeshPay application"
+
+config MESHPAY_DAG_MONITOR_ONLY
+    bool "DAG monitor only"
+    default n
+    help
+        Build a read-only DAG monitor application. The app listens to LoRa
+        frames, updates monitor counters, and does not initialize the wallet
+        runtime or Reticulum node transmitter path.
+
+endmenu
