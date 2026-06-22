@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture simultanee des 4 cartes de test MeshPayV2.
+"""Capture simultanee des cartes de test MeshPayV2.
 Reset DTR/RTS de chaque port puis log horodate + prefixe par alias.
 A lancer dans l'env IDF (pyserial dispo) :
   source ~/.espressif/v5.4.3/esp-idf/export.sh
@@ -9,8 +9,12 @@ Options :
   --no-reset  ne PAS rebooter les cartes (DTR/RTS) : capture l'etat courant
               sans perdre la DAG en RAM. Utile pour observer des paiements
               en direct ou un reseau deja convergent.
+Variable d'env :
+  QUAD_PORTS  override des ports, format "alias:/dev/xxx,alias2:/dev/yyy".
+              Utile quand une carte revient sur un autre numero apres
+              re-branchement, ou pour ne capturer qu'un sous-ensemble.
 """
-import sys, time, threading
+import sys, os, time, threading
 import serial
 
 PORTS = {
@@ -19,6 +23,11 @@ PORTS = {
     "orque-curieux": "/dev/cu.usbmodem11301",
     "castor-precis": "/dev/cu.usbmodem11401",
 }
+# Override possible des ports via la variable d'env QUAD_PORTS (voir docstring).
+_override = os.environ.get("QUAD_PORTS")
+if _override:
+    PORTS = dict(kv.split(":", 1) for kv in _override.split(",") if ":" in kv)
+
 # Parsing souple : flag --no-reset/noreset n'importe ou, 1er arg numerique = duree.
 _args = sys.argv[1:]
 NO_RESET = any(a in ("--no-reset", "noreset") for a in _args)
