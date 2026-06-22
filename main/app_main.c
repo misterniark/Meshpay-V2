@@ -1653,6 +1653,17 @@ static void dag_summary_task(void *arg)
                      "periodic DAG summary queue failed: %s",
                      esp_err_to_name(err));
         }
+        if (xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+            uint8_t dag_digest[RNS_CRYPTO_SHA256_SIZE];
+            size_t dag_n = meshpay_dag_count(&s_app.dag);
+            esp_err_t digest_err = meshpay_dag_digest(&s_app.dag, dag_digest);
+            xSemaphoreGive(s_runtime.lock);
+            if (digest_err == ESP_OK) {
+                ESP_LOGI(TAG, "dag_digest=%02x%02x%02x%02x count=%u",
+                         dag_digest[0], dag_digest[1], dag_digest[2], dag_digest[3],
+                         (unsigned)dag_n);
+            }
+        }
         vTaskDelay(pdMS_TO_TICKS(MESHPAY_DAG_SUMMARY_INTERVAL_MS));
     }
 }
