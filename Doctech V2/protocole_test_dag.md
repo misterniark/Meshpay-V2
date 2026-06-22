@@ -173,6 +173,22 @@ P1.fin| LES 4       | 4     | bdaf111a   | CONVERGENCE OUI ~59 s, stable 60 s ; 
 
 **Verdict P1 (propagation MINT) : RÉUSSITE** — critère atteint (même `dag_digest=bdaf111a` / `N=4` sur les 4, dans le délai de stabilisation). Aucun `merge=CONFLICT`. Reste à couvrir : paiements TRANSFER tactiles + soldes. Log brut : `/tmp/phase1_cap.log`.
 
+### 11.2 Run 2026-06-22 — Phase 1 complément (paiements TRANSFER tactiles)
+
+- **Build** : `883dc41` (main). Capture `quad_capture.py --no-reset` (sans reboot) ~557 s pendant les paiements tactiles, puis **75 s de stabilisation passive** (clé : conclure APRÈS le délai de stabilisation, pas à l'instant du dernier clic).
+- **Méthode** : 10 paiements TRANSFER aboutis (montants 2-5) émis depuis les 4 cartes.
+
+```
+Étape  | portée | dag=N | dag_digest | log notable
+-------+--------+-------+------------+-------------
+P1b.0  | 4      | 4     | bdaf111a   | etat post-MINT (cf. 11.1)
+P1b.tx | divers | 5→14  | (varie)    | 10 payment received (montants 2-5), 4 emetteurs distincts
+P1b.rej| 2 rej  | --    | --         | merge=3 MISSING_PARENT (transitoire, re-accepte) ; currency=6 (definitif)
+P1b.fin| LES 4  | 14    | d5fbea51   | CONVERGENCE OUI, stable 75s ; 14 = 4 MINT + 10 TRANSFER valides
+```
+
+**Verdict complément P1 : RÉUSSITE.** Les 4 convergent vers `d5fbea51` / `N=14`. Anti-double-dépense vérifiée : le paiement invalide (`currency=6`, sur-dépense) n'entre dans aucune DAG (pas de `count=15`) ; le rejet `MISSING_PARENT` était transitoire (ré-accepté après propagation du parent). **Soldes à confirmer visuellement** (non loggés par le firmware). Logs bruts : `/tmp/phase1_pay.log`, `/tmp/phase1_stab.log`.
+
 ## 12. Notes & pièges
 
 - **LoRa désactivé** (`policy=all:espnow`) : tout passe en ESP-NOW. Ne pas conclure sur la propagation LoRa ici.
