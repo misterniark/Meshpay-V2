@@ -156,6 +156,23 @@ P2.F1 | …     |      |       |            | reject verify ?
 …
 ```
 
+### 11.1 Run 2026-06-22 — Phase 1 (propagation des MINT, sans paiements tactiles)
+
+- **Build honnête** : `883dc41` (main) — `policy=all:espnow`, log `dag_digest` actif. **Injecteur** : n/a (différé).
+- **Méthode** : `esptool erase_region 0x9000 0x6000 --force` (partition `nvs`) sur les 4 → identités neuves + 1 boot-credit MINT par carte ; capture `quad_capture.py 120`.
+- **Couverture** : propagation des 4 MINT auto (cœur « une TX émise n'importe où atteint toutes »). **Étape 3 (15-20 paiements TRANSFER tactiles + vérif soldes/fees) NON exécutée** — pas d'accès tactile ni de console série.
+
+```
+Étape | portée      | dag=N | dag_digest | log notable
+------+-------------+-------+------------+-------------
+P1.0  | 4 cartes    | 1     | distinct   | boot credit restored=10 ; policy=all:espnow ; peers=3
+P1.a  | doux+sobre  | 2     | bd0c4d25   | 2 MINT mergés (~12-28 s)
+P1.b  | +orque      | 3     | 2f1724e4   | 3 MINT mergés (~29-44 s)
+P1.fin| LES 4       | 4     | bdaf111a   | CONVERGENCE OUI ~59 s, stable 60 s ; 0 conflit/rejet
+```
+
+**Verdict P1 (propagation MINT) : RÉUSSITE** — critère atteint (même `dag_digest=bdaf111a` / `N=4` sur les 4, dans le délai de stabilisation). Aucun `merge=CONFLICT`. Reste à couvrir : paiements TRANSFER tactiles + soldes. Log brut : `/tmp/phase1_cap.log`.
+
 ## 12. Notes & pièges
 
 - **LoRa désactivé** (`policy=all:espnow`) : tout passe en ESP-NOW. Ne pas conclure sur la propagation LoRa ici.
