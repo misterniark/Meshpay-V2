@@ -59,6 +59,36 @@ esp_err_t rns_resource_reassembler_accept(rns_resource_reassembler_t *reassemble
                                           size_t *written,
                                           bool *complete);
 
+/* Pool de reassembleurs : plusieurs Resource peuvent etre reassembles EN
+ * PARALLELE. Necessaire sous fork DAG, ou plusieurs pairs repondent au meme
+ * recepteur simultanement : leurs fragments s'entrelacent et, avec un
+ * reassembleur unique, chaque fragment d'un autre resource_id reinitialisait le
+ * reassemblage en cours (=> quasi aucun batch reassemble). Le pool route chaque
+ * fragment vers le slot de son resource_id (ou un slot libre, ou le LRU). */
+#ifndef RNS_RESOURCE_REASSEMBLER_POOL_SIZE
+#define RNS_RESOURCE_REASSEMBLER_POOL_SIZE 4
+#endif
+
+typedef struct {
+    rns_resource_reassembler_t slots[RNS_RESOURCE_REASSEMBLER_POOL_SIZE];
+    uint32_t last_used[RNS_RESOURCE_REASSEMBLER_POOL_SIZE]; /* tick LRU par slot */
+    uint32_t tick;                                          /* horloge logique */
+} rns_resource_reassembler_pool_t;
+
+void rns_resource_reassembler_pool_init(rns_resource_reassembler_pool_t *pool);
+
+/* Meme contrat que rns_resource_reassembler_accept, mais route le fragment vers
+ * le bon slot du pool. Slot choisi : (1) resource en cours correspondant, sinon
+ * (2) slot libre, sinon (3) slot le moins recemment utilise (son partiel est
+ * abandonne). Le slot est libere des que le resource est complet ou en erreur. */
+esp_err_t rns_resource_reassembler_pool_accept(
+    rns_resource_reassembler_pool_t *pool,
+    const rns_packet_t *packet,
+    uint8_t *data,
+    size_t data_len,
+    size_t *written,
+    bool *complete);
+
 #ifdef __cplusplus
 }
 #endif

@@ -89,7 +89,7 @@ typedef struct {
     TaskHandle_t reticulum_task;
     TaskHandle_t core_task;
     bool tasks_started;
-    rns_resource_reassembler_t dag_sync_reassembler;
+    rns_resource_reassembler_pool_t dag_sync_reassembler_pool;
     uint32_t dag_sync_merged;
     meshpay_storage_backend_t storage_backend;
     meshpay_storage_record_t storage_record;

@@ -5,7 +5,16 @@
 #include "esp_netif.h"
 #include "esp_now.h"
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
+
+/* Retry sur saturation de la file d'envoi ESP-NOW (ESP_ERR_ESPNOW_NO_MEM) : sous
+ * tempete de sync DAG la file interne se remplit ; un court delai laisse les
+ * callbacks d'envoi la vider. Evite de perdre des fragments (=> Resource
+ * incomplets => non-convergence). */
+#define MESHPAY_ESPNOW_SEND_RETRIES 6
+#define MESHPAY_ESPNOW_SEND_RETRY_DELAY_MS 3
 
 typedef struct {
     uint8_t data[MESHPAY_HAL_PACKET_MAX];
@@ -37,7 +46,15 @@ static esp_err_t espnow_send(void *ctx, const uint8_t *data, size_t len)
     if (len >= ESP_NOW_MAX_DATA_LEN) {
         return ESP_ERR_INVALID_SIZE;
     }
-    return esp_now_send(driver->config.peer, data, len);
+    esp_err_t err = ESP_ERR_ESPNOW_NO_MEM;
+    for (int attempt = 0; attempt < MESHPAY_ESPNOW_SEND_RETRIES; ++attempt) {
+        err = esp_now_send(driver->config.peer, data, len);
+        if (err != ESP_ERR_ESPNOW_NO_MEM) {
+            return err; /* succes ou erreur non transitoire */
+        }
+        vTaskDelay(pdMS_TO_TICKS(MESHPAY_ESPNOW_SEND_RETRY_DELAY_MS));
+    }
+    return err;
 }
 
 static esp_err_t espnow_recv(void *ctx,

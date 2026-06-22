@@ -1,6 +1,7 @@
 #include "meshpay/dag_sync.h"
 
 #include "esp_check.h"
+#include "esp_log.h"
 #include "meshpay/rns/rns_crypto.h"
 #include "meshpay/rns/rns_request_response.h"
 #include <stdlib.h>
@@ -270,7 +271,8 @@ static esp_err_t encode_batch(const meshpay_dag_t *source_dag,
                               uint16_t start_index,
                               uint8_t *batch,
                               size_t batch_size,
-                              size_t *batch_len)
+                              size_t *batch_len,
+                              uint16_t *next_index)
 {
     if (start_index > meshpay_dag_count(source_dag)) {
         return ESP_ERR_INVALID_ARG;
@@ -278,16 +280,27 @@ static esp_err_t encode_batch(const meshpay_dag_t *source_dag,
 
     size_t pos = 2;
     uint16_t count = 0;
-    for (size_t i = start_index; i < meshpay_dag_count(source_dag); ++i) {
+    size_t i = start_index;
+    for (; i < meshpay_dag_count(source_dag); ++i) {
         const meshpay_tx_t *tx = meshpay_dag_at(source_dag, i);
         uint8_t encoded[MESHPAY_TX_CBOR_MAX_SIZE];
         size_t encoded_len = 0;
         ESP_RETURN_ON_ERROR(meshpay_tx_encode(tx, encoded, sizeof(encoded),
                                               &encoded_len),
                             "dag_sync", "");
-        if (encoded_len > UINT16_MAX ||
-            pos + 2U + encoded_len > batch_size) {
+        if (encoded_len > UINT16_MAX) {
             return ESP_ERR_INVALID_SIZE;
+        }
+        /* Capacite du batch atteinte : on emet un chunk PARTIEL et on s'arrete.
+         * Le reste sera transfere par des Resource suivantes (pagination), ce
+         * qui leve le plafond ~29 tx/batch alors que la fenetre DAG est 250.
+         * Au moins 1 tx par chunk (une tx unique > capacite est impossible :
+         * CBOR <= 320 o << batch). */
+        if (pos + 2U + encoded_len > batch_size) {
+            if (count == 0) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            break;
         }
         put_u16(batch + pos, (uint16_t)encoded_len);
         pos += 2;
@@ -298,16 +311,20 @@ static esp_err_t encode_batch(const meshpay_dag_t *source_dag,
 
     put_u16(batch, count);
     *batch_len = pos;
+    if (next_index != NULL) {
+        *next_index = (uint16_t)i; /* 1re tx non encore envoyee (= count si fin) */
+    }
     return count == 0 ? ESP_ERR_NOT_FOUND : ESP_OK;
 }
 
-esp_err_t meshpay_dag_sync_build_batch_resource(
+esp_err_t meshpay_dag_sync_build_batch_resource_from(
     const meshpay_dag_t *source_dag,
     uint16_t start_index,
     const rns_link_t *link,
     rns_packet_t *packets,
     size_t max_packets,
-    size_t *packet_count)
+    size_t *packet_count,
+    uint16_t *next_index)
 {
     if (source_dag == NULL || link == NULL || packets == NULL ||
         packet_count == NULL) {
@@ -322,7 +339,8 @@ esp_err_t meshpay_dag_sync_build_batch_resource(
                                  start_index,
                                  batch,
                                  MESHPAY_DAG_SYNC_BATCH_MAX_SIZE,
-                                 &batch_len);
+                                 &batch_len,
+                                 next_index);
     if (err == ESP_OK) {
         err = rns_resource_create_packets(link,
                                           batch,
@@ -333,6 +351,23 @@ esp_err_t meshpay_dag_sync_build_batch_resource(
     }
     free(batch);
     return err;
+}
+
+esp_err_t meshpay_dag_sync_build_batch_resource(
+    const meshpay_dag_t *source_dag,
+    uint16_t start_index,
+    const rns_link_t *link,
+    rns_packet_t *packets,
+    size_t max_packets,
+    size_t *packet_count)
+{
+    return meshpay_dag_sync_build_batch_resource_from(source_dag,
+                                                      start_index,
+                                                      link,
+                                                      packets,
+                                                      max_packets,
+                                                      packet_count,
+                                                      NULL);
 }
 
 esp_err_t meshpay_dag_sync_apply_batch(meshpay_dag_t *target_dag,
@@ -394,6 +429,12 @@ esp_err_t meshpay_dag_sync_apply_batch(meshpay_dag_t *target_dag,
                 progress = true;
             } else if (result == MESHPAY_DAG_MERGE_CONFLICT ||
                        result == MESHPAY_DAG_MERGE_INVALID) {
+                /* DIAG : identifie la tx fautive (confirme H2 = rejet du batch
+                 * entier sur conflit (from,seq) ; revele le compte et le seq). */
+                ESP_LOGW("dag_sync",
+                         "apply_batch fatal result=%d seq=%u from=%02x%02x%02x%02x",
+                         (int)result, (unsigned)tx.seq,
+                         tx.from[0], tx.from[1], tx.from[2], tx.from[3]);
                 return ESP_ERR_INVALID_STATE;
             }
             /* DUPLICATE / MISSING_PARENT / FULL : non fatals (cf. ci-dessus). */

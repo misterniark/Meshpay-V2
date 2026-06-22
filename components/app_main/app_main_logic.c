@@ -487,7 +487,7 @@ esp_err_t meshpay_app_runtime_init(meshpay_app_runtime_t *runtime,
         meshpay_app_runtime_destroy(runtime);
         return ESP_ERR_NO_MEM;
     }
-    rns_resource_reassembler_init(&runtime->dag_sync_reassembler);
+    rns_resource_reassembler_pool_init(&runtime->dag_sync_reassembler_pool);
 
     runtime_refresh_depths(runtime);
     return ESP_OK;
@@ -713,6 +713,12 @@ static esp_err_t runtime_handle_dag_summary(meshpay_app_runtime_t *runtime,
     if (tips_known && summary.tx_count <= local_count) {
         return ESP_OK;
     }
+    /* Backoff anti-tempete : ne pas re-demander une sync a chaque summary de
+     * chaque pair tant qu'une requete recente est encore "en vol" (le batch a
+     * le temps d'arriver et d'etre applique). Reduit la saturation ESP-NOW. */
+    if (now_ms < runtime->dag_sync_quiet_until_ms) {
+        return ESP_OK;
+    }
 
     rns_packet_t request;
     ESP_RETURN_ON_ERROR(meshpay_dag_sync_build_request_from_count(
@@ -773,35 +779,53 @@ static esp_err_t runtime_handle_dag_request(meshpay_app_runtime_t *runtime,
     if (packets == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    size_t packet_count = 0;
-    err = meshpay_dag_sync_build_batch_resource(&runtime->app->dag,
-                                                known_count,
-                                                &link,
-                                                packets,
-                                                RNS_RESOURCE_MAX_FRAGMENTS,
-                                                &packet_count);
-    if (err == ESP_ERR_NOT_FOUND) {
-        free(packets);
-        return ESP_OK;
-    }
-    if (err != ESP_OK) {
-        free(packets);
-        return err;
-    }
-    ESP_LOGI(APP_RUNTIME_TAG,
-             "dag resource tx packets=%u start=%u to=%02x%02x%02x%02x",
-             (unsigned)packet_count,
-             (unsigned)known_count,
-             requester[0],
-             requester[1],
-             requester[2],
-             requester[3]);
-    for (size_t i = 0; i < packet_count; ++i) {
-        err = runtime->packet_tx(&packets[i], runtime->packet_tx_ctx);
+    /* Envoi PAGINE : la DAG peut depasser la capacite d'un seul batch (~29 tx)
+     * alors que la fenetre est 250. On emet plusieurs Resource (chunks), chacun
+     * reassemble en parallele cote recepteur grace au pool. Borne par requete
+     * pour ne pas saturer la radio ; le reste suit au prochain cycle de sync. */
+    uint16_t cursor = known_count;
+    uint16_t dag_count = (uint16_t)meshpay_dag_count(&runtime->app->dag);
+    unsigned chunks = 0;
+    for (; cursor < dag_count &&
+           chunks < MESHPAY_DAG_SYNC_MAX_CHUNKS_PER_REQUEST;
+         ++chunks) {
+        size_t packet_count = 0;
+        uint16_t next = cursor;
+        err = meshpay_dag_sync_build_batch_resource_from(&runtime->app->dag,
+                                                         cursor,
+                                                         &link,
+                                                         packets,
+                                                         RNS_RESOURCE_MAX_FRAGMENTS,
+                                                         &packet_count,
+                                                         &next);
+        if (err == ESP_ERR_NOT_FOUND) {
+            err = ESP_OK;
+            break;
+        }
         if (err != ESP_OK) {
             free(packets);
             return err;
         }
+        ESP_LOGI(APP_RUNTIME_TAG,
+                 "dag resource tx packets=%u start=%u next=%u to=%02x%02x%02x%02x",
+                 (unsigned)packet_count,
+                 (unsigned)cursor,
+                 (unsigned)next,
+                 requester[0],
+                 requester[1],
+                 requester[2],
+                 requester[3]);
+        for (size_t i = 0; i < packet_count; ++i) {
+            err = runtime->packet_tx(&packets[i], runtime->packet_tx_ctx);
+            if (err != ESP_OK) {
+                free(packets);
+                return err;
+            }
+        }
+        if (next <= cursor) { /* garde anti-boucle : progression obligatoire */
+            break;
+        }
+        cursor = next;
     }
     free(packets);
     return ESP_OK;
@@ -817,14 +841,16 @@ static esp_err_t runtime_handle_dag_resource(meshpay_app_runtime_t *runtime,
     }
     size_t batch_len = 0;
     bool complete = false;
-    esp_err_t err = rns_resource_reassembler_accept(
-        &runtime->dag_sync_reassembler,
+    esp_err_t err = rns_resource_reassembler_pool_accept(
+        &runtime->dag_sync_reassembler_pool,
         packet,
         batch,
         MESHPAY_DAG_SYNC_BATCH_MAX_SIZE,
         &batch_len,
         &complete);
     if (err != ESP_OK) {
+        ESP_LOGW(APP_RUNTIME_TAG,
+                 "dag resource accept err=%s", esp_err_to_name(err));
         free(batch);
         return err;
     }
@@ -832,6 +858,12 @@ static esp_err_t runtime_handle_dag_resource(meshpay_app_runtime_t *runtime,
         free(batch);
         return ESP_OK;
     }
+    /* DIAG (confirmation cause racine fork) : trace le reassemblage COMPLET.
+     * Distingue un echec de reassemblage (cette ligne absente alors que des
+     * `dag resource tx` arrivent => H3') d'un echec d'application (cette ligne
+     * presente + `apply err=...` ci-dessous => H2). */
+    ESP_LOGI(APP_RUNTIME_TAG,
+             "dag resource reassembled batch_len=%u", (unsigned)batch_len);
 
     size_t merged = 0;
     err = meshpay_dag_sync_apply_batch(&runtime->app->dag,
@@ -840,6 +872,9 @@ static esp_err_t runtime_handle_dag_resource(meshpay_app_runtime_t *runtime,
                                        &merged);
     free(batch);
     if (err != ESP_OK) {
+        ESP_LOGW(APP_RUNTIME_TAG,
+                 "dag resource apply err=%s batch_len=%u",
+                 esp_err_to_name(err), (unsigned)batch_len);
         return err;
     }
     runtime->dag_sync_merged += (uint32_t)merged;

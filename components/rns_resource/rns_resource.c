@@ -259,3 +259,83 @@ esp_err_t rns_resource_reassembler_accept(rns_resource_reassembler_t *reassemble
     *complete = true;
     return ESP_OK;
 }
+
+void rns_resource_reassembler_pool_init(rns_resource_reassembler_pool_t *pool)
+{
+    if (pool == NULL) {
+        return;
+    }
+    memset(pool, 0, sizeof(*pool));
+    for (size_t i = 0; i < RNS_RESOURCE_REASSEMBLER_POOL_SIZE; ++i) {
+        rns_resource_reassembler_init(&pool->slots[i]);
+    }
+}
+
+esp_err_t rns_resource_reassembler_pool_accept(
+    rns_resource_reassembler_pool_t *pool,
+    const rns_packet_t *packet,
+    uint8_t *data,
+    size_t data_len,
+    size_t *written,
+    bool *complete)
+{
+    if (pool == NULL || packet == NULL || data == NULL || complete == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *complete = false;
+    if (written != NULL) {
+        *written = 0;
+    }
+
+    /* Decodage prealable du fragment pour router vers le bon slot (le decodage
+     * sera refait par accept() ; c'est peu couteux et evite de dupliquer la
+     * logique de routage dans accept()). */
+    rns_resource_fragment_t fragment;
+    esp_err_t err = rns_resource_decode_fragment(packet, &fragment);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* 1) Slot d'un resource deja en cours qui correspond. */
+    size_t chosen = RNS_RESOURCE_REASSEMBLER_POOL_SIZE;
+    for (size_t i = 0; i < RNS_RESOURCE_REASSEMBLER_POOL_SIZE; ++i) {
+        if (same_resource(&pool->slots[i], &fragment)) {
+            chosen = i;
+            break;
+        }
+    }
+    /* 2) Sinon un slot libre. */
+    if (chosen == RNS_RESOURCE_REASSEMBLER_POOL_SIZE) {
+        for (size_t i = 0; i < RNS_RESOURCE_REASSEMBLER_POOL_SIZE; ++i) {
+            if (!pool->slots[i].active) {
+                chosen = i;
+                break;
+            }
+        }
+    }
+    /* 3) Sinon le slot le moins recemment utilise (son partiel est abandonne ;
+     * accept() le reinitialisera via start_resource()). */
+    if (chosen == RNS_RESOURCE_REASSEMBLER_POOL_SIZE) {
+        chosen = 0;
+        for (size_t i = 1; i < RNS_RESOURCE_REASSEMBLER_POOL_SIZE; ++i) {
+            if (pool->last_used[i] < pool->last_used[chosen]) {
+                chosen = i;
+            }
+        }
+    }
+
+    err = rns_resource_reassembler_accept(&pool->slots[chosen],
+                                          packet,
+                                          data,
+                                          data_len,
+                                          written,
+                                          complete);
+    pool->last_used[chosen] = ++pool->tick;
+
+    /* Libere le slot des que le resource aboutit (complet) ou echoue, pour le
+     * rendre disponible a un autre resource concurrent. */
+    if (*complete || err != ESP_OK) {
+        rns_resource_reassembler_init(&pool->slots[chosen]);
+    }
+    return err;
+}
