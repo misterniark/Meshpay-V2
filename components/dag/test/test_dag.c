@@ -161,3 +161,56 @@ TEST_CASE("dag checkpoint threshold is reached at two hundred txs", "[dag]")
                              meshpay_dag_count(&dag));
     TEST_ASSERT_TRUE(meshpay_dag_needs_checkpoint(&dag));
 }
+
+/* Helper : TX minimale identifiée par un octet de graine (digest ne lit que id). */
+static meshpay_tx_t mp_tx_with_id(uint8_t seed)
+{
+    meshpay_tx_t tx;
+    memset(&tx, 0, sizeof(tx));
+    memset(tx.id, seed, MESHPAY_TX_ID_SIZE);
+    return tx;
+}
+
+TEST_CASE("dag digest is identical for the same tx set in different order", "[dag]")
+{
+    meshpay_dag_t a, b;
+    meshpay_dag_init(&a);
+    meshpay_dag_init(&b);
+    meshpay_tx_t t1 = mp_tx_with_id(0x11);
+    meshpay_tx_t t2 = mp_tx_with_id(0x22);
+    meshpay_tx_t t3 = mp_tx_with_id(0x33);
+    a.transactions[0] = t1; a.transactions[1] = t2; a.transactions[2] = t3; a.count = 3;
+    b.transactions[0] = t3; b.transactions[1] = t1; b.transactions[2] = t2; b.count = 3;
+
+    uint8_t da[RNS_CRYPTO_SHA256_SIZE];
+    uint8_t db[RNS_CRYPTO_SHA256_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(&a, da));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(&b, db));
+    TEST_ASSERT_EQUAL_MEMORY(da, db, RNS_CRYPTO_SHA256_SIZE);
+}
+
+TEST_CASE("dag digest differs when one tx differs", "[dag]")
+{
+    meshpay_dag_t a, b;
+    meshpay_dag_init(&a);
+    meshpay_dag_init(&b);
+    a.transactions[0] = mp_tx_with_id(0x11); a.transactions[1] = mp_tx_with_id(0x22); a.count = 2;
+    b.transactions[0] = mp_tx_with_id(0x11); b.transactions[1] = mp_tx_with_id(0x99); b.count = 2;
+
+    uint8_t da[RNS_CRYPTO_SHA256_SIZE];
+    uint8_t db[RNS_CRYPTO_SHA256_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(&a, da));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(&b, db));
+    TEST_ASSERT_NOT_EQUAL(0, memcmp(da, db, RNS_CRYPTO_SHA256_SIZE));
+}
+
+TEST_CASE("dag digest of empty dag is deterministic", "[dag]")
+{
+    meshpay_dag_t a;
+    meshpay_dag_init(&a);
+    uint8_t d1[RNS_CRYPTO_SHA256_SIZE];
+    uint8_t d2[RNS_CRYPTO_SHA256_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(&a, d1));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(&a, d2));
+    TEST_ASSERT_EQUAL_MEMORY(d1, d2, RNS_CRYPTO_SHA256_SIZE);
+}

@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -49,6 +50,12 @@ meshpay_dag_merge_result_t meshpay_dag_get_tips(const meshpay_dag_t *dag,
                                                 size_t max_tips,
                                                 size_t *tip_count,
                                                 size_t *total_tips);
+
+/* Digest stable de l'ENSEMBLE des transactions (SHA-256 des id triés).
+ * Indépendant de l'ordre d'insertion : deux DAG de même contenu => même digest.
+ * Sert de critère de convergence pour les tests multi-devices. */
+esp_err_t meshpay_dag_digest(const meshpay_dag_t *dag,
+                             uint8_t out[RNS_CRYPTO_SHA256_SIZE]);
 
 #ifdef __cplusplus
 }

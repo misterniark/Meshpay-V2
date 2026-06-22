@@ -1,6 +1,7 @@
 #include "meshpay/dag.h"
 
 #include "meshpay/rns/rns_crypto.h"
+#include <stdlib.h>
 #include <string.h>
 
 static bool bytes_zero(const uint8_t *data, size_t len)
@@ -226,4 +227,37 @@ meshpay_dag_merge_result_t meshpay_dag_get_tips(const meshpay_dag_t *dag,
         *total_tips = total;
     }
     return MESHPAY_DAG_MERGE_OK;
+}
+
+/* Comparateur d'id pour qsort : ordre lexicographique des id (ensemble canonique). */
+static int mp_dag_cmp_id(const void *a, const void *b)
+{
+    const meshpay_tx_t *const *pa = (const meshpay_tx_t *const *)a;
+    const meshpay_tx_t *const *pb = (const meshpay_tx_t *const *)b;
+    return memcmp((*pa)->id, (*pb)->id, MESHPAY_TX_ID_SIZE);
+}
+
+esp_err_t meshpay_dag_digest(const meshpay_dag_t *dag,
+                             uint8_t out[RNS_CRYPTO_SHA256_SIZE])
+{
+    if (dag == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Scratch statique borné par la fenêtre DAG ; appelé sous s_runtime.lock
+     * côté firmware et séquentiellement en test => non-réentrant assumé. */
+    static uint8_t scratch[MESHPAY_DAG_MAX_TRANSACTIONS * MESHPAY_TX_ID_SIZE];
+    const meshpay_tx_t *ptrs[MESHPAY_DAG_MAX_TRANSACTIONS];
+
+    size_t n = dag->count;
+    if (n > MESHPAY_DAG_MAX_TRANSACTIONS) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        ptrs[i] = &dag->transactions[i];
+    }
+    qsort(ptrs, n, sizeof(ptrs[0]), mp_dag_cmp_id);
+    for (size_t i = 0; i < n; ++i) {
+        memcpy(scratch + i * MESHPAY_TX_ID_SIZE, ptrs[i]->id, MESHPAY_TX_ID_SIZE);
+    }
+    return rns_crypto_sha256(scratch, n * MESHPAY_TX_ID_SIZE, out);
 }
