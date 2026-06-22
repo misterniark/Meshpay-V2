@@ -187,7 +187,7 @@ P1b.rej| 2 rej  | --    | --         | merge=3 MISSING_PARENT (transitoire, re-a
 P1b.fin| LES 4  | 14    | d5fbea51   | CONVERGENCE OUI, stable 75s ; 14 = 4 MINT + 10 TRANSFER valides
 ```
 
-**Verdict complément P1 : RÉUSSITE.** Les 4 convergent vers `d5fbea51` / `N=14`. Anti-double-dépense vérifiée : le paiement invalide (`currency=6`, sur-dépense) n'entre dans aucune DAG (pas de `count=15`) ; le rejet `MISSING_PARENT` était transitoire (ré-accepté après propagation du parent). **Soldes : conservation vérifiée visuellement — somme des 4 wallets = 40 = total frappé** (4 boot-credits × 10), aucune valeur créée/détruite. Logs bruts : `/tmp/phase1_pay.log`, `/tmp/phase1_stab.log`.
+**Verdict complément P1 : RÉUSSITE.** Les 4 convergent vers `d5fbea51` / `N=14`. Anti-double-dépense vérifiée : le paiement invalide (`currency=6`, sur-dépense) n'entre dans aucune DAG (pas de `count=15`) ; le rejet `MISSING_PARENT` était transitoire (ré-accepté après propagation du parent). **Soldes : reconstruction comptable complète OK.** Mapping identité→carte par élimination (une carte ne reçoit jamais d'elle-même), puis `solde = 10 (boot) + reçus − émis` par identité : `d89a8145`=16, `63dc99b9`=12, `336e16cc`=6, `d8fd53cc`=6 — **exactement les 4 soldes affichés (Hibou 16, Aigle 12, Renard 6, Chamois 6), somme=40=total frappé**. Les soldes écran sont reproductibles depuis la DAG répliquée ⇒ aucun paiement perdu/double-compté, fee à effet net nul sur ces transferts. Logs bruts : `/tmp/phase1_pay.log`, `/tmp/phase1_stab.log`.
 
 ## 12. Notes & pièges
 
