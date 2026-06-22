@@ -217,6 +217,13 @@ dag request  tx to=d89a8145 known=0 delay=1799
 
 **Impact** : Phase 3 (catch-up) non testable tant que ce bug n'est pas corrigé. Prioritaire (règle projet : corriger une erreur avant de continuer). Logs bruts : `/tmp/p3_absent.log`, `/tmp/p3_stab3.log`.
 
+**Suite — fix #1 (commit `2bdfe90`, `apply_batch` multi-passes) : PROGRÈS PARTIEL, insuffisant.**
+`apply_batch` n'abandonne plus au 1er `MISSING_PARENT` (multi-passes ; `MISSING_PARENT`/`FULL` retentés, `CONFLICT`/`INVALID` fatals). Reflash des 4 + rejeu du fork (paiements concurrents) :
+- **Avant fix** : 0 `dag resource merged` (batch jamais applique). **Après fix : 11 merged** pendant les paiements → l'application multi-passes fonctionne (validé sur HW).
+- **MAIS** après 75 s de stabilisation, **toujours pas de convergence** : `loup-sobre 90963d06/12 · loup-doux c7d1e1e7/10 · orque 7792c52c/15 · castor adc6a3c6/9`, figé, **0 merged pendant la stab**, boucle `dag request … known=0` persistante, `tips=2`.
+- **2e cause confirmée = Cause B du diagnostic (NON corrigée)** : `known=0` systématique ⇒ diff de DAG mal calculé ⇒ le batch (`start=0`) renvoie surtout des DUPLICATE et **ne transfère pas les tx de l'AUTRE branche** ; la réconciliation par batch ne comble pas un fork bidirectionnel.
+- **À corriger (session dédiée)** : calcul du `known`/diff dans `app_main_logic.c` (`runtime_handle_dag_summary` ~L694-719, `runtime_handle_dag_request` ~L757) — baser le diff sur les tx réellement manquantes (pas un simple "tips connus ? oui/non"), et/ou `dag_sync.c:encode_batch` — envoyer le diff réel plutôt que toute la DAG depuis 0. Logs : `/tmp/fix_fork.log`, `/tmp/fix_fork_stab.log`.
+
 ## 12. Notes & pièges
 
 - **LoRa désactivé** (`policy=all:espnow`) : tout passe en ESP-NOW. Ne pas conclure sur la propagation LoRa ici.
