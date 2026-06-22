@@ -320,3 +320,74 @@ TEST_CASE("dag sync apply_batch still rejects a conflicting tx", "[dag_sync]")
                           meshpay_dag_sync_apply_batch(&dag, batch, batch_len, &merged));
     TEST_ASSERT_FALSE(meshpay_dag_contains(&dag, tx_b.id));
 }
+
+
+/* PAGINATION (revue #5) : une DAG dont l'encodage depasse un seul batch doit
+ * etre transferee en PLUSIEURS chunks Resource couvrant exactement [0, count)
+ * sans trou ni doublon ; un recepteur vide qui applique tous les chunks atteint
+ * le compte complet. Valide encode_batch (chunk partiel + next_index) et le
+ * chainage cursor->next. */
+TEST_CASE("dag sync build_batch_resource_from paginates a large dag", "[dag_sync]")
+{
+    uint8_t master[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t alice[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(master, sizeof(master), 0x10);
+    fill_sequence(alice, sizeof(alice), 0x40);
+
+    /* 100 MINT independants (sans parent) -> encodage tres au-dessus de la
+     * capacite d'un batch (~29 tx) => plusieurs chunks garantis. (from,seq)
+     * distincts (seq=i) => aucun conflit ; id distinct via id_seed. */
+    meshpay_dag_t src;
+    meshpay_dag_init(&src);
+    const uint32_t N = 100;
+    for (uint32_t i = 0; i < N; ++i) {
+        meshpay_tx_t tx;
+        make_tx(&tx, MESHPAY_TX_TYPE_MINT, (uint8_t)(0x10 + i), master, alice,
+                1000 + i, i, NULL, 0);
+        TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(&src, &tx));
+    }
+    TEST_ASSERT_EQUAL_UINT32(N, meshpay_dag_count(&src));
+
+    rns_link_t link;
+    make_active_link(&link);
+    meshpay_dag_t dst; /* recepteur vide */
+    meshpay_dag_init(&dst);
+
+    uint16_t cursor = 0;
+    size_t chunk_count = 0;
+    while (cursor < meshpay_dag_count(&src)) {
+        rns_packet_t packets[RNS_RESOURCE_MAX_FRAGMENTS];
+        size_t pc = 0;
+        uint16_t next = cursor;
+        TEST_ASSERT_EQUAL(ESP_OK,
+                          meshpay_dag_sync_build_batch_resource_from(
+                              &src, cursor, &link, packets,
+                              RNS_RESOURCE_MAX_FRAGMENTS, &pc, &next));
+        TEST_ASSERT_TRUE(pc >= 1);
+        TEST_ASSERT_TRUE(next > cursor); /* progression stricte (>=1 tx/chunk) */
+
+        /* Reassemblage du chunk puis application chez le recepteur. */
+        rns_resource_reassembler_t re;
+        rns_resource_reassembler_init(&re);
+        uint8_t batch[MESHPAY_DAG_SYNC_BATCH_MAX_SIZE];
+        size_t bl = 0;
+        bool complete = false;
+        for (size_t i = 0; i < pc; ++i) {
+            TEST_ASSERT_EQUAL(ESP_OK,
+                              rns_resource_reassembler_accept(
+                                  &re, &packets[i], batch, sizeof(batch),
+                                  &bl, &complete));
+        }
+        TEST_ASSERT_TRUE(complete);
+        size_t merged = 0;
+        TEST_ASSERT_EQUAL(ESP_OK,
+                          meshpay_dag_sync_apply_batch(&dst, batch, bl, &merged));
+        cursor = next;
+        chunk_count++;
+    }
+
+    TEST_ASSERT_TRUE(chunk_count >= 2);                    /* pagination effective */
+    TEST_ASSERT_EQUAL_UINT16(meshpay_dag_count(&src), cursor); /* couverture [0,count) */
+    TEST_ASSERT_EQUAL_UINT32(meshpay_dag_count(&src),
+                             meshpay_dag_count(&dst));     /* recepteur complet */
+}

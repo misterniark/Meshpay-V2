@@ -488,6 +488,7 @@ esp_err_t meshpay_app_runtime_init(meshpay_app_runtime_t *runtime,
         return ESP_ERR_NO_MEM;
     }
     rns_resource_reassembler_pool_init(&runtime->dag_sync_reassembler_pool);
+    runtime->dag_sync_send_offset = 0;
 
     runtime_refresh_depths(runtime);
     return ESP_OK;
@@ -727,10 +728,12 @@ static esp_err_t runtime_handle_dag_summary(meshpay_app_runtime_t *runtime,
                             runtime->app->local_destination,
                             &request),
                         "app_runtime", "");
+    /* Jitter reduit (50-550 ms) : echelonne les requetes des noeuds sans tenir
+     * trop longtemps le lock runtime pendant le vTaskDelay ci-dessous (revue #4). */
     uint32_t request_delay_ms =
-        250U + ((((uint32_t)runtime->app->local_destination[0] << 8) |
+        50U + ((((uint32_t)runtime->app->local_destination[0] << 8) |
                  (uint32_t)runtime->app->local_destination[1]) %
-                2000U);
+                500U);
     ESP_LOGI(APP_RUNTIME_TAG,
              "dag request tx to=%02x%02x%02x%02x known=%u delay=%u",
              packet->destination_hash[0],
@@ -783,8 +786,21 @@ static esp_err_t runtime_handle_dag_request(meshpay_app_runtime_t *runtime,
      * alors que la fenetre est 250. On emet plusieurs Resource (chunks), chacun
      * reassemble en parallele cote recepteur grace au pool. Borne par requete
      * pour ne pas saturer la radio ; le reste suit au prochain cycle de sync. */
-    uint16_t cursor = known_count;
     uint16_t dag_count = (uint16_t)meshpay_dag_count(&runtime->app->dag);
+    uint16_t base = known_count; /* < dag_count (garanti par le retour anticipe) */
+    uint16_t span = (uint16_t)(dag_count - base);
+    /* Offset rotatif (revue #1) : sous fork known=0 -> base=0, et la DAG peut
+     * depasser MAX_CHUNKS_PER_REQUEST. Sans rotation on renverrait toujours les
+     * memes premiers chunks ; la queue (ou resident les tips) ne serait jamais
+     * transferee -> tips jamais connus -> stall permanent. On demarre a un offset
+     * qui avance a chaque requete et couvre toute la plage [base, dag_count) au
+     * fil des cycles. Petite DAG (<= MAX_CHUNKS) : une requete couvre tout ->
+     * offset revient a 0 (comportement inchange, NO-OP). */
+    uint16_t offset = runtime->dag_sync_send_offset;
+    if (offset >= span) {
+        offset = 0;
+    }
+    uint16_t cursor = (uint16_t)(base + offset);
     unsigned chunks = 0;
     for (; cursor < dag_count &&
            chunks < MESHPAY_DAG_SYNC_MAX_CHUNKS_PER_REQUEST;
@@ -827,6 +843,10 @@ static esp_err_t runtime_handle_dag_request(meshpay_app_runtime_t *runtime,
         }
         cursor = next;
     }
+    /* Avance l'offset pour la prochaine requete ; revient a 0 quand la fin est
+     * atteinte (toute la plage [base, dag_count) couverte au fil des requetes). */
+    runtime->dag_sync_send_offset =
+        (cursor >= dag_count) ? 0U : (uint16_t)(cursor - base);
     free(packets);
     return ESP_OK;
 }

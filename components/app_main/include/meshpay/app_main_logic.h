@@ -91,6 +91,7 @@ typedef struct {
     bool tasks_started;
     rns_resource_reassembler_pool_t dag_sync_reassembler_pool;
     uint32_t dag_sync_merged;
+    uint16_t dag_sync_send_offset; /* rotation de la fenetre d'envoi de batch */
     meshpay_storage_backend_t storage_backend;
     meshpay_storage_record_t storage_record;
     bool has_storage;

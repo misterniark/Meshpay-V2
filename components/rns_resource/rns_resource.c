@@ -317,8 +317,12 @@ esp_err_t rns_resource_reassembler_pool_accept(
      * accept() le reinitialisera via start_resource()). */
     if (chosen == RNS_RESOURCE_REASSEMBLER_POOL_SIZE) {
         chosen = 0;
+        /* "moins recemment utilise" = plus grand age. Age = delta SIGNE par
+         * rapport au tick courant -> robuste au wrap de l'uint32 (revue #3). */
         for (size_t i = 1; i < RNS_RESOURCE_REASSEMBLER_POOL_SIZE; ++i) {
-            if (pool->last_used[i] < pool->last_used[chosen]) {
+            int32_t age_i = (int32_t)(pool->tick - pool->last_used[i]);
+            int32_t age_chosen = (int32_t)(pool->tick - pool->last_used[chosen]);
+            if (age_i > age_chosen) {
                 chosen = i;
             }
         }
@@ -332,9 +336,14 @@ esp_err_t rns_resource_reassembler_pool_accept(
                                           complete);
     pool->last_used[chosen] = ++pool->tick;
 
-    /* Libere le slot des que le resource aboutit (complet) ou echoue, pour le
-     * rendre disponible a un autre resource concurrent. */
-    if (*complete || err != ESP_OK) {
+    /* Libere le slot UNIQUEMENT a la completion. NE PAS liberer sur erreur
+     * (revue #2) : une erreur transitoire d'accept() (fragment duplique au
+     * payload different sous corruption, taille incoherente) detruirait sinon
+     * tout le partiel deja accumule d'un resource SAIN (memset), sapant la
+     * convergence. Un slot eventuellement bloque (rare : exige un fragment
+     * corrompu passant le CRC ESP-NOW) est recupere par l'eviction LRU des
+     * qu'un autre resource a besoin d'un slot. */
+    if (*complete) {
         rns_resource_reassembler_init(&pool->slots[chosen]);
     }
     return err;

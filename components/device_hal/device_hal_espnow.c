@@ -13,7 +13,7 @@
  * tempete de sync DAG la file interne se remplit ; un court delai laisse les
  * callbacks d'envoi la vider. Evite de perdre des fragments (=> Resource
  * incomplets => non-convergence). */
-#define MESHPAY_ESPNOW_SEND_RETRIES 6
+#define MESHPAY_ESPNOW_SEND_RETRIES 3
 #define MESHPAY_ESPNOW_SEND_RETRY_DELAY_MS 3
 
 typedef struct {
