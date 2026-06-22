@@ -348,33 +348,63 @@ esp_err_t meshpay_dag_sync_apply_batch(meshpay_dag_t *target_dag,
     }
 
     uint16_t count = get_u16(batch);
-    size_t pos = 2;
     size_t merged = 0;
-    for (uint16_t i = 0; i < count; ++i) {
-        if (pos + 2U > batch_len) {
+
+    /* Application MULTI-PASSES. Un batch peut contenir des tx dans un ordre non
+     * topologique du point de vue du recepteur (emission concurrente, branches
+     * de fork) : une tx enfant peut preceder son parent, ou un parent peut etre
+     * une tx d'une autre branche situee plus loin dans le batch. Appliquer en une
+     * seule passe et abandonner au premier MISSING_PARENT (ancien comportement)
+     * bloquait toute la reconciliation (0 tx integree, boucle infinie de re-sync).
+     *
+     * On reboucle donc tant qu'une passe parvient a integrer au moins une tx, en
+     * re-parsant le batch a chaque passe (evite un gros tampon de tx sur la pile).
+     * Au pire 'count' passes (1 tx applicable de plus par passe). Semantique des
+     * resultats de merge :
+     *   - OK            : nouvellement integree => progres.
+     *   - DUPLICATE     : deja presente => non bloquant, pas un progres.
+     *   - MISSING_PARENT/FULL : non fatals => retentes a la passe suivante (le
+     *     parent peut avoir ete integre entre-temps). Les MISSING_PARENT residuels
+     *     apres stabilisation sont laisses (seront combles par un futur batch).
+     *   - CONFLICT/INVALID : tx illegitime (double-depense, forme invalide) =>
+     *     fatal, on rejette tout le batch comme avant. */
+    bool progress = true;
+    for (uint16_t pass = 0; pass < count && progress; ++pass) {
+        progress = false;
+        size_t pos = 2;
+        for (uint16_t i = 0; i < count; ++i) {
+            if (pos + 2U > batch_len) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            uint16_t encoded_len = get_u16(batch + pos);
+            pos += 2;
+            if (encoded_len == 0 || pos + encoded_len > batch_len) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+
+            meshpay_tx_t tx;
+            ESP_RETURN_ON_ERROR(meshpay_tx_decode(batch + pos, encoded_len, &tx),
+                                "dag_sync", "");
+            pos += encoded_len;
+
+            meshpay_dag_merge_result_t result =
+                meshpay_dag_merge_tx(target_dag, &tx);
+            if (result == MESHPAY_DAG_MERGE_OK) {
+                merged++;
+                progress = true;
+            } else if (result == MESHPAY_DAG_MERGE_CONFLICT ||
+                       result == MESHPAY_DAG_MERGE_INVALID) {
+                return ESP_ERR_INVALID_STATE;
+            }
+            /* DUPLICATE / MISSING_PARENT / FULL : non fatals (cf. ci-dessus). */
+        }
+        /* Validation de format faite une fois, sur la passe complete initiale :
+         * tout le batch doit etre consomme exactement (pas d'octets en trop). */
+        if (pass == 0 && pos != batch_len) {
             return ESP_ERR_INVALID_SIZE;
         }
-        uint16_t encoded_len = get_u16(batch + pos);
-        pos += 2;
-        if (encoded_len == 0 || pos + encoded_len > batch_len) {
-            return ESP_ERR_INVALID_SIZE;
-        }
-
-        meshpay_tx_t tx;
-        ESP_RETURN_ON_ERROR(meshpay_tx_decode(batch + pos, encoded_len, &tx),
-                            "dag_sync", "");
-        pos += encoded_len;
-
-        meshpay_dag_merge_result_t result = meshpay_dag_merge_tx(target_dag, &tx);
-        if (result == MESHPAY_DAG_MERGE_OK) {
-            merged++;
-        } else if (result != MESHPAY_DAG_MERGE_DUPLICATE) {
-            return ESP_ERR_INVALID_STATE;
-        }
     }
-    if (pos != batch_len) {
-        return ESP_ERR_INVALID_SIZE;
-    }
+
     if (merged_count != NULL) {
         *merged_count = merged;
     }

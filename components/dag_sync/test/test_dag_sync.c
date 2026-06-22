@@ -215,3 +215,108 @@ TEST_CASE("dag sync catches up missing transactions through resource batch", "[d
     TEST_ASSERT_EQUAL_UINT32(3, meshpay_dag_count(&slow));
     TEST_ASSERT_TRUE(meshpay_dag_contains(&slow, tx2.id));
 }
+
+/* Encode un batch DAG-sync a la main, dans l'ordre exact du tableau fourni.
+ * Reproduit le format de encode_batch() (dag_sync.c) : [count u16 BE] puis,
+ * pour chaque tx, [len u16 BE][tx CBOR]. Sert a fabriquer un batch volontairement
+ * DESORDONNE (enfant avant parent), ce que build_batch_resource ne peut pas
+ * produire car une DAG est toujours topologiquement ordonnee. */
+static void encode_batch_manual(const meshpay_tx_t *txs, uint16_t n,
+                                uint8_t *batch, size_t batch_size,
+                                size_t *batch_len)
+{
+    size_t pos = 2;
+    for (uint16_t i = 0; i < n; ++i) {
+        uint8_t enc[MESHPAY_TX_CBOR_MAX_SIZE];
+        size_t enc_len = 0;
+        TEST_ASSERT_EQUAL(ESP_OK,
+                          meshpay_tx_encode(&txs[i], enc, sizeof(enc), &enc_len));
+        TEST_ASSERT_TRUE(pos + 2U + enc_len <= batch_size);
+        batch[pos] = (uint8_t)(enc_len >> 8);
+        batch[pos + 1] = (uint8_t)enc_len;
+        pos += 2;
+        memcpy(batch + pos, enc, enc_len);
+        pos += enc_len;
+    }
+    batch[0] = (uint8_t)(n >> 8);
+    batch[1] = (uint8_t)n;
+    *batch_len = pos;
+}
+
+/* Bug Phase 3 : sous emission concurrente, un noeud recoit un batch ou une tx
+ * enfant precede son parent (autre branche / ordre non topologique). L'ancien
+ * apply_batch abandonnait au 1er MISSING_PARENT (return ESP_ERR_INVALID_STATE),
+ * 0 tx integree, blocage. Le fix multi-passes doit appliquer les deux tx. */
+TEST_CASE("dag sync apply_batch applies out-of-order batch (child before parent)", "[dag_sync]")
+{
+    uint8_t master[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t alice[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t bob[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(master, sizeof(master), 0x10);
+    fill_sequence(alice, sizeof(alice), 0x40);
+    fill_sequence(bob, sizeof(bob), 0x70);
+
+    meshpay_tx_t parent_tx;
+    meshpay_tx_t child_tx;
+    make_tx(&parent_tx, MESHPAY_TX_TYPE_MINT, 0x20, master, alice, 1000, 0, NULL, 0);
+    uint8_t pref[1][MESHPAY_TX_PARENT_ID_SIZE];
+    memcpy(pref[0], parent_tx.id, MESHPAY_TX_PARENT_ID_SIZE);
+    make_tx(&child_tx, MESHPAY_TX_TYPE_TRANSFER, 0x50, alice, bob, 100, 1, pref, 1);
+
+    /* Batch volontairement desordonne : enfant AVANT parent. */
+    meshpay_tx_t ordered[2] = { child_tx, parent_tx };
+    uint8_t batch[MESHPAY_DAG_SYNC_BATCH_MAX_SIZE];
+    size_t batch_len = 0;
+    encode_batch_manual(ordered, 2, batch, sizeof(batch), &batch_len);
+
+    meshpay_dag_t dag;
+    meshpay_dag_init(&dag);
+    size_t merged = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_dag_sync_apply_batch(&dag, batch, batch_len, &merged));
+    TEST_ASSERT_EQUAL_UINT32(2, merged);
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&dag));
+    TEST_ASSERT_TRUE(meshpay_dag_contains(&dag, parent_tx.id));
+    TEST_ASSERT_TRUE(meshpay_dag_contains(&dag, child_tx.id));
+}
+
+/* Garde anti-regression : le fix multi-passes ne doit PAS rendre le merge
+ * permissif. Une tx en CONFLICT (meme from+seq qu'une tx locale, id different =
+ * double-depense) reste fatale : apply_batch doit echouer, pas l'integrer. */
+TEST_CASE("dag sync apply_batch still rejects a conflicting tx", "[dag_sync]")
+{
+    uint8_t master[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t alice[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t bob[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t carol[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(master, sizeof(master), 0x10);
+    fill_sequence(alice, sizeof(alice), 0x40);
+    fill_sequence(bob, sizeof(bob), 0x70);
+    fill_sequence(carol, sizeof(carol), 0xa0);
+
+    /* DAG cible : MINT puis un TRANSFER alice (seq=5). */
+    meshpay_tx_t tx0;
+    meshpay_tx_t tx_a;
+    make_tx(&tx0, MESHPAY_TX_TYPE_MINT, 0x20, master, alice, 1000, 0, NULL, 0);
+    uint8_t p0[1][MESHPAY_TX_PARENT_ID_SIZE];
+    memcpy(p0[0], tx0.id, MESHPAY_TX_PARENT_ID_SIZE);
+    make_tx(&tx_a, MESHPAY_TX_TYPE_TRANSFER, 0x50, alice, bob, 100, 5, p0, 1);
+
+    meshpay_dag_t dag;
+    meshpay_dag_init(&dag);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(&dag, &tx0));
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(&dag, &tx_a));
+
+    /* Batch contenant tx_b : meme from=alice + meme seq=5, id different => CONFLICT. */
+    meshpay_tx_t tx_b;
+    make_tx(&tx_b, MESHPAY_TX_TYPE_TRANSFER, 0x80, alice, carol, 120, 5, p0, 1);
+    meshpay_tx_t one[1] = { tx_b };
+    uint8_t batch[MESHPAY_DAG_SYNC_BATCH_MAX_SIZE];
+    size_t batch_len = 0;
+    encode_batch_manual(one, 1, batch, sizeof(batch), &batch_len);
+
+    size_t merged = 0;
+    TEST_ASSERT_NOT_EQUAL(ESP_OK,
+                          meshpay_dag_sync_apply_batch(&dag, batch, batch_len, &merged));
+    TEST_ASSERT_FALSE(meshpay_dag_contains(&dag, tx_b.id));
+}
