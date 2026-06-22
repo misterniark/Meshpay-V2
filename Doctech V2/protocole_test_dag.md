@@ -189,6 +189,34 @@ P1b.fin| LES 4  | 14    | d5fbea51   | CONVERGENCE OUI, stable 75s ; 14 = 4 MINT
 
 **Verdict complément P1 : RÉUSSITE.** Les 4 convergent vers `d5fbea51` / `N=14`. Anti-double-dépense vérifiée : le paiement invalide (`currency=6`, sur-dépense) n'entre dans aucune DAG (pas de `count=15`) ; le rejet `MISSING_PARENT` était transitoire (ré-accepté après propagation du parent). **Soldes : reconstruction comptable complète OK.** Mapping identité→carte par élimination (une carte ne reçoit jamais d'elle-même), puis `solde = 10 (boot) + reçus − émis` par identité : `d89a8145`=16, `63dc99b9`=12, `336e16cc`=6, `d8fd53cc`=6 — **exactement les 4 soldes affichés (Hibou 16, Aigle 12, Renard 6, Chamois 6), somme=40=total frappé**. Les soldes écran sont reproductibles depuis la DAG répliquée ⇒ aucun paiement perdu/double-compté, fee à effet net nul sur ces transferts. Logs bruts : `/tmp/phase1_pay.log`, `/tmp/phase1_stab.log`.
 
+### 11.3 Run 2026-06-22 — Phase 3 INTERROMPUE (bug de réconciliation de fork) ⚠️
+
+**Contexte** : 4 cartes convergées (`d5fbea51`/14). Débranchement de D = `loup-sobre` (port 11101, identité `336e16cc`). Les 3 restantes — `loup-doux`/Aigle (`63dc99b9`), `orque`/Hibou (`d89a8145`), `castor`/Renard (`d8fd53cc`) — devaient transacter puis converger à `N+M` (pré-condition du catch-up).
+
+**Constat = ÉCHEC de pré-condition.** Sous émission concurrente de paiements, la DAG des 3 a forké et n'a PAS reconvergé. État figé > 280 s (capture paiements + 180 s de stabilisation passive, sans action) :
+- `loup-doux` + `orque` → `8675a6c2` count=16 (convergées entre elles)
+- `castor` → **bloqué `02691624` count=15**, ne reconverge jamais.
+
+`loup-doux` et `castor` ont eu le **même count=15 mais des digests différents** ⇒ deux branches divergentes de même taille.
+
+**Logs exacts** (castor, en boucle ~toutes les 10 s pendant 180 s sans progresser) :
+```
+dag summary rx from=d89a8145 tx=16 tips=2 local=15 known=0
+dag request  tx to=d89a8145 known=0 delay=1799
+(orque/loup-doux) dag resource tx packets=8 start=0 to=d8fd53cc   ← 48 fois au total
+```
+- **48 `dag resource tx … to=d8fd53cc`** émis vers castor ; **0 `resource merged` côté castor** (il reçoit les packets, n'intègre rien).
+- 6× `payment reject merge=3` (MISSING_PARENT) sur les paiements entrants vers castor.
+
+**Cause probable (hypothèse, à confirmer dans le code)** :
+- castor est sur une branche (tx locale en pos. 15 absente chez les autres) et il lui manque les tx 15-16 des autres branches (`tips=2`).
+- `known=0` chez castor (vs `known=1` chez les convergées) : le **diff de DAG est mal calculé** ⇒ `dag request` inefficace ; le `Resource` reçu (8 packets depuis `start=0`) **n'est jamais appliqué** (réassemblage `rns_resource` qui échoue, ou merge du batch entièrement rejeté en duplicate/MISSING_PARENT).
+- Réconciliation de **tips multiples (fork)** défaillante sous charge concurrente.
+
+**Tentative de correction** : aucune encore — à diagnostiquer dans `dag_sync` (calcul de `known`, génération + application du batch `Resource`), `rns_resource` (réassemblage) et `dag` (merge avec tips multiples).
+
+**Impact** : Phase 3 (catch-up) non testable tant que ce bug n'est pas corrigé. Prioritaire (règle projet : corriger une erreur avant de continuer). Logs bruts : `/tmp/p3_absent.log`, `/tmp/p3_stab3.log`.
+
 ## 12. Notes & pièges
 
 - **LoRa désactivé** (`policy=all:espnow`) : tout passe en ESP-NOW. Ne pas conclure sur la propagation LoRa ici.
