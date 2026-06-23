@@ -742,8 +742,11 @@ static esp_err_t runtime_handle_dag_summary(meshpay_app_runtime_t *runtime,
              packet->destination_hash[3],
              tips_known ? (unsigned)local_count : 0U,
              (unsigned)request_delay_ms);
+    /* Backoff sans blocage : on arme la fenetre de silence (espace les requetes
+     * suivantes) mais on envoie CELLE-CI immediatement. Un vTaskDelay ici gelait
+     * la tache reticulum sous lock -> reticulum_queue saturee -> rx_queue saturee
+     * -> fragments entrants (dont les batches attendus) dropes silencieusement. */
     runtime->dag_sync_quiet_until_ms = now_ms + request_delay_ms + 3000U;
-    vTaskDelay(pdMS_TO_TICKS(request_delay_ms));
     return runtime->packet_tx(&request, runtime->packet_tx_ctx);
 }
 
