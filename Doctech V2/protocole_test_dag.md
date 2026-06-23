@@ -224,6 +224,48 @@ dag request  tx to=d89a8145 known=0 delay=1799
 - **2e cause confirmée = Cause B du diagnostic (NON corrigée)** : `known=0` systématique ⇒ diff de DAG mal calculé ⇒ le batch (`start=0`) renvoie surtout des DUPLICATE et **ne transfère pas les tx de l'AUTRE branche** ; la réconciliation par batch ne comble pas un fork bidirectionnel.
 - **À corriger (session dédiée)** : calcul du `known`/diff dans `app_main_logic.c` (`runtime_handle_dag_summary` ~L694-719, `runtime_handle_dag_request` ~L757) — baser le diff sur les tx réellement manquantes (pas un simple "tips connus ? oui/non"), et/ou `dag_sync.c:encode_batch` — envoyer le diff réel plutôt que toute la DAG depuis 0. Logs : `/tmp/fix_fork.log`, `/tmp/fix_fork_stab.log`.
 
+### 11.4 Run 2026-06-23 — RÉSOLU (convergence de fork validée au banc) ✅
+
+**Résultat** : sous émission concurrente (10 paiements acceptés, fork à 4 branches
+counts 8/9/12/14), les 4 cartes **convergent vers un même `dag_digest` =
+`56481e6c` count=14**, stable. `apply err=0`, `apply_batch fatal=0`,
+`reassembled==merged`. Baseline également propre (4× `bdaf111a/4`), matrice
+« qui entend qui » symétrique (chacun entend chacun 11-16×).
+
+**La cause n'était PAS « Cause B » (diff/`known`) comme supposé en §11.3** — elle
+était **multi-couches**, chaque couche révélée par instrumentation au banc :
+
+1. **Réassembleur unique partagé** (`rns_resource`) : sous fork, les fragments de
+   batches concurrents (resource_id différents) de plusieurs pairs s'entrelacent
+   et `start_resource()` (memset) réinitialise le réassemblage en cours → ~4,5 %
+   des batches aboutissaient. Fix : **pool de réassembleurs** (clé resource_id,
+   eviction LRU, libération à complétion seulement). Commit `330effa`/`52f5ffa`.
+2. **Perte de fragments RX** : `rx_queue` ESP-NOW profonde de **4** (drop
+   silencieux) alors qu'un batch fait 5-7 fragments ; aggravé par un
+   `vTaskDelay(≤550 ms)` tenu **sous lock** dans `handle_dag_summary` qui gelait la
+   tâche reticulum → files saturées → drop. Fix : `rx_queue` 4→32, files runtime
+   8→16, requête envoyée **sans `vTaskDelay`**. Commit `0fb1663`.
+3. **Diff positionnel faux (H1)** : `known=local_count` + découpage `[known,count)`
+   par **position**, or chaque nœud append dans son ordre de réception → mauvaises
+   tx envoyées. Un nœud restait bloqué à 1 MINT près même en baseline. Fix :
+   **digest (8 o) dans le SUMMARY** + détection de convergence par digest +
+   requête **toujours `known=0`**. Commit `8cb4a7b`.
+4. **Deadlock d'annonce** : le nœud détenant une tx unique requêtait sans cesse →
+   `quiet_until` armé → **son propre SUMMARY supprimé** → protocole pull → personne
+   ne tire sa tx. Le « device faible » tournait de run en run (= toujours le plus
+   requérant) ⇒ logiciel, pas matériel. Fix : **SUMMARY toujours diffusé** ;
+   `quiet_until` ne gate plus que les requêtes. Commit `297ea51`.
+5. Robustesse (revue adversariale) : pagination rotative des chunks (lève le
+   plafond ~29 tx/batch, fenêtre DAG = 250), retry ESP-NOW sur `NO_MEM`,
+   `apply_batch` multi-passes (commit `2bdfe90`).
+
+**Tests** : unitaires ajoutés dans `components/rns_resource/test/` (pool :
+entrelacement, isolation, surcharge) et `components/dag_sync/test/` (pagination,
+digest). Compilés via `test_app` (runner Unity cible-only).
+
+**Phase 3 (catch-up) et Phase 4 (merge) redeviennent testables.** Logs :
+`/tmp/quiet_fork_*.log`, `/tmp/quiet_boot_*.log`.
+
 ## 12. Notes & pièges
 
 - **LoRa désactivé** (`policy=all:espnow`) : tout passe en ESP-NOW. Ne pas conclure sur la propagation LoRa ici.
