@@ -1190,29 +1190,28 @@ static esp_err_t runtime_process_core(meshpay_app_runtime_t *runtime,
             }
         }
     } else if (event->type == MESHPAY_APP_EVENT_CORE_DAG_SUMMARY) {
-        if (event->now_ms < runtime->dag_sync_quiet_until_ms) {
-            ESP_LOGI(APP_RUNTIME_TAG,
-                     "dag summary skipped quiet_until=%llu now=%llu",
-                     (unsigned long long)runtime->dag_sync_quiet_until_ms,
-                     (unsigned long long)event->now_ms);
-            err = ESP_OK;
-        } else {
-            rns_packet_t packet;
-            err = meshpay_dag_sync_build_summary(
-                &runtime->app->dag,
-                runtime->app->local_destination,
-                &packet);
-            if (err == ESP_OK) {
-                const meshpay_app_event_t tx_event = {
-                    .type = MESHPAY_APP_EVENT_RETICULUM_TX,
-                    .now_ms = event->now_ms,
-                    .packet = packet,
-                };
-                if (xQueueSend(runtime->reticulum_queue,
-                               &tx_event,
-                               0) != pdTRUE) {
-                    return ESP_ERR_TIMEOUT;
-                }
+        /* Le SUMMARY se diffuse TOUJOURS periodiquement : c'est l'annonce du
+         * digest qui permet aux pairs de detecter une divergence et de tirer ce
+         * qui leur manque. Ne JAMAIS le supprimer via quiet_until -- sinon le
+         * noeud qui detient une tx unique, occupe a requeter (donc "quiet"),
+         * cesse d'annoncer et personne ne tire sa tx (deadlock observe au banc :
+         * 3 cartes bloquees a 1 MINT pres). quiet_until ne gate QUE les requetes
+         * (cf. runtime_handle_dag_summary). */
+        rns_packet_t packet;
+        err = meshpay_dag_sync_build_summary(
+            &runtime->app->dag,
+            runtime->app->local_destination,
+            &packet);
+        if (err == ESP_OK) {
+            const meshpay_app_event_t tx_event = {
+                .type = MESHPAY_APP_EVENT_RETICULUM_TX,
+                .now_ms = event->now_ms,
+                .packet = packet,
+            };
+            if (xQueueSend(runtime->reticulum_queue,
+                           &tx_event,
+                           0) != pdTRUE) {
+                return ESP_ERR_TIMEOUT;
             }
         }
     }
