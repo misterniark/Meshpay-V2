@@ -391,3 +391,44 @@ TEST_CASE("dag sync build_batch_resource_from paginates a large dag", "[dag_sync
     TEST_ASSERT_EQUAL_UINT32(meshpay_dag_count(&src),
                              meshpay_dag_count(&dst));     /* recepteur complet */
 }
+
+
+/* Le SUMMARY porte les 8 premiers octets du dag_digest (detection de
+ * convergence). Round-trip build->parse + deux DAG de contenus differents
+ * donnent des digests differents. */
+TEST_CASE("dag sync summary carries the dag digest", "[dag_sync]")
+{
+    meshpay_dag_t full;
+    meshpay_dag_t slow;
+    meshpay_tx_t tx0;
+    meshpay_tx_t tx1;
+    meshpay_tx_t tx2;
+    build_dags(&full, &slow, &tx0, &tx1, &tx2);
+
+    uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(source, sizeof(source), 0xaa);
+
+    rns_packet_t packet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_dag_sync_build_summary(&full, source, &packet));
+    meshpay_dag_sync_summary_t summary;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_dag_sync_parse_summary(&packet, &summary));
+    TEST_ASSERT_TRUE(summary.has_digest);
+
+    uint8_t expected[RNS_CRYPTO_SHA256_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(&full, expected));
+    TEST_ASSERT_EQUAL_MEMORY(expected, summary.digest,
+                             MESHPAY_DAG_SYNC_DIGEST_SIZE);
+
+    /* DAG de contenu different (slow = 1 tx) => digest different. */
+    rns_packet_t packet_slow;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_dag_sync_build_summary(&slow, source, &packet_slow));
+    meshpay_dag_sync_summary_t summary_slow;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_dag_sync_parse_summary(&packet_slow, &summary_slow));
+    TEST_ASSERT_TRUE(summary_slow.has_digest);
+    TEST_ASSERT_NOT_EQUAL(0, memcmp(summary.digest, summary_slow.digest,
+                                    MESHPAY_DAG_SYNC_DIGEST_SIZE));
+}

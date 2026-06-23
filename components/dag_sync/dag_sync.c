@@ -68,6 +68,14 @@ esp_err_t meshpay_dag_sync_build_summary(
         memcpy(packet->data + pos, tips[i]->id, MESHPAY_TX_ID_SIZE);
         pos += MESHPAY_TX_ID_SIZE;
     }
+    /* Digest (8 o du dag_digest) pour la detection de convergence cote pair :
+     * deux DAG de meme contenu => meme digest => sync inutile. Independant de
+     * l'ordre d'insertion (le digest trie les id). */
+    uint8_t digest[RNS_CRYPTO_SHA256_SIZE];
+    if (meshpay_dag_digest(dag, digest) == ESP_OK) {
+        memcpy(packet->data + pos, digest, MESHPAY_DAG_SYNC_DIGEST_SIZE);
+        pos += MESHPAY_DAG_SYNC_DIGEST_SIZE;
+    }
     packet->data_len = pos;
     return ESP_OK;
 }
@@ -84,14 +92,21 @@ esp_err_t meshpay_dag_sync_parse_summary(const rns_packet_t *packet,
     memset(summary, 0, sizeof(*summary));
     summary->tx_count = get_u16(packet->data + 1);
     summary->tip_count = packet->data[3];
+    size_t base = 4U + (size_t)summary->tip_count * MESHPAY_TX_ID_SIZE;
     if (summary->tip_count > MESHPAY_DAG_SYNC_MAX_TIPS ||
-        packet->data_len != 4U + (size_t)summary->tip_count * MESHPAY_TX_ID_SIZE) {
+        (packet->data_len != base &&
+         packet->data_len != base + MESHPAY_DAG_SYNC_DIGEST_SIZE)) {
         return ESP_ERR_INVALID_SIZE;
     }
     size_t pos = 4;
     for (uint8_t i = 0; i < summary->tip_count; ++i) {
         memcpy(summary->tips[i], packet->data + pos, MESHPAY_TX_ID_SIZE);
         pos += MESHPAY_TX_ID_SIZE;
+    }
+    /* Digest optionnel (compat : ancien format sans digest). */
+    if (packet->data_len == base + MESHPAY_DAG_SYNC_DIGEST_SIZE) {
+        memcpy(summary->digest, packet->data + pos, MESHPAY_DAG_SYNC_DIGEST_SIZE);
+        summary->has_digest = true;
     }
     return ESP_OK;
 }

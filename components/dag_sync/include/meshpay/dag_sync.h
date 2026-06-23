@@ -17,6 +17,7 @@ extern "C" {
 #define MESHPAY_DAG_SYNC_REQUEST_WITH_SOURCE_SIZE \
     (MESHPAY_DAG_SYNC_REQUEST_MIN_SIZE + MESHPAY_TX_DESTINATION_HASH_SIZE)
 #define MESHPAY_DAG_SYNC_MAX_TIPS 2
+#define MESHPAY_DAG_SYNC_DIGEST_SIZE 8 /* 8 premiers octets du dag_digest */
 #define MESHPAY_DAG_SYNC_BATCH_MAX_SIZE RNS_RESOURCE_MAX_DATA_SIZE
 /* Nb max de chunks (Resource) emis pour UNE requete : borne la rafale radio
  * quand la DAG depasse la capacite d'un batch (~29 tx) ; le reste suit aux
@@ -27,6 +28,8 @@ typedef struct {
     uint16_t tx_count;
     uint8_t tip_count;
     uint8_t tips[MESHPAY_DAG_SYNC_MAX_TIPS][MESHPAY_TX_ID_SIZE];
+    uint8_t digest[MESHPAY_DAG_SYNC_DIGEST_SIZE]; /* valide ssi has_digest */
+    bool has_digest;
 } meshpay_dag_sync_summary_t;
 
 esp_err_t meshpay_dag_sync_build_summary(

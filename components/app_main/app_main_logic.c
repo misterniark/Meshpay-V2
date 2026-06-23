@@ -701,8 +701,24 @@ static esp_err_t runtime_handle_dag_summary(meshpay_app_runtime_t *runtime,
     }
 
     size_t local_count = meshpay_dag_count(&runtime->app->dag);
+
+    /* Detection de convergence par DIGEST (8 o) : si le digest du pair == le
+     * notre, les deux ENSEMBLES sont identiques -> rien a synchroniser. Sinon il
+     * y a divergence -- y compris a compte egal (fork de meme taille) ou quand on
+     * a un compte >= mais qu'il nous manque des tx de l'autre branche. Remplace
+     * l'heuristique tips/count, qui ratait : (a) les tx interieures sous des
+     * ordres d'insertion differents, (b) les forks de meme taille, et faisait
+     * rester un noeud bloque a un MINT pres (observe au banc). */
+    bool converged = false;
+    if (summary.has_digest) {
+        uint8_t local_digest[RNS_CRYPTO_SHA256_SIZE];
+        if (meshpay_dag_digest(&runtime->app->dag, local_digest) == ESP_OK) {
+            converged = memcmp(summary.digest, local_digest,
+                               MESHPAY_DAG_SYNC_DIGEST_SIZE) == 0;
+        }
+    }
     ESP_LOGI(APP_RUNTIME_TAG,
-             "dag summary rx from=%02x%02x%02x%02x tx=%u tips=%u local=%u known=%u",
+             "dag summary rx from=%02x%02x%02x%02x tx=%u tips=%u local=%u conv=%u",
              packet->destination_hash[0],
              packet->destination_hash[1],
              packet->destination_hash[2],
@@ -710,37 +726,45 @@ static esp_err_t runtime_handle_dag_summary(meshpay_app_runtime_t *runtime,
              (unsigned)summary.tx_count,
              (unsigned)summary.tip_count,
              (unsigned)local_count,
-             tips_known ? 1U : 0U);
-    if (tips_known && summary.tx_count <= local_count) {
+             converged ? 1U : 0U);
+    if (converged) {
+        return ESP_OK;
+    }
+    /* Filet de securite (pair sans digest, ancien firmware) : heuristique
+     * d'origine. */
+    if (!summary.has_digest && tips_known && summary.tx_count <= local_count) {
         return ESP_OK;
     }
     /* Backoff anti-tempete : ne pas re-demander une sync a chaque summary de
-     * chaque pair tant qu'une requete recente est encore "en vol" (le batch a
-     * le temps d'arriver et d'etre applique). Reduit la saturation ESP-NOW. */
+     * chaque pair tant qu'une requete recente est encore "en vol". */
     if (now_ms < runtime->dag_sync_quiet_until_ms) {
         return ESP_OK;
     }
 
+    /* known=0 TOUJOURS : le decoupage du batch cote repondeur est POSITIONNEL,
+     * or les ordres d'insertion different entre noeuds (chaque noeud append dans
+     * son ordre de reception). Seul start=0 garantit d'inclure les tx qui nous
+     * manquent ; les DUPLICATE sont ignorees a l'application. Un known positionnel
+     * envoyait les mauvaises tx et laissait des noeuds bloques. (H1) */
     rns_packet_t request;
     ESP_RETURN_ON_ERROR(meshpay_dag_sync_build_request_from_count(
-                            tips_known ? (uint16_t)local_count : 0,
+                            0,
                             packet->destination_hash,
                             runtime->app->local_destination,
                             &request),
                         "app_runtime", "");
-    /* Jitter reduit (50-550 ms) : echelonne les requetes des noeuds sans tenir
-     * trop longtemps le lock runtime pendant le vTaskDelay ci-dessous (revue #4). */
+    /* Jitter (50-550 ms) : echelonne la fenetre de silence des noeuds (backoff),
+     * sans bloquer la tache (la requete part immediatement, cf. plus bas). */
     uint32_t request_delay_ms =
         50U + ((((uint32_t)runtime->app->local_destination[0] << 8) |
                  (uint32_t)runtime->app->local_destination[1]) %
                 500U);
     ESP_LOGI(APP_RUNTIME_TAG,
-             "dag request tx to=%02x%02x%02x%02x known=%u delay=%u",
+             "dag request tx to=%02x%02x%02x%02x known=0 delay=%u",
              packet->destination_hash[0],
              packet->destination_hash[1],
              packet->destination_hash[2],
              packet->destination_hash[3],
-             tips_known ? (unsigned)local_count : 0U,
              (unsigned)request_delay_ms);
     /* Backoff sans blocage : on arme la fenetre de silence (espace les requetes
      * suivantes) mais on envoie CELLE-CI immediatement. Un vTaskDelay ici gelait
