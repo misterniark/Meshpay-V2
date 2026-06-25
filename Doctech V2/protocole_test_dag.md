@@ -139,7 +139,7 @@ soit **~30–45 s** (intervalle SUMMARY 15 s + marge de transfert batch).
 
 - [ ] Phase 1 : convergence des 4 (digest commun) après émissions.
 - [ ] Phase 2 : 0 TX corrompue acceptée ; rejet attendu sur les 4 pour F1–F4 ; digest inchangé.
-- [ ] Phase 3 : catch-up complet d'un device absent (digest reconvergé), y compris au-delà du checkpoint.
+- [x] Phase 3 : catch-up complet d'un device absent (digest reconvergé) — VALIDÉ 2026-06-23 (variante > checkpoint 200 non testée, nécessite l'injecteur).
 - [ ] Phase 4 : merge complet de 2 historiques divergents (DAG = union), sans conflit ni perte.
 - [ ] Aucune carte ne crashe / ne fige / ne perd son état NVS sur l'ensemble du protocole.
 
@@ -265,6 +265,34 @@ digest). Compilés via `test_app` (runner Unity cible-only).
 
 **Phase 3 (catch-up) et Phase 4 (merge) redeviennent testables.** Logs :
 `/tmp/quiet_fork_*.log`, `/tmp/quiet_boot_*.log`.
+
+### 11.5 Run 2026-06-23 — Phase 3 (catch-up) RÉUSSIE ✅
+
+Pré-condition retrouvée grâce au fix de convergence (§11.4). Device D débranché
+(absent), les 3 restantes avancent 4 → **`aafaf704/11`** (digest commun, 7
+paiements). Retour de D (reset = absence/retour simulé) :
+
+```
+identity loaded from NVS next_seq=16      (identité + seq préservés)
+boot credit restored amount=10            (restauré depuis le checkpoint, pas de zéro)
+dag summary rx ... tx=11 local=1 conv=0   (D détecte la divergence par DIGEST)
+dag request tx ... known=0
+dag resource reassembled batch_len=2075
+dag resource merged=10 total=11           (catch-up 1 -> 11 en UN batch, ~0,2 s)
+```
+
+**Final : les 4 → `aafaf704/11`.** `apply err=0`, `apply_batch fatal=0`,
+`CONFLICT=0`, `next_seq` préservé (16) → pas de trou de séquence, pas de
+double-dépense, pas de rejeu. Catch-up quasi instantané (delta absorbé en un
+seul batch). Logs : `/tmp/p3_absent_*.log`, `/tmp/p3_catchup2_*.log`.
+
+**Note** : variante « absence longue > checkpoint 200 » NON testée (exige
+l'injecteur §4.1 — 200+ paiements irréalistes à la main).
+**Pièges de banc rencontrés** : (a) les ports USB-CDC se re-énumèrent au reset
+(`/dev/cu.usbmodem11X01` → `1X01`) → cibler via `QUAD_PORTS` ; (b) le device D
+revient sur le même port après rebranchement ; (c) le catch-up étant
+sub-seconde, capturer AVANT le boot de D (reset logiciel + capture déjà à
+l'écoute) pour voir la montée.
 
 ## 12. Notes & pièges
 
