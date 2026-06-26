@@ -564,7 +564,7 @@ TEST_CASE("app runtime persists wallet sequence after creating payment",
     meshpay_app_runtime_destroy(&runtime);
 }
 
-TEST_CASE("app runtime rejects second payment without canceling pending ack",
+TEST_CASE("app runtime allows a second committed payment",
           "[app_main]")
 {
     uint8_t master[MESHPAY_TX_DESTINATION_HASH_SIZE];
@@ -616,6 +616,8 @@ TEST_CASE("app runtime rejects second payment without canceling pending ack",
     uint8_t pending_id[MESHPAY_TX_ID_SIZE];
     memcpy(pending_id, app.payments.pending_tx.id, sizeof(pending_id));
 
+    /* Option A : un 2e paiement n'est plus bloqué — il est committé lui aussi,
+     * indépendamment du premier (le suivi de reçu pointe désormais la 2e tx). */
     meshpay_app_event_t second_payment = {
         .type = MESHPAY_APP_EVENT_CORE_PAYMENT,
         .amount = 20,
@@ -630,20 +632,28 @@ TEST_CASE("app runtime rejects second payment without canceling pending ack",
                                   &runtime,
                                   MESHPAY_APP_QUEUE_CORE, 0));
     TEST_ASSERT_TRUE(app.payments.has_pending);
-    TEST_ASSERT_EQUAL_MEMORY(pending_id, app.payments.pending_tx.id,
-                             sizeof(pending_id));
-    TEST_ASSERT_TRUE(meshpay_wallet_lock_active(&app.wallet, 1002));
-    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_REJECTED, app.ui.feedback);
-    TEST_ASSERT_EQUAL_UINT32(60, app.ui.balance);
-    TEST_ASSERT_EQUAL_UINT32(1, meshpay_app_runtime_queue_depth(
+    TEST_ASSERT_TRUE(memcmp(pending_id, app.payments.pending_tx.id,
+                            sizeof(pending_id)) != 0);
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_SENT, app.ui.feedback);
+    /* 100 - 40 - 20 = 40 : les deux paiements ont débité le solde. */
+    TEST_ASSERT_EQUAL_UINT32(40, app.ui.balance);
+    TEST_ASSERT_EQUAL_UINT32(3, app.wallet.next_seq);
+    /* Les deux tx sont en file d'émission directe. */
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_app_runtime_queue_depth(
                                     &runtime,
                                     MESHPAY_APP_QUEUE_RETICULUM));
+    uint8_t pending_id2[MESHPAY_TX_ID_SIZE];
+    memcpy(pending_id2, app.payments.pending_tx.id, sizeof(pending_id2));
 
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime,
                                   MESHPAY_APP_QUEUE_RETICULUM, 0));
-    TEST_ASSERT_EQUAL_UINT32(1, tx_probe.count);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
+                                  &runtime,
+                                  MESHPAY_APP_QUEUE_RETICULUM, 0));
+    TEST_ASSERT_EQUAL_UINT32(2, tx_probe.count);
 
+    /* L'ACK de la 2e tx ne fait que confirmer le reçu (déjà committée). */
     rns_packet_t ack_packet;
     rns_packet_clear(&ack_packet);
     ack_packet.header_type = RNS_PACKET_HEADER_TYPE_1;
@@ -652,7 +662,7 @@ TEST_CASE("app runtime rejects second payment without canceling pending ack",
     memcpy(ack_packet.destination_hash, alice,
            sizeof(ack_packet.destination_hash));
     ack_packet.data[0] = MESHPAY_PAYMENT_MSG_ACK;
-    memcpy(ack_packet.data + 1, pending_id, MESHPAY_TX_ID_SIZE);
+    memcpy(ack_packet.data + 1, pending_id2, MESHPAY_TX_ID_SIZE);
     ack_packet.data_len = 1U + MESHPAY_TX_ID_SIZE;
 
     const meshpay_app_event_t ack = {
@@ -668,10 +678,9 @@ TEST_CASE("app runtime rejects second payment without canceling pending ack",
                                   &runtime,
                                   MESHPAY_APP_QUEUE_RETICULUM, 0));
     TEST_ASSERT_FALSE(app.payments.has_pending);
-    TEST_ASSERT_FALSE(meshpay_wallet_lock_active(&app.wallet, 1004));
     TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_CONFIRMED, app.ui.feedback);
-    TEST_ASSERT_EQUAL_UINT32(40, app.ui.last_amount);
-    TEST_ASSERT_EQUAL_UINT32(60, app.ui.balance);
+    TEST_ASSERT_EQUAL_UINT32(20, app.ui.last_amount);
+    TEST_ASSERT_EQUAL_UINT32(40, app.ui.balance);
 
     meshpay_app_runtime_destroy(&runtime);
 }
@@ -817,7 +826,7 @@ TEST_CASE("app runtime accepts incoming payment packet", "[app_main]")
     meshpay_app_runtime_destroy(&runtime_b);
 }
 
-TEST_CASE("app runtime reject packet restores payer after receiver cannot validate",
+TEST_CASE("app runtime reject packet does not undo committed payment",
           "[app_main]")
 {
     uint8_t master[MESHPAY_TX_DESTINATION_HASH_SIZE];
@@ -916,17 +925,20 @@ TEST_CASE("app runtime reject packet restores payer after receiver cannot valida
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime_a,
                                   MESHPAY_APP_QUEUE_RETICULUM, 0));
+    /* Option A : un REJECT du destinataire n'annule PAS la tx déjà committée.
+     * Le solde (900) et le seq (2) ne sont PAS restaurés ; la tx reste en DAG. */
     TEST_ASSERT_FALSE(app_a.payments.has_pending);
     TEST_ASSERT_FALSE(meshpay_wallet_lock_active(&app_a.wallet, 5003));
-    TEST_ASSERT_EQUAL_UINT32(1000, app_a.ui.balance);
+    TEST_ASSERT_EQUAL_UINT32(900, app_a.ui.balance);
     TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_REJECTED, app_a.ui.feedback);
-    TEST_ASSERT_EQUAL_UINT32(1, app_a.wallet.next_seq);
+    TEST_ASSERT_EQUAL_UINT32(2, app_a.wallet.next_seq);
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&app_a.dag));
 
     meshpay_app_runtime_destroy(&runtime_b);
     meshpay_app_runtime_destroy(&runtime_a);
 }
 
-TEST_CASE("app runtime ui refresh expires unanswered payment lock",
+TEST_CASE("app runtime ui refresh expires receipt tracking without undoing payment",
           "[app_main]")
 {
     uint8_t master[MESHPAY_TX_DESTINATION_HASH_SIZE];
@@ -978,7 +990,7 @@ TEST_CASE("app runtime ui refresh expires unanswered payment lock",
 
     meshpay_app_event_t refresh = {
         .type = MESHPAY_APP_EVENT_UI_REFRESH,
-        .now_ms = 6000 + MESHPAY_WALLET_LOCK_TIMEOUT_MS,
+        .now_ms = 6000 + MESHPAY_PAYMENT_RECEIPT_TIMEOUT_MS,
     };
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_post(
                                   &runtime,
@@ -987,11 +999,14 @@ TEST_CASE("app runtime ui refresh expires unanswered payment lock",
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime,
                                   MESHPAY_APP_QUEUE_UI, 0));
+    /* Option A : l'expiration du suivi de reçu est NON destructive — le solde
+     * reste celui de la tx committée (900) et le seq n'est pas restauré (2).
+     * Le feedback reste « envoyé » (le paiement a réussi, seul l'accusé manque). */
     TEST_ASSERT_FALSE(app.payments.has_pending);
     TEST_ASSERT_FALSE(meshpay_wallet_lock_active(&app.wallet,
                                                  refresh.now_ms + 1));
-    TEST_ASSERT_EQUAL_UINT32(1000, app.ui.balance);
-    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_REJECTED, app.ui.feedback);
+    TEST_ASSERT_EQUAL_UINT32(900, app.ui.balance);
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_SENT, app.ui.feedback);
     TEST_ASSERT_EQUAL_UINT32(2, app.wallet.next_seq);
 
     meshpay_app_runtime_destroy(&runtime);

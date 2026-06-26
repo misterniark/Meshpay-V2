@@ -460,6 +460,13 @@ static esp_err_t runtime_config_effective(
     return ESP_OK;
 }
 
+static esp_err_t runtime_persist_wallet_state(meshpay_app_runtime_t *runtime);
+/* Adaptateur du hook de persistance de l'engine de paiement (void* -> runtime). */
+static esp_err_t runtime_persist_cb(void *ctx)
+{
+    return runtime_persist_wallet_state((meshpay_app_runtime_t *)ctx);
+}
+
 esp_err_t meshpay_app_runtime_init(meshpay_app_runtime_t *runtime,
                                    meshpay_app_t *app,
                                    const meshpay_app_runtime_config_t *config)
@@ -489,6 +496,12 @@ esp_err_t meshpay_app_runtime_init(meshpay_app_runtime_t *runtime,
     }
     rns_resource_reassembler_pool_init(&runtime->dag_sync_reassembler_pool);
     runtime->dag_sync_send_offset = 0;
+
+    /* Option A : la persistance de next_seq doit précéder tout commit DAG d'un
+     * paiement. On branche le hook de l'engine sur le runtime (anti-réutilisation
+     * de seq au reboot, la DAG étant en RAM). */
+    meshpay_payment_engine_set_persist(&runtime->app->payments,
+                                       runtime_persist_cb, runtime);
 
     runtime_refresh_depths(runtime);
     return ESP_OK;
@@ -1143,9 +1156,10 @@ static esp_err_t runtime_process_core(meshpay_app_runtime_t *runtime,
                                                         event->now_ms,
                                                         &packet);
         }
-        if (err == ESP_OK) {
-            err = runtime_persist_wallet_state(runtime);
-        }
+        /* Option A : create_payment persiste next_seq via son hook AVANT de
+         * committer la tx dans la DAG (pas de persist séparé ici, sinon double
+         * écriture). En cas d'échec, l'engine a déjà restauré le seq et n'a rien
+         * committé. */
         if (err != ESP_OK) {
             esp_err_t reason = err;
             if (!had_pending_before && runtime->app->payments.has_pending) {
@@ -1172,13 +1186,12 @@ static esp_err_t runtime_process_core(meshpay_app_runtime_t *runtime,
                 .packet = packet,
             };
             if (xQueueSend(runtime->reticulum_queue, &tx_event, 0) != pdTRUE) {
-                (void)meshpay_payment_engine_cancel_pending(
-                    &runtime->app->payments);
-                runtime_report_payment_rejected(runtime,
-                                                event->amount,
-                                                event->now_ms,
-                                                ESP_ERR_TIMEOUT);
-                return ESP_ERR_TIMEOUT;
+                /* Option A : la tx est DÉJÀ committée dans la DAG. L'envoi direct
+                 * est best-effort ; si la file est pleine, la synchro DAG
+                 * (SUMMARY/REQUEST/BATCH) livrera la tx au destinataire. NE PAS
+                 * annuler (cela réutiliserait le seq d'une tx committée). */
+                ESP_LOGW(APP_RUNTIME_TAG,
+                         "paiement committe; envoi direct non file, sync DAG relaiera");
             }
             err = runtime_refresh_balance(runtime, event->now_ms);
             if (err == ESP_OK) {

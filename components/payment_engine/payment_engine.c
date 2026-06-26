@@ -45,22 +45,38 @@ static void rollback_allocated_seq(meshpay_wallet_t *wallet, uint32_t seq)
     }
 }
 
+/* Oublie le suivi de reçu d'un paiement SANS toucher aux fonds ni au seq.
+ * En Option A la tx est déjà committée à l'envoi : « oublier le pending » ne
+ * doit donc rien restaurer (contrairement à l'ancien rollback verrou/seq). */
+static void clear_pending(meshpay_payment_engine_t *engine)
+{
+    meshpay_tx_clear(&engine->pending_tx);
+    engine->has_pending = false;
+    engine->pending_started_ms = 0;
+}
+
 bool meshpay_payment_engine_expire_pending(meshpay_payment_engine_t *engine,
                                            uint64_t now_ms,
                                            uint32_t *expired_amount)
 {
-    if (engine == NULL || !engine->has_pending || engine->wallet == NULL ||
-        meshpay_wallet_lock_active(engine->wallet, now_ms)) {
+    if (engine == NULL || !engine->has_pending) {
+        return false;
+    }
+    /* Pas encore expiré : on est dans la fenêtre d'attente de l'accusé.
+     * (Le test now_ms >= pending_started_ms évite un sous-débordement en cas
+     * d'horloge incohérente.) */
+    if (now_ms >= engine->pending_started_ms &&
+        now_ms - engine->pending_started_ms <
+            MESHPAY_PAYMENT_RECEIPT_TIMEOUT_MS) {
         return false;
     }
 
+    /* Délai écoulé : la tx étant déjà committée, on ne restaure NI fonds NI
+     * seq — on oublie juste le suivi cosmétique. Le solde reste correct. */
     if (expired_amount != NULL) {
         *expired_amount = engine->pending_tx.amount;
     }
-    (void)meshpay_wallet_unlock(engine->wallet, engine->pending_tx.id);
-    meshpay_tx_clear(&engine->pending_tx);
-    engine->has_pending = false;
-    engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
+    clear_pending(engine);
     return true;
 }
 
@@ -96,25 +112,17 @@ static uint8_t select_parents(const meshpay_dag_t *dag,
     return (uint8_t)tip_count;
 }
 
-esp_err_t meshpay_payment_engine_create_payment(
-    meshpay_payment_engine_t *engine,
-    const uint8_t to[MESHPAY_TX_DESTINATION_HASH_SIZE],
-    uint32_t amount,
-    uint64_t now_ms,
-    rns_packet_t *packet)
+/* Construit et signe une transaction de transfert, valide les fonds, et encode
+ * le paquet applicatif en clair — SANS committer dans la DAG ni marquer de
+ * pending. Le seq est alloué ici ; en cas d'échec il est toujours restauré.
+ * En sortie : *out_tx = tx prête à committer, *packet = paquet à émettre. */
+static esp_err_t build_payment(meshpay_payment_engine_t *engine,
+                               const uint8_t to[MESHPAY_TX_DESTINATION_HASH_SIZE],
+                               uint32_t amount,
+                               uint64_t now_ms,
+                               meshpay_tx_t *out_tx,
+                               rns_packet_t *packet)
 {
-    if (engine == NULL || to == NULL || packet == NULL ||
-        engine->wallet == NULL || engine->dag == NULL ||
-        engine->currency == NULL || engine->identity == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    (void)meshpay_payment_engine_expire_pending(engine, now_ms, NULL);
-    if (engine->has_pending ||
-        meshpay_wallet_lock_active(engine->wallet, now_ms)) {
-        engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
-        return ESP_ERR_INVALID_STATE;
-    }
-
     uint32_t seq = 0;
     ESP_RETURN_ON_ERROR(meshpay_wallet_allocate_seq(engine->wallet, &seq),
                         "payment_engine", "");
@@ -151,24 +159,15 @@ esp_err_t meshpay_payment_engine_create_payment(
         engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
         return ESP_ERR_INVALID_SIZE;
     }
-    uint32_t cost = amount + engine->currency->transfer_fee;
-    err = meshpay_wallet_lock(engine->wallet, tx.id, cost, now_ms);
-    if (err != ESP_OK) {
-        rollback_allocated_seq(engine->wallet, seq);
-        return err;
-    }
-    engine->feedback = MESHPAY_PAYMENT_FEEDBACK_LOCKED;
 
     uint8_t encoded[MESHPAY_TX_CBOR_MAX_SIZE];
     size_t encoded_len = 0;
     err = meshpay_tx_encode(&tx, encoded, sizeof(encoded), &encoded_len);
     if (err != ESP_OK) {
-        (void)meshpay_wallet_unlock(engine->wallet, tx.id);
         rollback_allocated_seq(engine->wallet, seq);
         return err;
     }
     if (encoded_len + 1U > RNS_PACKET_MAX_DATA_SIZE) {
-        (void)meshpay_wallet_unlock(engine->wallet, tx.id);
         rollback_allocated_seq(engine->wallet, seq);
         engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
         return ESP_ERR_INVALID_SIZE;
@@ -179,24 +178,71 @@ esp_err_t meshpay_payment_engine_create_payment(
     memcpy(packet->data + 1, encoded, encoded_len);
     packet->data_len = encoded_len + 1U;
 
-    memcpy(&engine->pending_tx, &tx, sizeof(tx));
+    memcpy(out_tx, &tx, sizeof(*out_tx));
+    return ESP_OK;
+}
+
+/* Persiste l'état du wallet (next_seq) PUIS committe la tx dans la DAG locale.
+ * L'ordre est crucial : persister AVANT le merge garantit qu'au reboot le seq
+ * ne sera jamais réutilisé pour une autre tx (la DAG est en RAM ; seul next_seq
+ * est durable). En cas d'échec, le seq est restauré et rien n'est committé. */
+static esp_err_t commit_built(meshpay_payment_engine_t *engine,
+                              const meshpay_tx_t *tx,
+                              uint64_t now_ms)
+{
+    if (engine->persist_cb != NULL) {
+        esp_err_t err = engine->persist_cb(engine->persist_ctx);
+        if (err != ESP_OK) {
+            rollback_allocated_seq(engine->wallet, tx->seq);
+            engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
+            return err;
+        }
+    }
+
+    meshpay_dag_merge_result_t merge = meshpay_dag_merge_tx(engine->dag, tx);
+    if (merge != MESHPAY_DAG_MERGE_OK &&
+        merge != MESHPAY_DAG_MERGE_DUPLICATE) {
+        /* Le merge a échoué APRÈS une persistance réussie de next_seq (NVS déjà
+         * à N+1). On NE rollback PAS le seq en RAM : cela le ferait passer sous
+         * la valeur durable et risquerait une réutilisation au reboot. On laisse
+         * un trou de seq (jamais réutilisé, donc sûr) et on rejette. */
+        engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Suivi cosmétique du reçu : la tx est déjà committée, l'ACK confirmera. */
+    memcpy(&engine->pending_tx, tx, sizeof(engine->pending_tx));
     engine->has_pending = true;
+    engine->pending_started_ms = now_ms;
     engine->feedback = MESHPAY_PAYMENT_FEEDBACK_SENT;
     return ESP_OK;
 }
 
-static void rollback_pending_payment(meshpay_payment_engine_t *engine)
+esp_err_t meshpay_payment_engine_create_payment(
+    meshpay_payment_engine_t *engine,
+    const uint8_t to[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    uint32_t amount,
+    uint64_t now_ms,
+    rns_packet_t *packet)
 {
-    if (engine == NULL) {
-        return;
+    if (engine == NULL || to == NULL || packet == NULL ||
+        engine->wallet == NULL || engine->dag == NULL ||
+        engine->currency == NULL || engine->identity == NULL) {
+        return ESP_ERR_INVALID_ARG;
     }
-    if (engine->has_pending && engine->wallet != NULL) {
-        (void)meshpay_wallet_unlock(engine->wallet, engine->pending_tx.id);
-        rollback_allocated_seq(engine->wallet, engine->pending_tx.seq);
+    /* Option A (commit-on-send) : on oublie d'abord un suivi de reçu périmé,
+     * puis chaque paiement est committé immédiatement et indépendamment — plus
+     * de verrou ni de blocage « un seul paiement à la fois ». La protection
+     * anti-double-dépense est assurée par validate_tx qui lit la DAG (mise à
+     * jour à chaque commit). */
+    (void)meshpay_payment_engine_expire_pending(engine, now_ms, NULL);
+
+    meshpay_tx_t tx;
+    esp_err_t err = build_payment(engine, to, amount, now_ms, &tx, packet);
+    if (err != ESP_OK) {
+        return err;
     }
-    meshpay_tx_clear(&engine->pending_tx);
-    engine->has_pending = false;
-    engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
+    return commit_built(engine, &tx, now_ms);
 }
 
 static esp_err_t verify_sender_if_known(const meshpay_tx_t *tx)
@@ -224,15 +270,18 @@ esp_err_t meshpay_payment_engine_create_encrypted_payment(
     uint64_t now_ms,
     rns_packet_t *packet)
 {
-    if (engine == NULL || recipient == NULL || packet == NULL) {
+    if (engine == NULL || to == NULL || recipient == NULL || packet == NULL ||
+        engine->wallet == NULL || engine->dag == NULL ||
+        engine->currency == NULL || engine->identity == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    (void)meshpay_payment_engine_expire_pending(engine, now_ms, NULL);
 
-    esp_err_t err = meshpay_payment_engine_create_payment(engine,
-                                                          to,
-                                                          amount,
-                                                          now_ms,
-                                                          packet);
+    /* On construit le paquet en clair, on le CHIFFRE, et seulement ENSUITE on
+     * committe : ainsi un échec de chiffrement n'a aucune tx committée à
+     * annuler (on restaure juste le seq alloué par build_payment). */
+    meshpay_tx_t tx;
+    esp_err_t err = build_payment(engine, to, amount, now_ms, &tx, packet);
     if (err != ESP_OK) {
         return err;
     }
@@ -245,14 +294,17 @@ esp_err_t meshpay_payment_engine_create_encrypted_payment(
                                            token,
                                            sizeof(token),
                                            &token_len);
-    if (err == ESP_OK) {
-        memcpy(packet->data, token, token_len);
-        packet->data_len = token_len;
-    } else {
-        rollback_pending_payment(engine);
+    if (err != ESP_OK) {
+        rns_crypto_secure_zero(token, sizeof(token));
+        rollback_allocated_seq(engine->wallet, tx.seq);
+        engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
+        return err;
     }
+    memcpy(packet->data, token, token_len);
+    packet->data_len = token_len;
     rns_crypto_secure_zero(token, sizeof(token));
-    return err;
+
+    return commit_built(engine, &tx, now_ms);
 }
 
 esp_err_t meshpay_payment_engine_receive_payment(
@@ -397,24 +449,20 @@ esp_err_t meshpay_payment_engine_receive_ack(
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Option A : la tx a déjà été committée à l'envoi. L'ACK n'est qu'un
+     * ACCUSÉ DE RÉCEPTION ; un REJECT du destinataire n'annule PAS un transfert
+     * valide déjà committé — on cesse simplement d'attendre le reçu. */
     if (ack_packet->data[0] == MESHPAY_PAYMENT_MSG_REJECT) {
-        rollback_pending_payment(engine);
+        clear_pending(engine);
+        engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
         return ESP_OK;
     }
 
-    meshpay_dag_merge_result_t merge =
-        meshpay_dag_merge_tx(engine->dag, &engine->pending_tx);
-    if (merge != MESHPAY_DAG_MERGE_OK &&
-        merge != MESHPAY_DAG_MERGE_DUPLICATE) {
-        engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    ESP_RETURN_ON_ERROR(meshpay_wallet_unlock(engine->wallet,
-                                              engine->pending_tx.id),
-                        "payment_engine", "");
-    engine->has_pending = false;
-    meshpay_tx_clear(&engine->pending_tx);
+    /* ACK : la tx a DÉJÀ été committée à l'envoi par commit_built (toujours, même
+     * sans persist_cb). L'ACK ne fait que confirmer la réception — aucun merge à
+     * refaire ici (un merge post-checkpoint pourrait échouer et bloquer le
+     * suivi). Aucun verrou à libérer (Option A n'en pose plus). */
+    clear_pending(engine);
     engine->feedback = MESHPAY_PAYMENT_FEEDBACK_ACKED;
     return ESP_OK;
 }
@@ -428,6 +476,21 @@ esp_err_t meshpay_payment_engine_cancel_pending(
     if (!engine->has_pending) {
         return ESP_ERR_NOT_FOUND;
     }
-    rollback_pending_payment(engine);
+    /* Annulation = on cesse d'attendre le reçu. La tx étant committée à
+     * l'envoi, on ne restaure NI le solde NI le seq (Option A). */
+    clear_pending(engine);
+    engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
     return ESP_OK;
+}
+
+void meshpay_payment_engine_set_persist(
+    meshpay_payment_engine_t *engine,
+    esp_err_t (*persist_cb)(void *ctx),
+    void *persist_ctx)
+{
+    if (engine == NULL) {
+        return;
+    }
+    engine->persist_cb = persist_cb;
+    engine->persist_ctx = persist_ctx;
 }

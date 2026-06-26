@@ -126,6 +126,10 @@ TEST_CASE("payment engine sends tx and accepts ack in memory", "[payment_engine]
     TEST_ASSERT_EQUAL_MEMORY(bob, payment_packet.destination_hash,
                              MESHPAY_TX_DESTINATION_HASH_SIZE);
 
+    /* Option A : la tx est committée dans la DAG du payeur DÈS l'envoi, sans
+     * attendre l'ACK (dag_a passe de 1 à 2 immédiatement). */
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&dag_a));
+
     uint32_t balance = 0;
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_wallet_get_available_balance(&wallet_a, &config,
@@ -162,7 +166,7 @@ TEST_CASE("payment engine sends tx and accepts ack in memory", "[payment_engine]
     TEST_ASSERT_EQUAL_UINT32(895, balance);
 }
 
-TEST_CASE("payment engine reject restores pending payer balance",
+TEST_CASE("payment engine reject does not undo committed payment",
           "[payment_engine]")
 {
     uint8_t master[MESHPAY_TX_DESTINATION_HASH_SIZE];
@@ -214,6 +218,8 @@ TEST_CASE("payment engine reject restores pending payer balance",
                       meshpay_payment_engine_create_payment(&engine_a, bob,
                                                             100, 1000,
                                                             &payment_packet));
+    /* Committée dès l'envoi : dag_a 1->2, solde débité (1000-100, fee=0). */
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&dag_a));
     uint32_t balance = 0;
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_wallet_get_available_balance(&wallet_a, &config,
@@ -235,18 +241,21 @@ TEST_CASE("payment engine reject restores pending payer balance",
                              MESHPAY_TX_ID_SIZE);
     TEST_ASSERT_EQUAL_UINT32(0, meshpay_dag_count(&dag_b));
 
+    /* Option A : un REJECT du destinataire n'annule PAS la tx déjà committée.
+     * On cesse seulement d'attendre le reçu : le solde et le seq ne sont PAS
+     * restaurés (contrairement à l'ancien modèle commit-sur-ACK). */
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_payment_engine_receive_ack(&engine_a,
                                                          &reject_packet));
     TEST_ASSERT_EQUAL(MESHPAY_PAYMENT_FEEDBACK_REJECTED, engine_a.feedback);
     TEST_ASSERT_FALSE(engine_a.has_pending);
-    TEST_ASSERT_FALSE(meshpay_wallet_lock_active(&wallet_a, 1003));
-    TEST_ASSERT_EQUAL_UINT32(1, wallet_a.next_seq);
+    TEST_ASSERT_EQUAL_UINT32(2, wallet_a.next_seq);
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&dag_a));
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_wallet_get_available_balance(&wallet_a, &config,
                                                            &dag_a, 1003,
                                                            &balance));
-    TEST_ASSERT_EQUAL_UINT32(1000, balance);
+    TEST_ASSERT_EQUAL_UINT32(900, balance);
 }
 
 TEST_CASE("payment engine rejects altered tx from announced sender",
@@ -348,7 +357,7 @@ TEST_CASE("payment engine rejects altered tx from announced sender",
     rns_announce_known_reset();
 }
 
-TEST_CASE("payment engine rejects second local payment while pending", "[payment_engine]")
+TEST_CASE("payment engine allows consecutive committed payments", "[payment_engine]")
 {
     uint8_t master[MESHPAY_TX_DESTINATION_HASH_SIZE];
     uint8_t alice[MESHPAY_TX_DESTINATION_HASH_SIZE];
@@ -380,24 +389,35 @@ TEST_CASE("payment engine rejects second local payment while pending", "[payment
                       meshpay_payment_engine_init(&engine, &wallet, &dag,
                                                   &config, &identity));
 
+    /* Option A : chaque paiement est committé immédiatement et indépendamment.
+     * Un 2e paiement n'est plus bloqué par un « pending » — la DAG (mise à jour
+     * à chaque commit) suffit à empêcher la double-dépense. mint=500, fee=1. */
     rns_packet_t packet;
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_payment_engine_create_payment(&engine, bob,
                                                             50, 1000,
                                                             &packet));
-    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&dag));
+    TEST_ASSERT_EQUAL_UINT32(2, wallet.next_seq);
+
+    TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_payment_engine_create_payment(&engine, bob,
                                                             50, 2000,
                                                             &packet));
-    TEST_ASSERT_EQUAL(MESHPAY_PAYMENT_FEEDBACK_REJECTED, engine.feedback);
+    TEST_ASSERT_EQUAL(MESHPAY_PAYMENT_FEEDBACK_SENT, engine.feedback);
+    TEST_ASSERT_EQUAL_UINT32(3, meshpay_dag_count(&dag));
+    TEST_ASSERT_EQUAL_UINT32(3, wallet.next_seq);
+
+    /* Solde = 500 - 2*(50+1) = 398. */
+    uint32_t balance = 0;
     TEST_ASSERT_EQUAL(ESP_OK,
-                      meshpay_payment_engine_cancel_pending(&engine));
-    TEST_ASSERT_FALSE(engine.has_pending);
-    TEST_ASSERT_FALSE(meshpay_wallet_lock_active(&wallet, 2001));
-    TEST_ASSERT_EQUAL_UINT32(1, wallet.next_seq);
+                      meshpay_wallet_get_available_balance(&wallet, &config,
+                                                           &dag, 2001,
+                                                           &balance));
+    TEST_ASSERT_EQUAL_UINT32(398, balance);
 }
 
-TEST_CASE("payment engine expires pending payment after wallet timeout",
+TEST_CASE("payment engine expire pending is non destructive after receipt timeout",
           "[payment_engine]")
 {
     uint8_t master[MESHPAY_TX_DESTINATION_HASH_SIZE];
@@ -435,29 +455,35 @@ TEST_CASE("payment engine expires pending payment after wallet timeout",
                       meshpay_payment_engine_create_payment(&engine, bob,
                                                             50, 1000,
                                                             &packet));
+    /* Committée dès l'envoi : dag 1->2, suivi de reçu armé. */
     TEST_ASSERT_TRUE(engine.has_pending);
     TEST_ASSERT_EQUAL_UINT32(1, engine.pending_tx.seq);
     TEST_ASSERT_EQUAL_UINT32(2, wallet.next_seq);
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&dag));
 
-    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
-                      meshpay_payment_engine_create_payment(
-                          &engine, bob, 60,
-                          1000 + MESHPAY_WALLET_LOCK_TIMEOUT_MS - 1,
-                          &packet));
+    /* Avant le délai : le suivi de reçu n'expire pas. */
+    TEST_ASSERT_FALSE(meshpay_payment_engine_expire_pending(
+        &engine, 1000 + MESHPAY_PAYMENT_RECEIPT_TIMEOUT_MS - 1, NULL));
     TEST_ASSERT_TRUE(engine.has_pending);
+
+    /* Après le délai : expiration NON destructive — on oublie le suivi du reçu,
+     * mais la tx reste committée (dag 2) et le seq n'est PAS restauré. */
+    uint32_t expired_amount = 0;
+    TEST_ASSERT_TRUE(meshpay_payment_engine_expire_pending(
+        &engine, 1000 + MESHPAY_PAYMENT_RECEIPT_TIMEOUT_MS, &expired_amount));
+    TEST_ASSERT_EQUAL_UINT32(50, expired_amount);
+    TEST_ASSERT_FALSE(engine.has_pending);
     TEST_ASSERT_EQUAL_UINT32(2, wallet.next_seq);
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&dag));
 
+    /* Le solde reflète la dépense committée : 500 - (50+1) = 449. */
+    uint32_t balance = 0;
     TEST_ASSERT_EQUAL(ESP_OK,
-                      meshpay_payment_engine_create_payment(
-                          &engine, bob, 60,
-                          1000 + MESHPAY_WALLET_LOCK_TIMEOUT_MS,
-                          &packet));
-    TEST_ASSERT_TRUE(engine.has_pending);
-    TEST_ASSERT_EQUAL_UINT32(2, engine.pending_tx.seq);
-    TEST_ASSERT_EQUAL_UINT32(3, wallet.next_seq);
-    TEST_ASSERT_TRUE(meshpay_wallet_lock_active(
-        &wallet, 1000 + MESHPAY_WALLET_LOCK_TIMEOUT_MS + 1));
-    TEST_ASSERT_EQUAL(MESHPAY_PAYMENT_FEEDBACK_SENT, engine.feedback);
+                      meshpay_wallet_get_available_balance(
+                          &wallet, &config, &dag,
+                          1000 + MESHPAY_PAYMENT_RECEIPT_TIMEOUT_MS + 1,
+                          &balance));
+    TEST_ASSERT_EQUAL_UINT32(449, balance);
 }
 
 TEST_CASE("payment engine sends encrypted tx and receiver decrypts it",
@@ -518,6 +544,9 @@ TEST_CASE("payment engine sends encrypted tx and receiver decrypts it",
                                         payment_packet.data_len);
     TEST_ASSERT_EQUAL_MEMORY(bob, payment_packet.destination_hash,
                              MESHPAY_TX_DESTINATION_HASH_SIZE);
+    /* Option A : la tx est committée chez le payeur dès l'envoi (dag_a 1->2),
+     * avant tout chiffrement réussi puis ACK. */
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&dag_a));
 
     rns_packet_t ack_packet;
     TEST_ASSERT_EQUAL(ESP_OK,
@@ -586,4 +615,57 @@ TEST_CASE("payment engine preserves sequence when payment is rejected",
     TEST_ASSERT_FALSE(meshpay_wallet_lock_active(&wallet, 1001));
     TEST_ASSERT_EQUAL_UINT32(7, wallet.next_seq);
     TEST_ASSERT_EQUAL(MESHPAY_PAYMENT_FEEDBACK_REJECTED, engine.feedback);
+}
+
+TEST_CASE("payment engine commits payment even without ack from offline receiver",
+          "[payment_engine]")
+{
+    /* Régression du bug observé au banc : on paie un destinataire hors ligne
+     * (aucun ACK ne reviendra). En Option A la tx doit tout de même être
+     * committée dans la DAG du payeur (la synchro DAG la livrera au retour du
+     * pair) et le solde doit refléter la dépense — plus de paiement perdu. */
+    uint8_t master[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t alice[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t bob[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(master, sizeof(master), 0x19);
+    fill_sequence(alice, sizeof(alice), 0x49);
+    fill_sequence(bob, sizeof(bob), 0x79);
+
+    meshpay_currency_config_t config;
+    meshpay_currency_config_init(&config, 0x4d35);
+    config.transfer_fee = 1;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_add_mint_authority(&config, master));
+
+    meshpay_dag_t dag;
+    meshpay_dag_init(&dag);
+    meshpay_tx_t mint;
+    make_mint(&mint, 0x29, master, alice, 500, config.currency_id);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
+                      meshpay_dag_merge_tx(&dag, &mint));
+
+    meshpay_wallet_t wallet;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_wallet_init(&wallet, alice, 1));
+    rns_identity_t identity;
+    load_identity(&identity, 0x59);
+
+    meshpay_payment_engine_t engine;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_payment_engine_init(&engine, &wallet, &dag,
+                                                  &config, &identity));
+
+    rns_packet_t packet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_payment_engine_create_payment(&engine, bob,
+                                                            40, 1000, &packet));
+    /* Committée immédiatement, SANS aucun ACK reçu. */
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&dag));
+    TEST_ASSERT_EQUAL(MESHPAY_PAYMENT_FEEDBACK_SENT, engine.feedback);
+
+    uint32_t balance = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_wallet_get_available_balance(&wallet, &config,
+                                                           &dag, 1001,
+                                                           &balance));
+    TEST_ASSERT_EQUAL_UINT32(459, balance); /* 500 - (40+1) */
 }

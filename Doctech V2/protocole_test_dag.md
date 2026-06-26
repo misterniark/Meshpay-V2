@@ -294,6 +294,53 @@ revient sur le même port après rebranchement ; (c) le catch-up étant
 sub-seconde, capturer AVANT le boot de D (reset logiciel + capture déjà à
 l'écoute) pour voir la montée.
 
+### 11.6 Run 2026-06-26 — Couche PAIEMENT : Option A (commit-on-send) ✅
+
+> **Hors protocole DAG** (couche paiement, pas une phase §6-9). Corrige un bug
+> trouvé au banc hors protocole : un paiement vers un receveur **hors ligne**
+> était **perdu**.
+
+**Bug** : le commit n'avait lieu qu'à la réception de l'**ACK** du receveur
+(`receive_ack` → `meshpay_dag_merge_tx`). Receveur absent ⇒ aucun ACK ⇒ tx
+**jamais committée dans aucune DAG**. Symptômes observés : payeur figé à un solde
+**verrouillé** (ex. 9), receveur jamais crédité (10), DAG convergée SANS la tx
+(`count` inchangé, aucun `CONFLICT`), et **aucun catch-up** au retour du receveur
+(rien à propager, la tx n'existait nulle part).
+
+**Correctif — « commit-on-send »** : la tx est committée dans la DAG du payeur
+**dès l'envoi** (`create_payment`/`create_encrypted_payment` :
+`build_payment` → [chiffrement] → `commit_built` qui **persiste `next_seq` AVANT
+le merge**), puis livrée au receveur par la **DAG sync** (SUMMARY/REQUEST/BATCH —
+le même catch-up qu'en §11.5). Conséquences : l'ACK n'est plus qu'un **accusé de
+réception** ; un REJECT n'annule plus un transfert valide déjà committé ; le
+**verrou local est supprimé** (la DAG est la source de vérité, l'anti-double-
+dépense passe par `validate_tx` qui lit la DAG) ; paiements consécutifs permis ;
+`expire_pending` devient **non destructif**. Persist-avant-commit ⇒ pas de
+réutilisation de seq au reboot. Revue adversariale → 2 correctifs intégrés (pas de
+rollback de seq après une persist réussie ; suppression du merge redondant dans
+`receive_ack`).
+
+**Validation banc (4× Waveshare S3, `build-hardware-smoke-s3-secure`)** :
+
+```
+Run court — castor (payeur) -> loup-sobre (receveur), débranché puis rebranché
+  castor : dag_digest=f93cb846 count=5   (commit DÈS l'envoi, sans ACK)
+  diffusion resource batch_len=849 ; loup-sobre revient -> catch-up
+  FINAL : les 4 -> f93cb846/5, conv=1 ; soldes payeur 9 / receveur 11 (transfert 1 OK)
+
+Run long — loup-doux (payeur), receveur orque débranché LONGTEMPS (2 tx pendant l'absence)
+  DAG en ligne avance 5 -> 7 ; au retour orque rattrape les 2 tx d'un coup
+  FINAL : les 4 -> 13ef669a/7, conv=1
+```
+
+**Verdict** : le scénario « paiement vers pair absent » (qui perdait le paiement,
+soldes figés 9/10) **passe**. La durée d'absence n'affecte pas le rattrapage tant
+qu'une carte en ligne détient la tx et diffuse son SUMMARY. Tests unitaires mis à
+jour (`payment_engine/test` : commit-on-send, reject non destructif, paiements
+consécutifs, expire non destructif, + cas « committé sans ACK » ; `app_main/test`
+567/820/929 réécrits) ; `test_app` compile (Unity cible-only). Logs :
+`/tmp/optA_replay_*.log`, `/tmp/optA_replay2_*.log`.
+
 ## 12. Notes & pièges
 
 - **LoRa désactivé** (`policy=all:espnow`) : tout passe en ESP-NOW. Ne pas conclure sur la propagation LoRa ici.
