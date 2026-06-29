@@ -10,7 +10,7 @@ Le projet reste toutefois en phase de durcissement préproduction. Le prochain t
 
 - Stabiliser la découverte à 3 devices : cold boot des 3, arrivée tardive, reboot d'un seul, compteur peers attendu `2` partout.
 - Valider les paiements répétés : A vers B, B vers C, C vers A, plusieurs fois, avec soldes corrects après chaque ACK.
-- Rendre la DAG vraiment durable : finaliser les checkpoints automatiques et la restauration complète après reboot ou power loss.
+- Rendre la DAG vraiment durable : ✅ Phase A faite (persistance + restauration au boot, composant `dag_store`) ; reste **Phase B = checkpoint élagueur > 200 TX** → prochain chantier détaillé dans `Doctech V2/chantier_phase_b_checkpoint.md` (touche le consensus, bloqué côté validation HW par l'injecteur §4.1).
 - Tester les coupures pendant un paiement pending : ne pas perdre la séquence, ne pas double-dépenser, ne pas bloquer le wallet.
 - Corriger tout écart découvert sur matériel avant d'ajouter de nouvelles features.
 
