@@ -8,6 +8,7 @@
 #include "meshpay/app_main_logic.h"
 #include "meshpay/dag_monitor.h"
 #include "meshpay/dag_sync.h"
+#include "meshpay/dag_store.h"
 #include "meshpay/device_hal.h"
 #include "meshpay/project_skeleton.h"
 #include "meshpay/rns/rns_announce.h"
@@ -344,6 +345,35 @@ static esp_err_t create_boot_credit_once(meshpay_app_t *app,
     ESP_LOGI(TAG, "boot credit minted once amount=%u",
              (unsigned)MESHPAY_BOOT_CREDIT_AMOUNT);
     return refresh_app_balance(app, 0);
+}
+
+/* Recalcule next_seq depuis la DAG restauree : max(seq des tx emises par soi) + 1,
+ * jamais en dessous du next_seq deja charge du NVS. Empeche toute reutilisation
+ * de seq si la DAG persistee est plus avancee que le compteur NVS. */
+static void restore_next_seq_from_dag(meshpay_app_t *app)
+{
+    if (app == NULL) {
+        return;
+    }
+    uint32_t max_seq = 0;
+    bool found = false;
+    size_t n = meshpay_dag_count(&app->dag);
+    for (size_t i = 0; i < n; ++i) {
+        const meshpay_tx_t *tx = meshpay_dag_at(&app->dag, i);
+        if (tx == NULL || tx->type != MESHPAY_TX_TYPE_TRANSFER) {
+            continue;
+        }
+        if (!meshpay_destination_equal(tx->from, app->wallet.owner)) {
+            continue;
+        }
+        if (!found || tx->seq >= max_seq) {
+            max_seq = tx->seq;
+            found = true;
+        }
+    }
+    if (found && max_seq + 1U > app->wallet.next_seq) {
+        app->wallet.next_seq = max_seq + 1U;
+    }
 }
 
 #if CONFIG_MESHPAY_BOARD_WAVESHARE_S3_TOUCH
@@ -2567,6 +2597,34 @@ void app_main(void)
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "runtime storage disabled: %s",
                      esp_err_to_name(err));
+        }
+    }
+
+    /* Persistance durable de la DAG (Phase A) : restaurer la fenetre depuis la
+     * flash AVANT le demarrage de la sync, puis brancher le backend pour les
+     * sauvegardes ulterieures. Degradation gracieuse si la partition est absente. */
+    {
+        meshpay_dag_store_backend_t dag_store_be;
+        esp_err_t derr =
+            meshpay_dag_store_partition_backend("dagstore", &dag_store_be);
+        if (derr == ESP_OK) {
+            esp_err_t lerr = meshpay_dag_store_load(&dag_store_be, &s_app.dag);
+            if (lerr == ESP_OK) {
+                restore_next_seq_from_dag(&s_app);
+                (void)refresh_app_balance(&s_app, 0);
+                ESP_LOGI(TAG,
+                         "dag restored from flash count=%u next_seq=%u",
+                         (unsigned)meshpay_dag_count(&s_app.dag),
+                         (unsigned)s_app.wallet.next_seq);
+            } else if (lerr == ESP_ERR_NOT_FOUND) {
+                ESP_LOGI(TAG, "dag store empty (first boot)");
+            } else {
+                ESP_LOGW(TAG, "dag store load err=%s", esp_err_to_name(lerr));
+            }
+            (void)meshpay_app_runtime_set_dag_store(&s_runtime, &dag_store_be);
+        } else {
+            ESP_LOGW(TAG, "dag store partition absent: %s",
+                     esp_err_to_name(derr));
         }
     }
 

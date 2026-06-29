@@ -558,6 +558,21 @@ esp_err_t meshpay_app_runtime_set_storage(
     return ESP_OK;
 }
 
+esp_err_t meshpay_app_runtime_set_dag_store(
+    meshpay_app_runtime_t *runtime,
+    const meshpay_dag_store_backend_t *backend)
+{
+    if (runtime == NULL || backend == NULL || backend->read == NULL ||
+        backend->write == NULL || backend->erase == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    runtime->dag_store = *backend;
+    runtime->dag_store_ready = true;
+    runtime->dag_dirty = false;
+    runtime->dag_saved_ms = 0;
+    return ESP_OK;
+}
+
 esp_err_t meshpay_app_runtime_post(meshpay_app_runtime_t *runtime,
                                    meshpay_app_queue_id_t queue_id,
                                    const meshpay_app_event_t *event,
@@ -586,6 +601,41 @@ UBaseType_t meshpay_app_runtime_queue_depth(const meshpay_app_runtime_t *runtime
 }
 
 static esp_err_t runtime_persist_wallet_state(meshpay_app_runtime_t *runtime);
+
+/* Intervalle minimal entre deux sauvegardes DAG « débouncées » (anti-usure
+ * flash). Un commit de paiement LOCAL force une sauvegarde immédiate hors de ce
+ * débounce (cf. runtime_dag_flush(..., force=true)). */
+#define MESHPAY_DAG_STORE_FLUSH_INTERVAL_MS 15000ULL
+
+/* Marque la DAG comme modifiée : sera persistée au prochain flush (tick UI) ou
+ * immédiatement si un commit local force le flush. */
+static void runtime_dag_mark_dirty(meshpay_app_runtime_t *runtime)
+{
+    runtime->dag_dirty = true;
+}
+
+/* Persiste la fenêtre DAG si nécessaire. `force` contourne le débounce (utilisé
+ * après un commit de paiement local, le cas le plus critique à ne pas perdre). */
+static void runtime_dag_flush(meshpay_app_runtime_t *runtime, uint64_t now_ms,
+                              bool force, const char *reason)
+{
+    if (!runtime->dag_store_ready || !runtime->dag_dirty) {
+        return;
+    }
+    if (!force && now_ms >= runtime->dag_saved_ms &&
+        now_ms - runtime->dag_saved_ms < MESHPAY_DAG_STORE_FLUSH_INTERVAL_MS) {
+        return;
+    }
+    esp_err_t err =
+        meshpay_dag_store_save(&runtime->dag_store, &runtime->app->dag, reason);
+    if (err == ESP_OK) {
+        runtime->dag_dirty = false;
+        runtime->dag_saved_ms = now_ms;
+    } else {
+        ESP_LOGW(APP_RUNTIME_TAG, "dag store save err=%s",
+                 esp_err_to_name(err));
+    }
+}
 
 static esp_err_t runtime_process_ui(meshpay_app_runtime_t *runtime,
                                     const meshpay_app_event_t *event)
@@ -619,6 +669,9 @@ static esp_err_t runtime_process_ui(meshpay_app_runtime_t *runtime,
                                              runtime->app->payments.feedback,
                                              expired_amount);
     }
+    /* Flush débouncé de la DAG : persiste les tx accumulées (sync entrante)
+     * sans écrire à chaque transaction (usure flash). */
+    runtime_dag_flush(runtime, event->now_ms, false, "tick");
     if (err == ESP_OK) {
         runtime->processed_ui++;
     }
@@ -938,6 +991,9 @@ static esp_err_t runtime_handle_dag_resource(meshpay_app_runtime_t *runtime,
         return err;
     }
     runtime->dag_sync_merged += (uint32_t)merged;
+    if (merged > 0) {
+        runtime_dag_mark_dirty(runtime); /* persisté au prochain tick (débounce) */
+    }
     ESP_LOGI(APP_RUNTIME_TAG,
              "dag resource merged=%u total=%u",
              (unsigned)merged,
@@ -1089,6 +1145,8 @@ static esp_err_t runtime_process_reticulum(meshpay_app_runtime_t *runtime,
         }
         if (err == ESP_OK &&
             runtime->app->payments.feedback == MESHPAY_PAYMENT_FEEDBACK_RECEIVED) {
+            /* Paiement reçu et mergé dans la DAG locale : persiste (débouncé). */
+            runtime_dag_mark_dirty(runtime);
             if (runtime->app->payments.has_last_received) {
                 runtime_set_history_peer(
                     runtime,
@@ -1179,6 +1237,10 @@ static esp_err_t runtime_process_core(meshpay_app_runtime_t *runtime,
             payment_ready = true;
         }
         if (err == ESP_OK && payment_ready) {
+            /* Paiement committé localement : on persiste IMMÉDIATEMENT (cas le
+             * plus critique à ne pas perdre — son propre paiement avant la sync). */
+            runtime_dag_mark_dirty(runtime);
+            runtime_dag_flush(runtime, event->now_ms, true, "payment");
             const meshpay_app_event_t tx_event = {
                 .type = MESHPAY_APP_EVENT_RETICULUM_TX,
                 .now_ms = event->now_ms,
@@ -1227,6 +1289,10 @@ static esp_err_t runtime_process_core(meshpay_app_runtime_t *runtime,
                 return ESP_ERR_TIMEOUT;
             }
         }
+        /* Tick périodique fiable du wallet (~15 s) : flush débouncé de la DAG.
+         * Sur le wallet, UI_REFRESH n'est posté qu'une fois au boot — ce tick
+         * SUMMARY est donc la source de flush périodique des tx accumulées. */
+        runtime_dag_flush(runtime, event->now_ms, false, "summary");
     }
     if (err == ESP_OK &&
         (event->type == MESHPAY_APP_EVENT_CORE_ANNOUNCE ||

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include "meshpay/dag_store.h"
 #include "meshpay/dag_sync.h"
 #include "meshpay/payment_engine.h"
 #include "meshpay/storage.h"
@@ -92,6 +93,10 @@ typedef struct {
     rns_resource_reassembler_pool_t dag_sync_reassembler_pool;
     uint32_t dag_sync_merged;
     uint16_t dag_sync_send_offset; /* rotation de la fenetre d'envoi de batch */
+    meshpay_dag_store_backend_t dag_store; /* persistance durable de la DAG */
+    bool dag_store_ready;                   /* backend dag_store installe */
+    bool dag_dirty;                         /* DAG modifiee depuis le dernier save */
+    uint64_t dag_saved_ms;                  /* horodatage du dernier save reussi */
     meshpay_storage_backend_t storage_backend;
     meshpay_storage_record_t storage_record;
     bool has_storage;
@@ -140,6 +145,11 @@ esp_err_t meshpay_app_runtime_set_storage(
     meshpay_app_runtime_t *runtime,
     const meshpay_storage_backend_t *backend,
     const meshpay_storage_record_t *record);
+/* Installe le backend de persistance DAG. Active la sauvegarde durable de la
+ * fenetre DAG (flush debounce + flush force apres un commit local). */
+esp_err_t meshpay_app_runtime_set_dag_store(
+    meshpay_app_runtime_t *runtime,
+    const meshpay_dag_store_backend_t *backend);
 esp_err_t meshpay_app_runtime_start_tasks(meshpay_app_runtime_t *runtime);
 esp_err_t meshpay_app_runtime_stop_tasks(meshpay_app_runtime_t *runtime);
 esp_err_t meshpay_app_runtime_post(meshpay_app_runtime_t *runtime,
