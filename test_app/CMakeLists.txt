@@ -20,6 +20,7 @@ set(EXTRA_COMPONENT_DIRS
     "../components/storage"
     "../components/meshpay_tx"
     "../components/dag"
+    "../components/dag_store"
     "../components/currency"
     "../components/wallet"
     "../components/payment_engine"
