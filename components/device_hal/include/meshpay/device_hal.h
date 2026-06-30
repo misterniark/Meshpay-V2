@@ -68,6 +68,7 @@ typedef enum {
     MESHPAY_BOARD_CYD,
     MESHPAY_BOARD_WAVESHARE_S3_TOUCH,
     MESHPAY_BOARD_LILYGO_T5S3_H752,
+    MESHPAY_BOARD_LILYGO_TDECK,   /* LilyGo T-Deck / T-Deck Plus (carte fondateur) */
 } meshpay_board_t;
 
 typedef struct {

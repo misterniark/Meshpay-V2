@@ -1707,6 +1707,9 @@ static meshpay_board_t configured_board(void)
     return MESHPAY_BOARD_WAVESHARE_S3_TOUCH;
 #elif CONFIG_MESHPAY_BOARD_LILYGO_T5S3_H752
     return MESHPAY_BOARD_LILYGO_T5S3_H752;
+#elif CONFIG_MESHPAY_BOARD_LILYGO_TDECK
+    /* T-Deck / T-Deck Plus : carte fondateur — drivers viendront dans les tâches suivantes */
+    return MESHPAY_BOARD_LILYGO_TDECK;
 #else
     return MESHPAY_BOARD_UNKNOWN;
 #endif

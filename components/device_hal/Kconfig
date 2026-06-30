@@ -15,6 +15,9 @@ choice MESHPAY_BOARD
 
     config MESHPAY_BOARD_LILYGO_T5S3_H752
         bool "LilyGo T5 S3 Pro H752"
+
+    config MESHPAY_BOARD_LILYGO_TDECK
+        bool "LilyGo T-Deck / T-Deck Plus (founder)"
 endchoice
 
 choice MESHPAY_RADIO_BACKEND
