@@ -13,8 +13,15 @@ extern "C" {
 
 #define MESHPAY_STORAGE_ALIAS_MAX 32
 #define MESHPAY_STORAGE_CHECKPOINT_MAX 512
+/* Blob CBOR opaque du descripteur de monnaie signé (Palier A). storage ne
+ * connaît pas son contenu : il le stocke/relit tel quel, la vérification de
+ * signature est faite par la couche currency. Borne alignée sur la borne wire
+ * du descripteur (MESHPAY_CURRENCY_DESCRIPTOR_CBOR_MAX = 384). */
+#define MESHPAY_STORAGE_DESCRIPTOR_MAX 384
 #define MESHPAY_STORAGE_MAGIC 0x4d505356u
-#define MESHPAY_STORAGE_VERSION 1u
+/* v2 : ajout du blob descripteur de monnaie (Palier A). Un blob v1 (plus petit)
+ * ne se relit pas — traité comme absent (init neuf), ce qui est sûr. */
+#define MESHPAY_STORAGE_VERSION 2u
 #define MESHPAY_STORAGE_NVS_NAMESPACE "meshpay"
 
 typedef esp_err_t (*meshpay_storage_write_blob_fn_t)(void *ctx,
@@ -56,6 +63,10 @@ typedef struct {
     uint8_t checkpoint_hash[RNS_CRYPTO_SHA256_SIZE];
     uint8_t checkpoint[MESHPAY_STORAGE_CHECKPOINT_MAX];
     size_t checkpoint_len;
+    /* Palier A — descripteur de monnaie signé, stocké en blob CBOR opaque. */
+    bool has_currency_descriptor;
+    uint8_t currency_descriptor[MESHPAY_STORAGE_DESCRIPTOR_MAX];
+    size_t currency_descriptor_len;
 } meshpay_storage_record_t;
 
 void meshpay_storage_record_init(meshpay_storage_record_t *record);
@@ -69,6 +80,13 @@ esp_err_t meshpay_storage_record_set_checkpoint(meshpay_storage_record_t *record
                                                 uint32_t checkpoint_seq,
                                                 const uint8_t *checkpoint,
                                                 size_t checkpoint_len);
+/* Stocke le blob CBOR opaque du descripteur de monnaie signé (1..MAX octets).
+ * storage reste agnostique : aucune validation de contenu ici (la signature est
+ * vérifiée par la couche currency au chargement). */
+esp_err_t meshpay_storage_record_set_currency_descriptor(
+    meshpay_storage_record_t *record,
+    const uint8_t *descriptor,
+    size_t descriptor_len);
 esp_err_t meshpay_storage_save(const meshpay_storage_backend_t *backend,
                                const meshpay_storage_record_t *record);
 esp_err_t meshpay_storage_load(const meshpay_storage_backend_t *backend,

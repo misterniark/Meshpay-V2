@@ -207,3 +207,76 @@ TEST_CASE("meshpay storage nvs init recovers from reusable partition errors",
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
                       meshpay_storage_nvs_init_with_ops(NULL));
 }
+
+/* --- Palier A4 : persistance du descripteur de monnaie (blob opaque) --- */
+
+TEST_CASE("meshpay storage persists currency descriptor blob", "[storage]")
+{
+    meshpay_storage_mock_t mock;
+    meshpay_storage_mock_init(&mock);
+    meshpay_storage_backend_t backend = meshpay_storage_mock_backend(&mock);
+
+    meshpay_storage_record_t record;
+    meshpay_storage_record_init(&record);
+
+    uint8_t descriptor[200];
+    fill_sequence(descriptor, sizeof(descriptor), 0x05);
+    TEST_ASSERT_EQUAL(ESP_OK,
+        meshpay_storage_record_set_currency_descriptor(&record, descriptor,
+                                                       sizeof(descriptor)));
+    TEST_ASSERT_TRUE(record.has_currency_descriptor);
+    TEST_ASSERT_EQUAL_UINT32(sizeof(descriptor), record.currency_descriptor_len);
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_storage_save(&backend, &record));
+    meshpay_storage_record_t loaded;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_storage_load(&backend, &loaded));
+    TEST_ASSERT_EQUAL_UINT16(MESHPAY_STORAGE_VERSION, loaded.version);
+    TEST_ASSERT_TRUE(loaded.has_currency_descriptor);
+    TEST_ASSERT_EQUAL_UINT32(sizeof(descriptor),
+                             loaded.currency_descriptor_len);
+    TEST_ASSERT_EQUAL_MEMORY(descriptor, loaded.currency_descriptor,
+                             sizeof(descriptor));
+}
+
+TEST_CASE("meshpay storage record without descriptor loads as absent", "[storage]")
+{
+    meshpay_storage_mock_t mock;
+    meshpay_storage_mock_init(&mock);
+    meshpay_storage_backend_t backend = meshpay_storage_mock_backend(&mock);
+
+    meshpay_storage_record_t record;
+    meshpay_storage_record_init(&record);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_storage_record_set_alias(&record, "Bob"));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_storage_save(&backend, &record));
+
+    meshpay_storage_record_t loaded;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_storage_load(&backend, &loaded));
+    TEST_ASSERT_FALSE(loaded.has_currency_descriptor);
+    TEST_ASSERT_EQUAL_UINT32(0, loaded.currency_descriptor_len);
+}
+
+TEST_CASE("meshpay storage rejects invalid currency descriptor", "[storage]")
+{
+    meshpay_storage_record_t record;
+    meshpay_storage_record_init(&record);
+
+    uint8_t descriptor[8];
+    fill_sequence(descriptor, sizeof(descriptor), 0x09);
+    /* NULL / longueur nulle / surdimensionné -> rejet avant toute copie. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+        meshpay_storage_record_set_currency_descriptor(&record, NULL, 4));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE,
+        meshpay_storage_record_set_currency_descriptor(&record, descriptor, 0));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE,
+        meshpay_storage_record_set_currency_descriptor(
+            &record, descriptor, MESHPAY_STORAGE_DESCRIPTOR_MAX + 1));
+
+    /* Flag présent mais longueur 0 -> incohérent -> rejeté à la sauvegarde. */
+    meshpay_storage_mock_t mock;
+    meshpay_storage_mock_init(&mock);
+    meshpay_storage_backend_t backend = meshpay_storage_mock_backend(&mock);
+    meshpay_storage_record_init(&record);
+    record.has_currency_descriptor = true;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE,
+                      meshpay_storage_save(&backend, &record));
+}

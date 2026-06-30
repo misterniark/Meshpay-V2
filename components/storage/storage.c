@@ -105,6 +105,27 @@ esp_err_t meshpay_storage_record_set_checkpoint(meshpay_storage_record_t *record
     return ESP_OK;
 }
 
+esp_err_t meshpay_storage_record_set_currency_descriptor(
+    meshpay_storage_record_t *record,
+    const uint8_t *descriptor,
+    size_t descriptor_len)
+{
+    if (!record_header_valid(record) || descriptor == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (descriptor_len == 0 ||
+        descriptor_len > MESHPAY_STORAGE_DESCRIPTOR_MAX) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    /* Blob opaque : copié tel quel, le reste du buffer remis à zéro pour ne pas
+     * persister de résidus. La signature sera vérifiée par la couche currency. */
+    memset(record->currency_descriptor, 0, sizeof(record->currency_descriptor));
+    memcpy(record->currency_descriptor, descriptor, descriptor_len);
+    record->currency_descriptor_len = descriptor_len;
+    record->has_currency_descriptor = true;
+    return ESP_OK;
+}
+
 static esp_err_t validate_record(const meshpay_storage_record_t *record)
 {
     if (!record_header_valid(record)) {
@@ -114,6 +135,13 @@ static esp_err_t validate_record(const meshpay_storage_record_t *record)
         return ESP_ERR_INVALID_SIZE;
     }
     if (record->checkpoint_len > MESHPAY_STORAGE_CHECKPOINT_MAX) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (record->currency_descriptor_len > MESHPAY_STORAGE_DESCRIPTOR_MAX) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (record->has_currency_descriptor &&
+        record->currency_descriptor_len == 0) {
         return ESP_ERR_INVALID_SIZE;
     }
     if (record->has_identity) {
