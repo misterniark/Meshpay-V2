@@ -520,6 +520,22 @@ TEST_CASE("lilygo h752 driver rejects invalid handles",
                       meshpay_hal_lilygo_t5s3_h752_driver_deinit(NULL));
 }
 
+TEST_CASE("tdeck keyboard decode maps raw byte to key", "[device_hal]")
+{
+    bool has_key = true;
+    char ch = '?';
+    /* 0 = aucune touche. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_hal_tdeck_keyboard_decode(0, &has_key, &ch));
+    TEST_ASSERT_FALSE(has_key);
+    /* ASCII imprimable. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_hal_tdeck_keyboard_decode('z', &has_key, &ch));
+    TEST_ASSERT_TRUE(has_key);
+    TEST_ASSERT_EQUAL_CHAR('z', ch);
+    /* Garde-fou. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_hal_tdeck_keyboard_decode('z', NULL, &ch));
+}
+
 TEST_CASE("device hal mock keyboard read returns queued ascii", "[device_hal]")
 {
     meshpay_hal_t hal;

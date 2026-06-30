@@ -326,6 +326,13 @@ esp_err_t meshpay_hal_gt911_decode_raw(const uint8_t *frame,
                                        uint16_t *raw_x,
                                        uint16_t *raw_y);
 
+/* Décode un octet brut reçu du clavier T-Deck (ESP32-C3 @0x55 en I2C).
+ * raw == 0 → aucune touche en attente (*has_key = false).
+ * raw != 0 → touche pressée (*has_key = true, *ch = (char)raw).
+ * Retourne ESP_ERR_INVALID_ARG si has_key ou ch est NULL.
+ * Fonction pure, testable hors banc (sans I2C réel). */
+esp_err_t meshpay_hal_tdeck_keyboard_decode(uint8_t raw, bool *has_key, char *ch);
+
 esp_err_t meshpay_hal_lilygo_h752_gt911_decode(const uint8_t *frame,
                                                size_t frame_len,
                                                meshpay_touch_state_t *state);

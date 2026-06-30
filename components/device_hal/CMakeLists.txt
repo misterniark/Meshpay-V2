@@ -9,6 +9,7 @@ set(DEVICE_HAL_SRCS
         "sx126x/sx126x_driver_version.c"
         "device_hal_lilygo_t5s3_h752.c"
         "device_hal_waveshare_s3_touch.c"
+        "device_hal_lilygo_tdeck.c"
 )
 
 set(DEVICE_HAL_INCLUDE_DIRS "include" "sx126x")
