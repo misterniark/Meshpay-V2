@@ -19,6 +19,7 @@ set(EXTRA_COMPONENT_DIRS
     "../components/rns_radio"
     "../components/storage"
     "../components/meshpay_tx"
+    "../components/currency_descriptor"
     "../components/dag"
     "../components/dag_store"
     "../components/currency"

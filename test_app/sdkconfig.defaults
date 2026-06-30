@@ -1,0 +1,7 @@
+# Defaults du banc de test Unity (test_app).
+#
+# La tâche `main` exécute les TEST_CASE Unity, dont des tests crypto-lourds
+# (vérif Ed25519 Monocypher ~2 Ko de pile + buffers CBOR 384 o). La pile par
+# défaut du main (3584 o) déborde -> « stack overflow in task main » détecté au
+# changement de contexte. On la remonte largement pour le banc.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
