@@ -26,6 +26,18 @@
 #define TDECK_PIN_KB_POWERON 10  /* GPIO à mettre HAUT avant toute init matérielle */
 #define TDECK_PIN_SD_CS      39  /* CS de la carte SD : tenir HAUT (bus SPI partagé) */
 
+/* Bus I2C partagé tactile GT911 + clavier ESP32-C3 */
+#define TDECK_PIN_SDA  18   /* SDA du bus I2C partagé */
+#define TDECK_PIN_SCL   8   /* SCL du bus I2C partagé */
+
+/* GT911 : contrôleur tactile capacitif */
+#define TDECK_TOUCH_ADDR        0x5D   /* Adresse I2C du GT911 */
+#define TDECK_GT911_REG_STATUS  0x814E /* Registre statut GT911 : nombre de points + bit 0x80 */
+
+/* Clavier T-Deck : microcontrôleur ESP32-C3 embarqué (@0x55)
+ * Retourne 0 si aucune touche, sinon le code ASCII de la touche pressée. */
+#define TDECK_KEYBOARD_ADDR  0x55
+
 /* Écran ST7789 SPI */
 #define TDECK_PIN_CS   12
 #define TDECK_PIN_DC   11
@@ -76,6 +88,7 @@
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
 
 #include "driver/gpio.h"
+#include "driver/i2c.h"
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
@@ -151,6 +164,219 @@ static esp_err_t send_cmd_data(meshpay_hal_lilygo_tdeck_driver_t *driver,
         return err;
     }
     return send_data(driver, &param, 1);
+}
+
+/* ── Init I2C (API legacy) ───────────────────────────────────────────────── */
+
+/* Adresse alternative du GT911 (selon le niveau d'INT au reset). */
+#define TDECK_TOUCH_ADDR_ALT 0x14
+
+/* Adresse I2C du tactile GT911 détectée au runtime (0 = absent). */
+static uint8_t s_tdeck_touch_addr = 0;
+
+/* Teste si une adresse I2C 7 bits répond (ACK), via une lecture d'1 octet.
+ * Lecture (et non écriture) pour éviter tout effet de bord sur les périphériques. */
+static bool tdeck_i2c_probe(uint8_t addr)
+{
+    uint8_t b = 0;
+    return i2c_master_read_from_device(I2C_NUM_0, addr, &b, 1,
+                                       pdMS_TO_TICKS(20)) == ESP_OK;
+}
+
+/* Scanne le bus I2C et logue les adresses qui répondent (diagnostic banc). */
+static void tdeck_i2c_scan(void)
+{
+    int count = 0;
+    ESP_LOGI(TAG, "I2C scan (0x08-0x77)...");
+    for (uint8_t a = 0x08; a <= 0x77; ++a) {
+        if (tdeck_i2c_probe(a)) {
+            ESP_LOGI(TAG, "  I2C présent à 0x%02x", a);
+            count++;
+        }
+    }
+    ESP_LOGI(TAG, "I2C scan terminé : %d périphérique(s)", count);
+}
+
+/* Détecte l'adresse du GT911 : essaie 0x5D puis 0x14, mémorise dans
+ * s_tdeck_touch_addr (0 si absent). */
+static void tdeck_detect_touch(void)
+{
+    if (tdeck_i2c_probe(TDECK_TOUCH_ADDR)) {
+        s_tdeck_touch_addr = TDECK_TOUCH_ADDR;
+    } else if (tdeck_i2c_probe(TDECK_TOUCH_ADDR_ALT)) {
+        s_tdeck_touch_addr = TDECK_TOUCH_ADDR_ALT;
+    } else {
+        s_tdeck_touch_addr = 0;
+    }
+    ESP_LOGI(TAG, "GT911 tactile : %s (addr=0x%02x)",
+             s_tdeck_touch_addr ? "détecté" : "ABSENT",
+             (unsigned)s_tdeck_touch_addr);
+}
+
+/* Initialise le bus I2C_NUM_0 en maître à 400 kHz avec les pins SDA=18, SCL=8.
+ * Tolère ESP_ERR_INVALID_STATE si le bus est déjà installé (idempotent). */
+static esp_err_t tdeck_init_i2c(void)
+{
+    const i2c_config_t conf = {
+        .mode             = I2C_MODE_MASTER,
+        .sda_io_num       = TDECK_PIN_SDA,
+        .scl_io_num       = TDECK_PIN_SCL,
+        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 400000,
+        .clk_flags        = 0,
+    };
+    esp_err_t err = i2c_param_config(I2C_NUM_0, &conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2C param config échec : %s", esp_err_to_name(err));
+        return err;
+    }
+    err = i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
+    if (err == ESP_ERR_INVALID_STATE) {
+        /* Déjà installé — on continue sans erreur */
+        ESP_LOGD(TAG, "I2C_NUM_0 déjà installé, partage du bus");
+        err = ESP_OK;
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "I2C_NUM_0 init OK (SDA=%d SCL=%d 400kHz)",
+                 TDECK_PIN_SDA, TDECK_PIN_SCL);
+        tdeck_i2c_scan();       /* diagnostic : liste ce qui répond sur le bus */
+        tdeck_detect_touch();   /* fixe s_tdeck_touch_addr (0x5D / 0x14 / absent) */
+    } else {
+        ESP_LOGE(TAG, "I2C driver install échec : %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+/* ── Helpers I2C bas niveau ──────────────────────────────────────────────── */
+
+/* Lecture depuis un registre 16 bits d'un périphérique I2C (adresse 7 bits).
+ * Écrit d'abord les 2 octets du registre (big-endian), puis lit `len` octets. */
+static esp_err_t i2c_read_reg16(uint8_t addr, uint16_t reg,
+                                 uint8_t *data, size_t len)
+{
+    const uint8_t rb[2] = { (uint8_t)(reg >> 8), (uint8_t)reg };
+    return i2c_master_write_read_device(I2C_NUM_0,
+                                        addr,
+                                        rb, sizeof(rb),
+                                        data, len,
+                                        pdMS_TO_TICKS(80));
+}
+
+/* Écriture vers un registre 16 bits d'un périphérique I2C.
+ * Construit un buffer [reg_hi, reg_lo, data...] et envoie en une transaction. */
+static esp_err_t i2c_write_reg16(uint8_t addr, uint16_t reg,
+                                  const uint8_t *data, size_t len)
+{
+    /* Buffer temporaire : 2 octets de registre + données (max pratique : 8 o) */
+    uint8_t buf[2 + 8];
+    if (len > sizeof(buf) - 2U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    buf[0] = (uint8_t)(reg >> 8);
+    buf[1] = (uint8_t)reg;
+    memcpy(buf + 2, data, len);
+    return i2c_master_write_to_device(I2C_NUM_0,
+                                      addr,
+                                      buf, 2U + len,
+                                      pdMS_TO_TICKS(80));
+}
+
+/* ── Lecture tactile GT911 ───────────────────────────────────────────────── */
+
+/* Lit l'état du tactile GT911 via I2C et remplit `state`.
+ *
+ * Protocole GT911 :
+ *   1. Lire 9 octets depuis le registre 0x814E (statut + 8 octets du 1er point).
+ *   2. Appeler meshpay_hal_gt911_decode_raw pour extraire pressed/raw_x/raw_y.
+ *   3. Si bit 0x80 du 1er octet est positionné, acquitter en écrivant 0 à 0x814E.
+ *
+ * Passthrough coordonnées sans transformation (calibration ultérieure). */
+static esp_err_t tdeck_touch_read(void *ctx, meshpay_touch_state_t *state)
+{
+    (void)ctx;
+    if (state == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Réinitialise l'état : pas de pression par défaut */
+    state->pressed = false;
+    state->x = 0;
+    state->y = 0;
+
+    /* GT911 non détecté au boot (ni 0x5D ni 0x14) → pas de tactile disponible. */
+    if (s_tdeck_touch_addr == 0) {
+        return ESP_OK;
+    }
+
+    /* Lecture de la trame statut GT911 : 1 octet statut + 8 octets données point 1 */
+    uint8_t frame[9];
+    esp_err_t err = i2c_read_reg16(s_tdeck_touch_addr, TDECK_GT911_REG_STATUS,
+                                    frame, sizeof(frame));
+    if (err != ESP_OK) {
+        /* Pas de pression ou périphérique absent : on retourne ESP_OK (état = non pressé) */
+        return ESP_OK;
+    }
+
+    /* Variables temporaires uint16_t requises par la signature de gt911_decode_raw
+     * (coordonnées brutes GT911 sont toujours positives). */
+    bool pressed = false;
+    uint16_t raw_x = 0;
+    uint16_t raw_y = 0;
+    err = meshpay_hal_gt911_decode_raw(frame, sizeof(frame),
+                                       &pressed, &raw_x, &raw_y);
+    if (err != ESP_OK) {
+        return ESP_OK; /* décodage échoué : état non pressé, non fatal */
+    }
+
+    state->pressed = pressed;
+    /* Conversion uint16_t → int16_t : les coords GT911 sont dans [0..479], jamais négatives. */
+    state->x = (int16_t)raw_x;
+    state->y = (int16_t)raw_y;
+
+    /* Acquittement GT911 : si le bit 0x80 du registre statut est positionné,
+     * l'hôte doit écrire 0 à 0x814E pour permettre la mise à jour suivante. */
+    if ((frame[0] & 0x80U) != 0U) {
+        const uint8_t clear = 0x00;
+        (void)i2c_write_reg16(s_tdeck_touch_addr, TDECK_GT911_REG_STATUS,
+                               &clear, 1);
+    }
+
+    return ESP_OK;
+}
+
+/* ── Lecture clavier I2C (ESP32-C3 @0x55) ───────────────────────────────── */
+
+/* Lit un octet ASCII depuis le contrôleur clavier I2C du T-Deck.
+ *
+ * Le clavier (ESP32-C3 @0x55) renvoie 0 si aucune touche n'est pressée,
+ * sinon le code ASCII brut. On passe par meshpay_hal_tdeck_keyboard_decode
+ * pour filtrer les codes invalides et normaliser. */
+static esp_err_t tdeck_keyboard_read(void *ctx, uint8_t *out_ascii)
+{
+    (void)ctx;
+    if (out_ascii == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_ascii = 0;
+
+    uint8_t raw = 0;
+    esp_err_t err = i2c_master_read_from_device(I2C_NUM_0,
+                                                 TDECK_KEYBOARD_ADDR,
+                                                 &raw, 1,
+                                                 pdMS_TO_TICKS(20));
+    if (err != ESP_OK) {
+        /* Aucune touche disponible ou erreur de bus : on retourne ESP_OK (key=0) */
+        return ESP_OK;
+    }
+
+    bool has_key = false;
+    char ch = 0;
+    err = meshpay_hal_tdeck_keyboard_decode(raw, &has_key, &ch);
+    if (err != ESP_OK) {
+        return ESP_OK; /* décodage échoué : pas de touche, non fatal */
+    }
+    *out_ascii = has_key ? (uint8_t)ch : 0U;
+    return ESP_OK;
 }
 
 /* ── Alimentation ────────────────────────────────────────────────────────── */
@@ -325,7 +551,10 @@ static esp_err_t run_st7789_init(meshpay_hal_lilygo_tdeck_driver_t *driver)
  * RAMWR, puis les pixels RGB565 fournis convertis en big-endian.
  *
  * pixels : tableau de width×height uint16_t RGB565 (little-endian machine).
- * Réutilise meshpay_hal_waveshare_s3_rgb565_to_be pour la conversion BE. */
+ * Conversion big-endian faite EN LOCAL (et pas via la fonction du fichier
+ * Waveshare) : ce fichier embarque le NOUVEAU driver I2C, incompatible avec
+ * l'ANCIEN driver I2C utilisé ici pour le GT911/clavier → sinon abort au boot
+ * (check_i2c_driver_conflict, deux pilotes I2C liés dans le même binaire). */
 static esp_err_t tdeck_display_flush(void *ctx,
                                      const void *pixels,
                                      uint16_t width,
@@ -367,11 +596,13 @@ static esp_err_t tdeck_display_flush(void *ctx,
         const size_t chunk_px = (remaining < (sizeof(tx_buf) / 2U))
                                     ? remaining
                                     : (sizeof(tx_buf) / 2U);
-        err = meshpay_hal_waveshare_s3_rgb565_to_be(src, chunk_px,
-                                                    tx_buf, sizeof(tx_buf));
-        if (err == ESP_OK) {
-            err = send_data(driver, tx_buf, chunk_px * 2U);
+        /* RGB565 machine (little-endian) → big-endian sur le bus, en local. */
+        for (size_t i = 0; i < chunk_px; ++i) {
+            const uint16_t px = src[i];
+            tx_buf[i * 2U]      = (uint8_t)(px >> 8);
+            tx_buf[i * 2U + 1U] = (uint8_t)(px & 0xFFU);
         }
+        err = send_data(driver, tx_buf, chunk_px * 2U);
         if (err != ESP_OK) {
             return err;
         }
@@ -471,16 +702,28 @@ static esp_err_t tdeck_display_init(void *ctx)
         /* Non fatal : l'écran est initialisé, le remplissage couleur est cosmétique */
     }
 
+    /* Init du bus I2C partagé tactile + clavier APRÈS le power-on (KB_POWERON déjà HIGH).
+     * Toléré si le bus est déjà installé (cas de démarrage répété ou partage). */
+    esp_err_t i2c_err = tdeck_init_i2c();
+    if (i2c_err != ESP_OK) {
+        /* Non fatal : l'écran fonctionne ; le tactile et le clavier seront absents. */
+        ESP_LOGW(TAG, "I2C init échoué (tactile/clavier indisponibles) : %s",
+                 esp_err_to_name(i2c_err));
+    }
+
     ESP_LOGI(TAG, "T-Deck display ready %ux%u",
              (unsigned)MESHPAY_HAL_TDECK_WIDTH,
              (unsigned)MESHPAY_HAL_TDECK_HEIGHT);
     return ESP_OK;
 }
 
-/* Table des ops display pour le T-Deck (pas de tactile, pas de LoRa dans ce périmètre). */
+/* Table des ops pour le T-Deck : écran ST7789, tactile GT911 et clavier I2C câblés.
+ * Les ops LoRa, ESP-NOW, batterie et stockage sont NULL (pas dans ce périmètre). */
 static const meshpay_hal_ops_t TDECK_OPS = {
     .display_init  = tdeck_display_init,
     .display_flush = tdeck_display_flush,
+    .touch_read    = tdeck_touch_read,
+    .keyboard_read = tdeck_keyboard_read,
 };
 
 /* ── Driver init / deinit publics ────────────────────────────────────────── */

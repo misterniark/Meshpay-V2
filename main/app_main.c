@@ -141,6 +141,8 @@ static meshpay_hal_lilygo_t5s3_h752_driver_t s_lilygo_h752_display_driver;
 /* HAL d'affichage T-Deck : écran ST7789 SPI 320×240 (Phase 2 Palier 0). */
 static meshpay_hal_t s_display_hal;
 static meshpay_hal_lilygo_tdeck_driver_t s_tdeck_display_driver;
+/* Tâche de diagnostic I2C (tactile GT911 + clavier) : active uniquement sur T-Deck. */
+static TaskHandle_t s_tdeck_diag_task;
 #endif
 #if MESHPAY_RADIO_HAS_ESPNOW
 static meshpay_hal_espnow_driver_t s_espnow_driver;
@@ -1156,6 +1158,41 @@ static void waveshare_touch_task(void *arg)
     }
 }
 #endif
+
+/* ── Tâche diagnostic T-Deck (tactile GT911 + clavier I2C) ──────────────── */
+#if CONFIG_MESHPAY_BOARD_LILYGO_TDECK
+/* Tâche de validation au banc : poll le tactile et le clavier toutes les 150 ms
+ * et logue toute activité en série. Permet de vérifier l'I2C sans matériel UI. */
+static void tdeck_diag_task(void *arg)
+{
+    static const char *DIAG_TAG = "tdeck_diag";
+    (void)arg;
+
+    ESP_LOGI(DIAG_TAG, "tâche diagnostic T-Deck démarrée (poll 150 ms)");
+
+    while (true) {
+        /* --- Lecture tactile GT911 --- */
+        meshpay_touch_state_t st = {0};
+        esp_err_t err = meshpay_hal_touch_read(&s_display_hal, &st);
+        if (err == ESP_OK && st.pressed) {
+            ESP_LOGI(DIAG_TAG, "touch x=%d y=%d", (int)st.x, (int)st.y);
+        }
+
+        /* --- Lecture clavier ESP32-C3 (@0x55) --- */
+        uint8_t key = 0;
+        err = meshpay_hal_keyboard_read(&s_display_hal, &key);
+        if (err == ESP_OK && key != 0) {
+            /* Affiche le code hex et le caractère imprimable si possible */
+            ESP_LOGI(DIAG_TAG,
+                     "key=0x%02x '%c'",
+                     (unsigned)key,
+                     (key >= 32U && key < 127U) ? (char)key : '.');
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+}
+#endif /* CONFIG_MESHPAY_BOARD_LILYGO_TDECK */
 
 #if CONFIG_MESHPAY_BOARD_LILYGO_T5S3_H752
 #define H752_UI_BLACK 0x0000
@@ -2717,6 +2754,20 @@ void app_main(void)
                     MESHPAY_APP_TASK_PRIORITY,
                     &s_waveshare_touch_task) != pdPASS) {
         ESP_LOGW(TAG, "touch task start failed");
+    }
+#endif
+
+#if CONFIG_MESHPAY_BOARD_LILYGO_TDECK
+    /* Tâche de diagnostic I2C T-Deck : poll tactile GT911 + clavier ESP32-C3.
+     * Démarre même si l'écran n'est pas parfaitement initialisé (diagnostic indépendant).
+     * Pile 3072 octets : lecture I2C simple, pas de framebuffer. */
+    if (xTaskCreate(tdeck_diag_task,
+                    "tdeck_diag",
+                    3072,
+                    NULL,
+                    MESHPAY_APP_TASK_PRIORITY,
+                    &s_tdeck_diag_task) != pdPASS) {
+        ESP_LOGW(TAG, "T-Deck diag task start failed");
     }
 #endif
 
