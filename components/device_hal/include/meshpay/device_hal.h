@@ -193,10 +193,14 @@ typedef struct {
     bool dirty;
 } meshpay_hal_lilygo_t5s3_h752_driver_t;
 
-/* Contexte du driver d'écran ST7789 du T-Deck (SPI host 2). */
+/* Contexte du driver T-Deck (écran ST7789 SPI host 2 + batterie ADC). */
 typedef struct {
-    void *spi_handle; /* handle spi_device_handle_t opaque */
+    void *spi_handle;       /* handle spi_device_handle_t opaque */
+    void *adc_handle;       /* adc_oneshot_unit_handle_t opaque (batterie) */
+    void *adc_cali_handle;  /* adc_cali_handle_t opaque (calibration) */
     bool initialized;
+    bool adc_ready;
+    bool adc_calibrated;
 } meshpay_hal_lilygo_tdeck_driver_t;
 
 esp_err_t meshpay_hal_init(meshpay_hal_t *hal,

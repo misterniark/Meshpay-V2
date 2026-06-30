@@ -91,9 +91,16 @@
 #include "driver/i2c.h"
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+/* Forward decl : la lecture batterie est appelée depuis display_init (log de boot)
+ * alors que sa définition est plus bas (près de la table d'ops). */
+static esp_err_t tdeck_battery_mv(void *ctx, uint16_t *mv);
 
 static const char *TAG = "hal_tdeck";
 
@@ -711,19 +718,130 @@ static esp_err_t tdeck_display_init(void *ctx)
                  esp_err_to_name(i2c_err));
     }
 
+    /* Lecture batterie au boot (validation banc + diagnostic). */
+    uint16_t batt_mv = 0;
+    if (tdeck_battery_mv(driver, &batt_mv) == ESP_OK) {
+        ESP_LOGI(TAG, "T-Deck batterie ~%u mV", (unsigned)batt_mv);
+    }
+
     ESP_LOGI(TAG, "T-Deck display ready %ux%u",
              (unsigned)MESHPAY_HAL_TDECK_WIDTH,
              (unsigned)MESHPAY_HAL_TDECK_HEIGHT);
     return ESP_OK;
 }
 
-/* Table des ops pour le T-Deck : écran ST7789, tactile GT911 et clavier I2C câblés.
- * Les ops LoRa, ESP-NOW, batterie et stockage sont NULL (pas dans ce périmètre). */
+/* ── Batterie (ADC) ──────────────────────────────────────────────────────── */
+
+#define TDECK_BATT_ADC_CHANNEL ADC_CHANNEL_3    /* GPIO4 = ADC1_CH3 sur ESP32-S3 */
+#define TDECK_BATT_ADC_ATTEN   ADC_ATTEN_DB_12
+/* Pont diviseur : tension batterie = tension pin × 2.11 (ADC_MULTIPLIER T-Deck). */
+#define TDECK_BATT_MULT_NUM    211
+#define TDECK_BATT_MULT_DEN    100
+
+/* Initialise l'unité ADC1 + le canal batterie + la calibration (init paresseuse). */
+static esp_err_t tdeck_battery_adc_init(meshpay_hal_lilygo_tdeck_driver_t *driver)
+{
+    if (driver == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (driver->adc_ready) {
+        return ESP_OK;
+    }
+    adc_oneshot_unit_handle_t adc = NULL;
+    const adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = ADC_UNIT_1 };
+    esp_err_t err = adc_oneshot_new_unit(&unit_cfg, &adc);
+    if (err != ESP_OK) {
+        return err;
+    }
+    const adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten    = TDECK_BATT_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    err = adc_oneshot_config_channel(adc, TDECK_BATT_ADC_CHANNEL, &chan_cfg);
+    if (err != ESP_OK) {
+        (void)adc_oneshot_del_unit(adc);
+        return err;
+    }
+    /* Calibration : curve fitting si dispo, sinon line fitting, sinon brut. */
+    adc_cali_handle_t cali = NULL;
+    bool calibrated = false;
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    if (!calibrated) {
+        const adc_cali_curve_fitting_config_t cfg = {
+            .unit_id  = ADC_UNIT_1,
+            .chan     = TDECK_BATT_ADC_CHANNEL,
+            .atten    = TDECK_BATT_ADC_ATTEN,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        calibrated = (adc_cali_create_scheme_curve_fitting(&cfg, &cali) == ESP_OK);
+    }
+#endif
+#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    if (!calibrated) {
+        const adc_cali_line_fitting_config_t cfg = {
+            .unit_id  = ADC_UNIT_1,
+            .atten    = TDECK_BATT_ADC_ATTEN,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        calibrated = (adc_cali_create_scheme_line_fitting(&cfg, &cali) == ESP_OK);
+    }
+#endif
+    driver->adc_handle      = (void *)adc;
+    driver->adc_cali_handle = (void *)cali;
+    driver->adc_calibrated  = calibrated;
+    driver->adc_ready       = true;
+    return ESP_OK;
+}
+
+/* Op batterie : tension en mV (moyenne de 4 mesures × pont diviseur ×2.11). */
+static esp_err_t tdeck_battery_mv(void *ctx, uint16_t *mv)
+{
+    meshpay_hal_lilygo_tdeck_driver_t *driver =
+        (meshpay_hal_lilygo_tdeck_driver_t *)ctx;
+    if (driver == NULL || mv == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err = tdeck_battery_adc_init(driver);
+    if (err != ESP_OK) {
+        return err;
+    }
+    adc_oneshot_unit_handle_t adc = (adc_oneshot_unit_handle_t)driver->adc_handle;
+    int raw_sum = 0;
+    for (int i = 0; i < 4; ++i) {
+        int raw = 0;
+        err = adc_oneshot_read(adc, TDECK_BATT_ADC_CHANNEL, &raw);
+        if (err != ESP_OK) {
+            return err;
+        }
+        raw_sum += raw;
+    }
+    const int raw = raw_sum / 4;
+    int pin_mv = 0;
+    if (driver->adc_calibrated && driver->adc_cali_handle != NULL) {
+        err = adc_cali_raw_to_voltage((adc_cali_handle_t)driver->adc_cali_handle,
+                                      raw, &pin_mv);
+        if (err != ESP_OK) {
+            return err;
+        }
+    } else {
+        pin_mv = (raw * 3300) / 4095;   /* fallback non calibré */
+    }
+    uint32_t batt = (uint32_t)pin_mv * TDECK_BATT_MULT_NUM / TDECK_BATT_MULT_DEN;
+    if (batt > UINT16_MAX) {
+        batt = UINT16_MAX;
+    }
+    *mv = (uint16_t)batt;
+    return ESP_OK;
+}
+
+/* Table des ops pour le T-Deck : écran ST7789, tactile GT911, clavier I2C, batterie.
+ * Les ops LoRa, ESP-NOW et stockage sont NULL (hors périmètre du driver d'écran). */
 static const meshpay_hal_ops_t TDECK_OPS = {
     .display_init  = tdeck_display_init,
     .display_flush = tdeck_display_flush,
     .touch_read    = tdeck_touch_read,
     .keyboard_read = tdeck_keyboard_read,
+    .battery_mv    = tdeck_battery_mv,
 };
 
 /* ── Driver init / deinit publics ────────────────────────────────────────── */
