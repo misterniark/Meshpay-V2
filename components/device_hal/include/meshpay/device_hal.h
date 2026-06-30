@@ -316,6 +316,16 @@ esp_err_t meshpay_hal_lilygo_h752_rgb565_to_epd4(const uint16_t *pixels,
                                                  size_t pixel_count,
                                                  uint8_t *out,
                                                  size_t out_size);
+/* Décodeur GT911 brut, sans transformation d'axes : extrait uniquement le flag
+ * pressed et les coordonnées brutes (raw_x, raw_y) depuis la trame I2C.
+ * Réutilisable par toutes les cartes équipées d'un GT911 (H752, T-Deck, …).
+ * Chaque carte applique ensuite sa propre transformation d'axes. */
+esp_err_t meshpay_hal_gt911_decode_raw(const uint8_t *frame,
+                                       size_t frame_len,
+                                       bool *pressed,
+                                       uint16_t *raw_x,
+                                       uint16_t *raw_y);
+
 esp_err_t meshpay_hal_lilygo_h752_gt911_decode(const uint8_t *frame,
                                                size_t frame_len,
                                                meshpay_touch_state_t *state);

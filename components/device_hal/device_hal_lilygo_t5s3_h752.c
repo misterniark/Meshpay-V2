@@ -94,23 +94,57 @@ esp_err_t meshpay_hal_lilygo_h752_rgb565_to_epd4(const uint16_t *pixels,
     return ESP_OK;
 }
 
+/* Décodeur GT911 générique, sans transformation d'axes.
+ * Lit le registre de statut (frame[0]), vérifie la présence d'un point valide
+ * (bit 0x80 = données prêtes, bits 0x0F = nombre de points > 0), puis extrait
+ * les coordonnées brutes du premier point (little-endian, octets 2-5).
+ * Ne dépend d'aucune géométrie de carte — réutilisable par H752, T-Deck, etc. */
+esp_err_t meshpay_hal_gt911_decode_raw(const uint8_t *frame,
+                                       size_t frame_len,
+                                       bool *pressed,
+                                       uint16_t *raw_x,
+                                       uint16_t *raw_y)
+{
+    if (frame == NULL || pressed == NULL || raw_x == NULL || raw_y == NULL ||
+        frame_len < MESHPAY_HAL_LILYGO_H752_GT911_FRAME_LEN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const uint8_t status = frame[0];
+    /* Bit 0x80 : nouvelles données disponibles ; bits 0x0F : nombre de points. */
+    if ((status & 0x80U) == 0U || (status & 0x0FU) == 0U) {
+        *pressed = false;
+        *raw_x = 0;
+        *raw_y = 0;
+        return ESP_OK;
+    }
+    *pressed = true;
+    /* Coordonnées du premier point, encodées en little-endian sur 2 octets chacune. */
+    *raw_x = (uint16_t)frame[2] | ((uint16_t)frame[3] << 8);
+    *raw_y = (uint16_t)frame[4] | ((uint16_t)frame[5] << 8);
+    return ESP_OK;
+}
+
+/* Décodeur GT911 spécifique H752 : appelle le décodeur brut générique, puis
+ * applique la transformation d'axes propre à la carte H752 (rotation / miroir).
+ * Le comportement externe est identique à l'ancienne implémentation monolithique. */
 esp_err_t meshpay_hal_lilygo_h752_gt911_decode(const uint8_t *frame,
                                                size_t frame_len,
                                                meshpay_touch_state_t *state)
 {
-    if (frame == NULL || state == NULL ||
-        frame_len < MESHPAY_HAL_LILYGO_H752_GT911_FRAME_LEN) {
+    if (state == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-
+    bool pressed = false;
+    uint16_t raw_x = 0, raw_y = 0;
+    esp_err_t err =
+        meshpay_hal_gt911_decode_raw(frame, frame_len, &pressed, &raw_x, &raw_y);
+    if (err != ESP_OK) {
+        return err;
+    }
     memset(state, 0, sizeof(*state));
-    const uint8_t status = frame[0];
-    if ((status & 0x80U) == 0U || (status & 0x0FU) == 0U) {
+    if (!pressed) {
         return ESP_OK;
     }
-
-    const uint16_t raw_x = (uint16_t)frame[2] | ((uint16_t)frame[3] << 8);
-    const uint16_t raw_y = (uint16_t)frame[4] | ((uint16_t)frame[5] << 8);
     return meshpay_hal_lilygo_h752_transform_touch(raw_x, raw_y, state);
 }
 

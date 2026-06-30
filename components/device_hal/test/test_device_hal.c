@@ -448,6 +448,31 @@ TEST_CASE("lilygo h752 gt911 frame decodes status and point",
     TEST_ASSERT_FALSE(state.pressed);
 }
 
+/* Test Step 1 (TDD) : vérifie le décodeur GT911 brut, sans transformation d'axes.
+ * Ce test doit d'abord provoquer une erreur de compilation (symbole absent),
+ * puis passer au vert après implémentation de meshpay_hal_gt911_decode_raw. */
+TEST_CASE("gt911 raw decode extracts pressed flag and coordinates", "[device_hal]")
+{
+    uint8_t frame[MESHPAY_HAL_LILYGO_H752_GT911_FRAME_LEN] = {0};
+    bool pressed = true;
+    uint16_t x = 0, y = 0;
+
+    /* status sans bit 0x80 -> pas de point. */
+    TEST_ASSERT_EQUAL(ESP_OK,
+        meshpay_hal_gt911_decode_raw(frame, sizeof(frame), &pressed, &x, &y));
+    TEST_ASSERT_FALSE(pressed);
+
+    /* status valide (0x80 | count=1), point (0x0123, 0x0045). */
+    frame[0] = 0x81;
+    frame[2] = 0x23; frame[3] = 0x01;
+    frame[4] = 0x45; frame[5] = 0x00;
+    TEST_ASSERT_EQUAL(ESP_OK,
+        meshpay_hal_gt911_decode_raw(frame, sizeof(frame), &pressed, &x, &y));
+    TEST_ASSERT_TRUE(pressed);
+    TEST_ASSERT_EQUAL_UINT16(0x0123, x);
+    TEST_ASSERT_EQUAL_UINT16(0x0045, y);
+}
+
 TEST_CASE("lilygo h752 rgb565 packs into 4bpp epaper framebuffer",
           "[device_hal]")
 {
