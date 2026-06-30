@@ -62,6 +62,9 @@ extern "C" {
 #define MESHPAY_HAL_LILYGO_H752_GT911_FRAME_LEN 9
 #define MESHPAY_HAL_LILYGO_H752_TPS65185_ADDR 0x6B
 #define MESHPAY_HAL_LILYGO_H752_TPS65185_VCOM_MV 2000
+/* Résolution de l'écran ST7789 du T-Deck en mode paysage (320×240). */
+#define MESHPAY_HAL_TDECK_WIDTH  320
+#define MESHPAY_HAL_TDECK_HEIGHT 240
 
 typedef enum {
     MESHPAY_BOARD_UNKNOWN = 0,
@@ -189,6 +192,12 @@ typedef struct {
     bool adc_calibrated;
     bool dirty;
 } meshpay_hal_lilygo_t5s3_h752_driver_t;
+
+/* Contexte du driver d'écran ST7789 du T-Deck (SPI host 2). */
+typedef struct {
+    void *spi_handle; /* handle spi_device_handle_t opaque */
+    bool initialized;
+} meshpay_hal_lilygo_tdeck_driver_t;
 
 esp_err_t meshpay_hal_init(meshpay_hal_t *hal,
                            meshpay_board_t board,
@@ -325,6 +334,17 @@ esp_err_t meshpay_hal_gt911_decode_raw(const uint8_t *frame,
                                        bool *pressed,
                                        uint16_t *raw_x,
                                        uint16_t *raw_y);
+
+/* Initialise le driver écran ST7789 du T-Deck.
+ * Câble le SPI (host 2), l'alimentation KB_POWERON/SD_CS, le rétroéclairage LEDC
+ * et remplit l'écran en bleu au boot pour valider visuellement le driver.
+ * Retourne ESP_ERR_INVALID_ARG si driver ou hal est NULL. */
+esp_err_t meshpay_hal_lilygo_tdeck_driver_init(
+    meshpay_hal_lilygo_tdeck_driver_t *driver,
+    meshpay_hal_t *hal);
+/* Libère les ressources SPI allouées par meshpay_hal_lilygo_tdeck_driver_init. */
+esp_err_t meshpay_hal_lilygo_tdeck_driver_deinit(
+    meshpay_hal_lilygo_tdeck_driver_t *driver);
 
 /* Décode un octet brut reçu du clavier T-Deck (ESP32-C3 @0x55 en I2C).
  * raw == 0 → aucune touche en attente (*has_key = false).

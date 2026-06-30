@@ -1,12 +1,546 @@
 #include "meshpay/device_hal.h"
 
-/* Driver de la carte LILYGO T-Deck / T-Deck Plus (carte fondateur).
- * Pour l'instant : uniquement le décodage clavier pur (testable hors banc).
- * Les drivers matériels (écran ST7789, tactile GT911, clavier I2C, LoRa,
- * batterie) seront ajoutés en Phase 2 du Palier 0. */
+#include "sdkconfig.h"
 
-/* Le clavier T-Deck (ESP32-C3 @0x55) renvoie 0 quand aucune touche n'est
- * pressée, sinon le code ASCII de la touche. Décodage pur, testable hors banc. */
+#include <string.h>
+
+/* Driver de la carte LILYGO T-Deck / T-Deck Plus (carte fondateur).
+ *
+ * Phase 1 : décodage clavier pur (testable hors banc).
+ * Phase 2 : alimentation + écran ST7789 SPI (init + remplissage bleu + rétroéclairage).
+ *
+ * Phases suivantes (incréments ultérieurs) : tactile GT911, clavier I2C, LoRa SX1262,
+ * batterie — NON implémentés ici.
+ *
+ * Pinout écran ST7789 (paysage 320×240) :
+ *   CS=12  DC=11  MOSI=41  SCK=40  MISO=38  RST=-1 (pas de reset GPIO)  BL=42
+ * Alimentation :
+ *   KB_POWERON=10  (HIGH avant tout autre accès matériel)
+ *   SD_CS=39       (tenir HAUT pour éviter de perturber le bus SPI partagé) */
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Pins et constantes privées
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/* Alimentation / arbitrage bus */
+#define TDECK_PIN_KB_POWERON 10  /* GPIO à mettre HAUT avant toute init matérielle */
+#define TDECK_PIN_SD_CS      39  /* CS de la carte SD : tenir HAUT (bus SPI partagé) */
+
+/* Écran ST7789 SPI */
+#define TDECK_PIN_CS   12
+#define TDECK_PIN_DC   11
+#define TDECK_PIN_MOSI 41
+#define TDECK_PIN_SCK  40
+#define TDECK_PIN_MISO 38
+/* RST = -1 : pas de broche reset GPIO sur le T-Deck, reset logiciel (SWRESET) uniquement */
+#define TDECK_PIN_BL   42
+
+/* Fréquence SPI : 40 MHz — ST7789 supporte jusqu'à 80 MHz mais on reste conservatif */
+#define ST7789_SPI_CLOCK_HZ       (40 * 1000 * 1000)
+/* Taille max d'un transfert DMA SPI (doit être multiple de 4 pour certains DMA) */
+#define ST7789_SPI_MAX_TRANSFER   (32 * 1024)
+/* Taille des chunks utilisés pour envoyer les pixels (en octets) */
+#define ST7789_CHUNK_BYTES        512
+
+/* Rétroéclairage LEDC — canal 0, timer 0, PWM 8 bits, 5 kHz */
+#define TDECK_BL_LEDC_TIMER      LEDC_TIMER_0
+#define TDECK_BL_LEDC_CHANNEL    LEDC_CHANNEL_0
+#define TDECK_BL_LEDC_MODE       LEDC_LOW_SPEED_MODE
+#define TDECK_BL_LEDC_FREQ_HZ    5000
+#define TDECK_BL_LEDC_RESOLUTION LEDC_TIMER_8_BIT
+#define TDECK_BL_LEDC_MAX_DUTY   255
+
+/* Commandes ST7789 */
+#define ST7789_CMD_SWRESET 0x01
+#define ST7789_CMD_SLPOUT  0x11
+#define ST7789_CMD_NORON   0x13
+#define ST7789_CMD_INVON   0x21
+#define ST7789_CMD_CASET   0x2A
+#define ST7789_CMD_RASET   0x2B
+#define ST7789_CMD_RAMWR   0x2C
+#define ST7789_CMD_COLMOD  0x3A
+#define ST7789_CMD_MADCTL  0x36
+#define ST7789_CMD_DISPON  0x29
+
+/* COLMOD 0x55 = RGB565, 16 bits par pixel */
+#define ST7789_COLMOD_RGB565 0x55
+/* MADCTL 0x60 = MV (swap axes) + MX (miroir X) → paysage 320×240 */
+#define ST7789_MADCTL_LANDSCAPE 0x60
+
+/* Couleur de boot (bleu pur en RGB565 big-endian : R=0 G=0 B=31) */
+#define TDECK_BOOT_FILL_RGB565 0x001F
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Section compilée uniquement sur ESP32-S3 (cible T-Deck)
+ * ────────────────────────────────────────────────────────────────────────── */
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "driver/spi_master.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+static const char *TAG = "hal_tdeck";
+
+/* ── Helpers SPI ─────────────────────────────────────────────────────────── */
+
+/* Envoie un octet de commande (DC=0) via polling SPI. */
+static esp_err_t send_cmd(meshpay_hal_lilygo_tdeck_driver_t *driver, uint8_t cmd)
+{
+    gpio_set_level(TDECK_PIN_DC, 0);
+    spi_transaction_t t = {
+        .length = 8,
+        .flags  = SPI_TRANS_USE_TXDATA,
+    };
+    t.tx_data[0] = cmd;
+    return spi_device_polling_transmit((spi_device_handle_t)driver->spi_handle, &t);
+}
+
+/* Envoie un buffer de données (DC=1) par chunks de ST7789_CHUNK_BYTES octets.
+ * Utilise tx_data inline si le chunk tient dans 4 octets, sinon tx_buffer. */
+static esp_err_t send_data(meshpay_hal_lilygo_tdeck_driver_t *driver,
+                           const uint8_t *data,
+                           size_t len)
+{
+    if (driver == NULL || driver->spi_handle == NULL ||
+        (data == NULL && len > 0)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (len == 0) {
+        return ESP_OK;
+    }
+
+    gpio_set_level(TDECK_PIN_DC, 1);
+
+    size_t offset = 0;
+    while (offset < len) {
+        const size_t remaining = len - offset;
+        const size_t chunk = (remaining < ST7789_CHUNK_BYTES)
+                                 ? remaining
+                                 : ST7789_CHUNK_BYTES;
+        spi_transaction_t t = {
+            .length = chunk * 8U,
+        };
+        if (chunk <= sizeof(t.tx_data)) {
+            /* Transfert inline : évite une allocation DMA pour les petits buffers */
+            t.flags = SPI_TRANS_USE_TXDATA;
+            memcpy(t.tx_data, data + offset, chunk);
+        } else {
+            t.tx_buffer = data + offset;
+        }
+
+        const esp_err_t err =
+            spi_device_polling_transmit((spi_device_handle_t)driver->spi_handle, &t);
+        if (err != ESP_OK) {
+            return err;
+        }
+        offset += chunk;
+    }
+    return ESP_OK;
+}
+
+/* Raccourci : commande + 1 octet de paramètre. */
+static esp_err_t send_cmd_data(meshpay_hal_lilygo_tdeck_driver_t *driver,
+                               uint8_t cmd,
+                               uint8_t param)
+{
+    esp_err_t err = send_cmd(driver, cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return send_data(driver, &param, 1);
+}
+
+/* ── Alimentation ────────────────────────────────────────────────────────── */
+
+/* Met sous tension la section clavier/alimentation du T-Deck et maintient
+ * le CS de la carte SD à l'état HAUT pour ne pas perturber le bus SPI partagé.
+ * Doit être appelé en PREMIER, avant toute autre initialisation matérielle. */
+static esp_err_t tdeck_power_on(void)
+{
+    /* Configuration des GPIOs de contrôle en sortie */
+    const uint64_t output_mask =
+        (1ULL << TDECK_PIN_KB_POWERON) |
+        (1ULL << TDECK_PIN_SD_CS)      |
+        (1ULL << TDECK_PIN_DC)         |
+        (1ULL << TDECK_PIN_CS);
+    gpio_config_t cfg = {
+        .pin_bit_mask   = output_mask,
+        .mode           = GPIO_MODE_OUTPUT,
+        .pull_up_en     = GPIO_PULLUP_DISABLE,
+        .pull_down_en   = GPIO_PULLDOWN_DISABLE,
+        .intr_type      = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err = gpio_config(&cfg);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* KB_POWERON HIGH : active l'alimentation du clavier et des périphériques */
+    gpio_set_level(TDECK_PIN_KB_POWERON, 1);
+    /* SD_CS HIGH : déselectionne la SD card (bus SPI partagé) */
+    gpio_set_level(TDECK_PIN_SD_CS, 1);
+    /* CS écran HIGH : déselectionne l'écran pendant le démarrage */
+    gpio_set_level(TDECK_PIN_CS, 1);
+    /* DC : état quelconque pour l'instant */
+    gpio_set_level(TDECK_PIN_DC, 1);
+
+    /* Délai de stabilisation de l'alimentation avant tout accès SPI */
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "T-Deck power on (KB_POWERON=GPIO%u HIGH, SD_CS=GPIO%u HIGH)",
+             (unsigned)TDECK_PIN_KB_POWERON, (unsigned)TDECK_PIN_SD_CS);
+    return ESP_OK;
+}
+
+/* ── Init SPI ────────────────────────────────────────────────────────────── */
+
+/* Initialise le bus SPI2 et y attache le device ST7789.
+ * Tolère ESP_ERR_INVALID_STATE si le bus est déjà initialisé (partagé avec LoRa). */
+static esp_err_t init_spi(meshpay_hal_lilygo_tdeck_driver_t *driver)
+{
+    spi_bus_config_t bus = {
+        .mosi_io_num     = TDECK_PIN_MOSI,
+        .miso_io_num     = TDECK_PIN_MISO,
+        .sclk_io_num     = TDECK_PIN_SCK,
+        .quadwp_io_num   = -1,
+        .quadhd_io_num   = -1,
+        .max_transfer_sz = ST7789_SPI_MAX_TRANSFER,
+    };
+    esp_err_t err = spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO);
+    if (err == ESP_ERR_INVALID_STATE) {
+        /* Bus déjà initialisé (partagé avec LoRa) — on continue */
+        ESP_LOGD(TAG, "SPI2 bus déjà initialisé, on partage");
+        err = ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    spi_device_interface_config_t dev = {
+        .clock_speed_hz = ST7789_SPI_CLOCK_HZ,
+        .mode           = 0,
+        .spics_io_num   = TDECK_PIN_CS,
+        .queue_size     = 4,
+        .flags          = SPI_DEVICE_NO_DUMMY,
+    };
+    spi_device_handle_t handle = NULL;
+    err = spi_bus_add_device(SPI2_HOST, &dev, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    driver->spi_handle = (void *)handle;
+    return ESP_OK;
+}
+
+/* ── Rétroéclairage LEDC ─────────────────────────────────────────────────── */
+
+/* Configure le rétroéclairage via LEDC PWM 8 bits à 5 kHz, duty=255 (pleine
+ * luminosité). Pattern identique au Waveshare S3. */
+static esp_err_t init_backlight(void)
+{
+    ledc_timer_config_t timer = {
+        .speed_mode      = TDECK_BL_LEDC_MODE,
+        .timer_num       = TDECK_BL_LEDC_TIMER,
+        .duty_resolution = TDECK_BL_LEDC_RESOLUTION,
+        .freq_hz         = TDECK_BL_LEDC_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    esp_err_t err = ledc_timer_config(&timer);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    ledc_channel_config_t ch = {
+        .speed_mode = TDECK_BL_LEDC_MODE,
+        .channel    = TDECK_BL_LEDC_CHANNEL,
+        .timer_sel  = TDECK_BL_LEDC_TIMER,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .gpio_num   = TDECK_PIN_BL,
+        .duty       = TDECK_BL_LEDC_MAX_DUTY,
+        .hpoint     = 0,
+    };
+    err = ledc_channel_config(&ch);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = ledc_update_duty(TDECK_BL_LEDC_MODE, TDECK_BL_LEDC_CHANNEL);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "T-Deck backlight LEDC GPIO%u duty=%u",
+                 (unsigned)TDECK_PIN_BL, (unsigned)TDECK_BL_LEDC_MAX_DUTY);
+    }
+    return err;
+}
+
+/* ── Séquence d'init ST7789 ─────────────────────────────────────────────── */
+
+/* Initialise le contrôleur ST7789 en mode paysage 320×240, RGB565.
+ * Séquence standard validée sur ST7789V2 / T-Deck :
+ *   SWRESET → SLPOUT → COLMOD (RGB565) → MADCTL (paysage) → INVON → NORON → DISPON */
+static esp_err_t run_st7789_init(meshpay_hal_lilygo_tdeck_driver_t *driver)
+{
+    esp_err_t err;
+
+    /* Reset logiciel — pas de GPIO reset sur le T-Deck */
+    err = send_cmd(driver, ST7789_CMD_SWRESET);
+    if (err != ESP_OK) return err;
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    /* Sortie du mode sleep */
+    err = send_cmd(driver, ST7789_CMD_SLPOUT);
+    if (err != ESP_OK) return err;
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    /* Format de couleur : RGB565 (16 bits/pixel) */
+    err = send_cmd_data(driver, ST7789_CMD_COLMOD, ST7789_COLMOD_RGB565);
+    if (err != ESP_OK) return err;
+
+    /* Orientation paysage : MV (swap axes) + MX (miroir X).
+     * À affiner au banc si l'image apparaît retournée ou miroir. */
+    err = send_cmd_data(driver, ST7789_CMD_MADCTL, ST7789_MADCTL_LANDSCAPE);
+    if (err != ESP_OK) return err;
+
+    /* Inversion ON : requise sur ST7789 pour des couleurs correctes */
+    err = send_cmd(driver, ST7789_CMD_INVON);
+    if (err != ESP_OK) return err;
+
+    /* Normal display ON */
+    err = send_cmd(driver, ST7789_CMD_NORON);
+    if (err != ESP_OK) return err;
+
+    /* Display ON */
+    err = send_cmd(driver, ST7789_CMD_DISPON);
+    if (err != ESP_OK) return err;
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    return ESP_OK;
+}
+
+/* ── Flush / remplissage ─────────────────────────────────────────────────── */
+
+/* Définit la fenêtre d'écriture plein écran ST7789 (CASET + RASET) et envoie
+ * RAMWR, puis les pixels RGB565 fournis convertis en big-endian.
+ *
+ * pixels : tableau de width×height uint16_t RGB565 (little-endian machine).
+ * Réutilise meshpay_hal_waveshare_s3_rgb565_to_be pour la conversion BE. */
+static esp_err_t tdeck_display_flush(void *ctx,
+                                     const void *pixels,
+                                     uint16_t width,
+                                     uint16_t height)
+{
+    meshpay_hal_lilygo_tdeck_driver_t *driver =
+        (meshpay_hal_lilygo_tdeck_driver_t *)ctx;
+    if (driver == NULL || !driver->initialized || pixels == NULL ||
+        width == 0 || height == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Fenêtre colonnes (CASET) : 0..(width-1) */
+    const uint16_t x2 = width - 1U;
+    const uint8_t caset[4] = {
+        0x00, 0x00,
+        (uint8_t)(x2 >> 8), (uint8_t)x2,
+    };
+    /* Fenêtre lignes (RASET) : 0..(height-1) */
+    const uint16_t y2 = height - 1U;
+    const uint8_t raset[4] = {
+        0x00, 0x00,
+        (uint8_t)(y2 >> 8), (uint8_t)y2,
+    };
+
+    esp_err_t err = send_cmd(driver, ST7789_CMD_CASET);
+    if (err == ESP_OK) err = send_data(driver, caset, sizeof(caset));
+    if (err == ESP_OK) err = send_cmd(driver, ST7789_CMD_RASET);
+    if (err == ESP_OK) err = send_data(driver, raset, sizeof(raset));
+    if (err == ESP_OK) err = send_cmd(driver, ST7789_CMD_RAMWR);
+    if (err != ESP_OK) return err;
+
+    /* Envoi des pixels par chunks avec conversion RGB565 → big-endian */
+    const uint16_t *src = (const uint16_t *)pixels;
+    size_t remaining = (size_t)width * (size_t)height;
+    /* Buffer local de 1024 octets = 512 pixels max par chunk */
+    uint8_t tx_buf[1024];
+    while (remaining > 0) {
+        const size_t chunk_px = (remaining < (sizeof(tx_buf) / 2U))
+                                    ? remaining
+                                    : (sizeof(tx_buf) / 2U);
+        err = meshpay_hal_waveshare_s3_rgb565_to_be(src, chunk_px,
+                                                    tx_buf, sizeof(tx_buf));
+        if (err == ESP_OK) {
+            err = send_data(driver, tx_buf, chunk_px * 2U);
+        }
+        if (err != ESP_OK) {
+            return err;
+        }
+        src       += chunk_px;
+        remaining -= chunk_px;
+    }
+    return ESP_OK;
+}
+
+/* Remplit tout l'écran d'une couleur unie rgb565 (utile au boot et pour les tests). */
+static esp_err_t fill_screen(meshpay_hal_lilygo_tdeck_driver_t *driver,
+                             uint16_t rgb565)
+{
+    /* Fenêtre colonnes plein écran */
+    const uint8_t caset[4] = {
+        0x00, 0x00,
+        (uint8_t)((MESHPAY_HAL_TDECK_WIDTH  - 1U) >> 8),
+        (uint8_t) (MESHPAY_HAL_TDECK_WIDTH  - 1U),
+    };
+    /* Fenêtre lignes plein écran */
+    const uint8_t raset[4] = {
+        0x00, 0x00,
+        (uint8_t)((MESHPAY_HAL_TDECK_HEIGHT - 1U) >> 8),
+        (uint8_t) (MESHPAY_HAL_TDECK_HEIGHT - 1U),
+    };
+
+    esp_err_t err = send_cmd(driver, ST7789_CMD_CASET);
+    if (err == ESP_OK) err = send_data(driver, caset, sizeof(caset));
+    if (err == ESP_OK) err = send_cmd(driver, ST7789_CMD_RASET);
+    if (err == ESP_OK) err = send_data(driver, raset, sizeof(raset));
+    if (err == ESP_OK) err = send_cmd(driver, ST7789_CMD_RAMWR);
+    if (err != ESP_OK) return err;
+
+    /* Préremplit un buffer de 256 octets (128 pixels) avec la couleur big-endian */
+    uint8_t tx_buf[256];
+    for (size_t i = 0; i < sizeof(tx_buf); i += 2U) {
+        tx_buf[i]      = (uint8_t)(rgb565 >> 8);
+        tx_buf[i + 1U] = (uint8_t)rgb565;
+    }
+
+    /* Envoie la couleur sur l'ensemble des pixels plein écran */
+    size_t remaining =
+        (size_t)MESHPAY_HAL_TDECK_WIDTH * (size_t)MESHPAY_HAL_TDECK_HEIGHT * 2U;
+    while (remaining > 0) {
+        const size_t chunk = (remaining < sizeof(tx_buf))
+                                 ? remaining
+                                 : sizeof(tx_buf);
+        err = send_data(driver, tx_buf, chunk);
+        if (err != ESP_OK) return err;
+        remaining -= chunk;
+    }
+    return ESP_OK;
+}
+
+/* ── Ops display_init / display_flush ────────────────────────────────────── */
+
+/* Fonction d'initialisation de l'écran appelée via meshpay_hal_display_init.
+ * Séquence : power on → SPI → rétroéclairage → séquence ST7789 → remplissage bleu. */
+static esp_err_t tdeck_display_init(void *ctx)
+{
+    meshpay_hal_lilygo_tdeck_driver_t *driver =
+        (meshpay_hal_lilygo_tdeck_driver_t *)ctx;
+    if (driver == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (driver->initialized) {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "initialisation écran T-Deck ST7789 320×240");
+
+    esp_err_t err = tdeck_power_on();
+    if (err == ESP_OK) {
+        err = init_spi(driver);
+    }
+    if (err == ESP_OK) {
+        err = init_backlight();
+    }
+    if (err == ESP_OK) {
+        err = run_st7789_init(driver);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "T-Deck display init failed: %s", esp_err_to_name(err));
+        (void)meshpay_hal_lilygo_tdeck_driver_deinit(driver);
+        return err;
+    }
+
+    /* Marque le driver comme initialisé AVANT le fill_screen car tdeck_display_flush
+     * vérifie driver->initialized. */
+    driver->initialized = true;
+
+    /* Remplissage bleu pur au boot : validation visuelle immédiate au banc.
+     * RGB565 0x001F = R=0 G=0 B=31 = bleu pur. */
+    err = fill_screen(driver, TDECK_BOOT_FILL_RGB565);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "T-Deck fill bleu boot échoué: %s", esp_err_to_name(err));
+        /* Non fatal : l'écran est initialisé, le remplissage couleur est cosmétique */
+    }
+
+    ESP_LOGI(TAG, "T-Deck display ready %ux%u",
+             (unsigned)MESHPAY_HAL_TDECK_WIDTH,
+             (unsigned)MESHPAY_HAL_TDECK_HEIGHT);
+    return ESP_OK;
+}
+
+/* Table des ops display pour le T-Deck (pas de tactile, pas de LoRa dans ce périmètre). */
+static const meshpay_hal_ops_t TDECK_OPS = {
+    .display_init  = tdeck_display_init,
+    .display_flush = tdeck_display_flush,
+};
+
+/* ── Driver init / deinit publics ────────────────────────────────────────── */
+
+esp_err_t meshpay_hal_lilygo_tdeck_driver_init(
+    meshpay_hal_lilygo_tdeck_driver_t *driver,
+    meshpay_hal_t *hal)
+{
+    if (driver == NULL || hal == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(driver, 0, sizeof(*driver));
+    return meshpay_hal_init(hal, MESHPAY_BOARD_LILYGO_TDECK, &TDECK_OPS, driver);
+}
+
+esp_err_t meshpay_hal_lilygo_tdeck_driver_deinit(
+    meshpay_hal_lilygo_tdeck_driver_t *driver)
+{
+    if (driver == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (driver->spi_handle != NULL) {
+        (void)spi_bus_remove_device((spi_device_handle_t)driver->spi_handle);
+    }
+    /* Ne pas appeler spi_bus_free ici car le bus SPI2 peut être partagé avec le LoRa */
+    memset(driver, 0, sizeof(*driver));
+    return ESP_OK;
+}
+
+#else /* CONFIG_IDF_TARGET_ESP32S3 non défini */
+
+/* Stubs pour les cibles non-S3 (compilation croisée, tests hôte, etc.) */
+
+esp_err_t meshpay_hal_lilygo_tdeck_driver_init(
+    meshpay_hal_lilygo_tdeck_driver_t *driver,
+    meshpay_hal_t *hal)
+{
+    (void)driver;
+    (void)hal;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t meshpay_hal_lilygo_tdeck_driver_deinit(
+    meshpay_hal_lilygo_tdeck_driver_t *driver)
+{
+    if (driver == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(driver, 0, sizeof(*driver));
+    return ESP_OK;
+}
+
+#endif /* CONFIG_IDF_TARGET_ESP32S3 */
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Phase 1 — Décodage clavier pur (testable hors banc, toutes cibles)
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * Le clavier T-Deck (ESP32-C3 @0x55) renvoie 0 quand aucune touche n'est
+ * pressée, sinon le code ASCII de la touche. Décodage pur, sans I2C. */
 esp_err_t meshpay_hal_tdeck_keyboard_decode(uint8_t raw, bool *has_key, char *ch)
 {
     if (has_key == NULL || ch == NULL) {

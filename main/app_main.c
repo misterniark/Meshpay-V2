@@ -137,6 +137,11 @@ static TaskHandle_t s_waveshare_touch_task;
 static meshpay_hal_t s_display_hal;
 static meshpay_hal_lilygo_t5s3_h752_driver_t s_lilygo_h752_display_driver;
 #endif
+#if CONFIG_MESHPAY_BOARD_LILYGO_TDECK
+/* HAL d'affichage T-Deck : écran ST7789 SPI 320×240 (Phase 2 Palier 0). */
+static meshpay_hal_t s_display_hal;
+static meshpay_hal_lilygo_tdeck_driver_t s_tdeck_display_driver;
+#endif
 #if MESHPAY_RADIO_HAS_ESPNOW
 static meshpay_hal_espnow_driver_t s_espnow_driver;
 #endif
@@ -2432,6 +2437,23 @@ static void init_display_if_available(void)
     } else {
         ESP_LOGW(TAG,
                  "LilyGo H752 display/touch HAL unavailable: %s",
+                 esp_err_to_name(err));
+    }
+#elif CONFIG_MESHPAY_BOARD_LILYGO_TDECK
+    /* Phase 2 Palier 0 : driver écran ST7789 T-Deck.
+     * L'init allume le rétroéclairage et remplit l'écran en bleu (validation visuelle
+     * immédiate au banc). Tactile, clavier I2C et LoRa : incréments suivants. */
+    esp_err_t err = meshpay_hal_lilygo_tdeck_driver_init(
+        &s_tdeck_display_driver,
+        &s_display_hal);
+    if (err == ESP_OK) {
+        err = meshpay_hal_display_init(&s_display_hal);
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "T-Deck display HAL ready (ST7789 320x240)");
+    } else {
+        ESP_LOGW(TAG,
+                 "T-Deck display HAL unavailable: %s",
                  esp_err_to_name(err));
     }
 #else
