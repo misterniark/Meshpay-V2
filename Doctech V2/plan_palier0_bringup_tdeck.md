@@ -10,6 +10,12 @@
 
 **Référence spec :** `Doctech V2/chantier_palier0_bringup_tdeck.md`.
 
+> **État (2026-06-30) : Phase 1 ✅ TERMINÉE et fusionnée sur `main`** (commits
+> `9cf99ff..f333abe`). Tâches 1-5 faites en TDD (sous-agents) ; `test_app` et le
+> firmware T-Deck compilent. ⚠️ Assertions Unity **non encore exécutées on-device**
+> (cible-only S3). **Phase 2 (drivers au banc) = prochaine étape**, nécessite le
+> T-Deck branché.
+
 ---
 
 ## Pinout (rappel, source variant Meshtastic `t-deck` + utilities.h LILYGO)
