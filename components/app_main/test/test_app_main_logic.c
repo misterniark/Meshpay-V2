@@ -1501,3 +1501,121 @@ TEST_CASE("app bootstrap rejects stored record without identity", "[app_main]")
                       meshpay_app_bootstrap_identity(&backend, "Fallback",
                                                      &identity, NULL, NULL));
 }
+
+/* --- Palier A5 : config monnaie au boot depuis le record (repli sûr) --- *
+ * Tag dédié [a5] : ces tests n'utilisent que record + config (petites
+ * structures) et peuvent être lancés seuls, sans le reste de la suite
+ * [app_main] qui place de gros meshpay_app_t (~57 Ko de DAG) sur la pile. */
+
+/* Construit un record portant un descripteur signé par 'founder'. */
+static void record_with_descriptor(meshpay_storage_record_t *record,
+                                   const rns_identity_t *founder)
+{
+    meshpay_storage_record_init(record);
+
+    meshpay_currency_descriptor_t body;
+    meshpay_currency_descriptor_init(&body);
+    strncpy(body.name, "Minimistan", sizeof(body.name) - 1);
+    strncpy(body.symbol, "MIN", sizeof(body.symbol) - 1);
+    body.max_supply = 12345;
+    body.transfer_fee = 2;
+
+    meshpay_currency_descriptor_signed_t signed_desc;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_sign(&signed_desc, &body,
+                                                       founder));
+    uint8_t wire[MESHPAY_CURRENCY_DESCRIPTOR_CBOR_MAX];
+    size_t wire_len = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_encode(&signed_desc, wire,
+                                                         sizeof(wire), &wire_len));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_storage_record_set_currency_descriptor(record, wire,
+                                                                     wire_len));
+}
+
+TEST_CASE("app currency_from_record derives from valid descriptor", "[app_main][a5]")
+{
+    rns_identity_t founder;
+    load_identity(&founder, 0x30);
+
+    meshpay_storage_record_t record;
+    record_with_descriptor(&record, &founder);
+
+    meshpay_currency_config_t fallback;
+    meshpay_currency_config_init(&fallback, 1); /* repli codé en dur */
+
+    meshpay_currency_config_t out;
+    bool from_desc = false;
+    TEST_ASSERT_EQUAL(ESP_OK,
+        meshpay_app_currency_from_record(&record, &fallback, &out, &from_desc));
+
+    TEST_ASSERT_TRUE(from_desc);
+    TEST_ASSERT_TRUE(out.has_descriptor);
+    TEST_ASSERT_EQUAL_UINT64(12345, out.max_supply); /* dérivé, != repli (0) */
+    /* Autorité MINT unique = hash du fondateur. */
+    uint8_t founder_hash[RNS_IDENTITY_HASH_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_get_hash(&founder, founder_hash));
+    TEST_ASSERT_EQUAL_UINT8(1, out.mint_authority_count);
+    TEST_ASSERT_TRUE(meshpay_currency_is_mint_authority(&out, founder_hash));
+}
+
+TEST_CASE("app currency_from_record falls back without descriptor", "[app_main][a5]")
+{
+    meshpay_storage_record_t record;
+    meshpay_storage_record_init(&record); /* aucun descripteur */
+    TEST_ASSERT_FALSE(record.has_currency_descriptor);
+
+    meshpay_currency_config_t fallback;
+    meshpay_currency_config_init(&fallback, 7);
+    fallback.transfer_fee = 9;
+
+    meshpay_currency_config_t out;
+    bool from_desc = true;
+    TEST_ASSERT_EQUAL(ESP_OK,
+        meshpay_app_currency_from_record(&record, &fallback, &out, &from_desc));
+
+    TEST_ASSERT_FALSE(from_desc);
+    TEST_ASSERT_FALSE(out.has_descriptor);
+    TEST_ASSERT_EQUAL_UINT32(7, out.currency_id);   /* config de repli conservée */
+    TEST_ASSERT_EQUAL_UINT32(9, out.transfer_fee);
+}
+
+TEST_CASE("app currency_from_record falls back on corrupt descriptor", "[app_main][a5]")
+{
+    rns_identity_t founder;
+    load_identity(&founder, 0x31);
+
+    meshpay_storage_record_t record;
+    record_with_descriptor(&record, &founder);
+    /* Corrompre un octet du corps signé : la vérif échoue -> repli (pas vierge,
+     * pas de blocage du boot). */
+    record.currency_descriptor[5] ^= 0xFF;
+
+    meshpay_currency_config_t fallback;
+    meshpay_currency_config_init(&fallback, 7);
+
+    meshpay_currency_config_t out;
+    bool from_desc = true;
+    TEST_ASSERT_EQUAL(ESP_OK,
+        meshpay_app_currency_from_record(&record, &fallback, &out, &from_desc));
+
+    TEST_ASSERT_FALSE(from_desc);
+    TEST_ASSERT_FALSE(out.has_descriptor);
+    TEST_ASSERT_EQUAL_UINT32(7, out.currency_id);   /* repli */
+}
+
+TEST_CASE("app currency_from_record rejects NULL", "[app_main][a5]")
+{
+    meshpay_storage_record_t record;
+    meshpay_storage_record_init(&record);
+    meshpay_currency_config_t cfg;
+    meshpay_currency_config_init(&cfg, 1);
+
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+        meshpay_app_currency_from_record(NULL, &cfg, &cfg, NULL));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+        meshpay_app_currency_from_record(&record, NULL, &cfg, NULL));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+        meshpay_app_currency_from_record(&record, &cfg, NULL, NULL));
+}

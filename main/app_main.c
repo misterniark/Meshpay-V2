@@ -2594,6 +2594,9 @@ void app_main(void)
              destination->hash[2],
              destination->hash[3]);
 
+    /* Config monnaie de REPLI (codée en dur) : currency_id=1, le device est sa
+     * propre autorité MINT. Conserve le comportement historique du wallet quand
+     * aucun descripteur signé n'est encore persisté. */
     meshpay_currency_config_t currency;
     meshpay_currency_config_init(&currency, 1);
     currency.transfer_fee = 0;
@@ -2603,10 +2606,27 @@ void app_main(void)
         return;
     }
 
+    /* Palier A5 : si un descripteur de monnaie signé est persisté (storage),
+     * la config effective en dérive (autorité = fondateur, durcissement MINT
+     * actif) ; sinon on garde le repli ci-dessus (aucune régression du wallet). */
+    meshpay_currency_config_t effective_currency;
+    bool currency_from_descriptor = false;
+    err = meshpay_app_currency_from_record(&boot_record, &currency,
+                                           &effective_currency,
+                                           &currency_from_descriptor);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "resolution config monnaie echouee: %s",
+                 esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI(TAG, "config monnaie: %s (currency_id=%u)",
+             currency_from_descriptor ? "descripteur signe" : "repli code en dur",
+             (unsigned)effective_currency.currency_id);
+
     err = meshpay_app_init(&s_app,
                            destination->hash,
                            &s_node.identity,
-                           &currency,
+                           &effective_currency,
                            next_seq,
                            storage_ready && boot_record.has_pin_hash);
     if (err != ESP_OK) {

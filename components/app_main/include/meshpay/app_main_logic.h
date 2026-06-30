@@ -114,6 +114,21 @@ esp_err_t meshpay_app_init(meshpay_app_t *app,
                            const meshpay_currency_config_t *currency,
                            uint32_t next_seq,
                            bool has_pin);
+
+/*
+ * Palier A5 — détermine la config monnaie EFFECTIVE au boot, avec repli sûr :
+ *  - si le record porte un descripteur de monnaie valide (blob décodé PUIS
+ *    vérifié), out_config est dérivé du descripteur (durcissement MINT actif) ;
+ *  - sinon (pas de descripteur, ou blob illisible/invalide), out_config = repli
+ *    (la config fournie, p.ex. codée en dur) — aucune régression du wallet.
+ * out_from_descriptor (optionnel) indique le chemin pris. Renvoie toujours une
+ * config utilisable (ESP_OK), sauf arguments NULL (ESP_ERR_INVALID_ARG).
+ */
+esp_err_t meshpay_app_currency_from_record(
+    const meshpay_storage_record_t *record,
+    const meshpay_currency_config_t *fallback,
+    meshpay_currency_config_t *out_config,
+    bool *out_from_descriptor);
 esp_err_t meshpay_app_seed_tx(meshpay_app_t *app, const meshpay_tx_t *tx);
 esp_err_t meshpay_app_announce(meshpay_app_t *app);
 esp_err_t meshpay_app_pay(meshpay_app_t *sender,

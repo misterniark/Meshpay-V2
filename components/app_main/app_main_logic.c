@@ -2,6 +2,7 @@
 
 #include "esp_check.h"
 #include "esp_log.h"
+#include "meshpay/currency_descriptor.h"
 #include "meshpay/rns/rns_announce.h"
 #include "meshpay/rns/rns_crypto.h"
 #include <stdio.h>
@@ -292,6 +293,57 @@ esp_err_t meshpay_app_init(meshpay_app_t *app,
                                                    &app->currency,
                                                    &app->identity),
                         "app_main", "");
+    return ESP_OK;
+}
+
+esp_err_t meshpay_app_currency_from_record(
+    const meshpay_storage_record_t *record,
+    const meshpay_currency_config_t *fallback,
+    meshpay_currency_config_t *out_config,
+    bool *out_from_descriptor)
+{
+    if (record == NULL || fallback == NULL || out_config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (out_from_descriptor != NULL) {
+        *out_from_descriptor = false;
+    }
+    /* Repli par défaut : la config fournie (codée en dur). On la pose d'emblée
+     * pour qu'un chemin d'échec laisse toujours une config utilisable. */
+    *out_config = *fallback;
+
+    /* Pas de descripteur stocké -> device « vierge » -> on garde le repli. */
+    if (!record->has_currency_descriptor ||
+        record->currency_descriptor_len == 0) {
+        return ESP_OK;
+    }
+
+    /* Décodage du blob CBOR opaque, puis vérification cryptographique. Tout
+     * échec retombe sur le repli (descripteur corrompu/illisible ne doit pas
+     * empêcher le boot). */
+    meshpay_currency_descriptor_signed_t signed_desc;
+    if (meshpay_currency_descriptor_decode(record->currency_descriptor,
+                                           record->currency_descriptor_len,
+                                           &signed_desc) != ESP_OK) {
+        ESP_LOGW("app_main", "descripteur monnaie stocké illisible -> repli");
+        return ESP_OK;
+    }
+    if (meshpay_currency_descriptor_verify(&signed_desc) != ESP_OK) {
+        ESP_LOGW("app_main", "descripteur monnaie stocké invalide -> repli");
+        return ESP_OK;
+    }
+
+    meshpay_currency_config_t derived;
+    if (meshpay_currency_config_from_descriptor(&derived, &signed_desc) !=
+        ESP_OK) {
+        ESP_LOGW("app_main", "dérivation config depuis descripteur échouée -> repli");
+        return ESP_OK;
+    }
+
+    *out_config = derived;
+    if (out_from_descriptor != NULL) {
+        *out_from_descriptor = true;
+    }
     return ESP_OK;
 }
 
