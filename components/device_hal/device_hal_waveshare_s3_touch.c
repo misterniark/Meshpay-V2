@@ -115,7 +115,12 @@ esp_err_t meshpay_hal_waveshare_s3_rgb565_to_be(const uint16_t *pixels,
     return ESP_OK;
 }
 
-#if defined(CONFIG_IDF_TARGET_ESP32S3)
+/* Gardé par le board Kconfig (comme le H752) : sur un build S3 d'une AUTRE carte
+ * — ou le test_app (board UNKNOWN) — ce driver (i2c « neuf », i2c_master.h) ne
+ * doit PAS être lié, sinon il entre en conflit avec le driver i2c « ancien »
+ * du T-Deck/H752 (abort au boot : « driver_ng is not allowed with this old
+ * driver »). */
+#if defined(CONFIG_IDF_TARGET_ESP32S3) && CONFIG_MESHPAY_BOARD_WAVESHARE_S3_TOUCH
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"

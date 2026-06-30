@@ -83,9 +83,12 @@
 #define TDECK_BOOT_FILL_RGB565 0x001F
 
 /* ──────────────────────────────────────────────────────────────────────────
- * Section compilée uniquement sur ESP32-S3 (cible T-Deck)
+ * Section compilée uniquement pour la carte T-Deck sur ESP32-S3.
+ * Gardée par le board Kconfig (comme le H752) : ce driver tire l'i2c « ancien »
+ * (i2c.h) ; sur un autre board S3 ou le test_app (board UNKNOWN) il ne doit pas
+ * être lié, sinon conflit avec l'i2c « neuf » du Waveshare (abort au boot).
  * ────────────────────────────────────────────────────────────────────────── */
-#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#if defined(CONFIG_IDF_TARGET_ESP32S3) && CONFIG_MESHPAY_BOARD_LILYGO_TDECK
 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
