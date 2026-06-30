@@ -3,7 +3,9 @@
 #include "meshpay/rns/rns_crypto.h"
 #include "meshpay/rns/rns_node.h"
 #include "meshpay/rns/rns_packet_crypto.h"
+#include "test_pool.h"
 #include "unity.h"
+#include <stdlib.h>
 #include <string.h>
 
 static void fill_sequence(uint8_t *out, size_t len, uint8_t start)
@@ -228,49 +230,49 @@ TEST_CASE("app main simulated boot announce and payment", "[app_main]")
     load_identity(&identity_a, 0x01);
     load_identity(&identity_b, 0x21);
 
-    meshpay_app_t app_a;
-    meshpay_app_t app_b;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app_a, alice, &identity_a,
+    meshpay_app_t *app_a = test_pool_app(0);
+    meshpay_app_t *app_b = test_pool_app(1);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_a, alice, &identity_a,
                                                &config, 1, true));
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app_b, bob, &identity_b,
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_b, bob, &identity_b,
                                                &config, 1, true));
-    TEST_ASSERT_EQUAL(MESHPAY_UI_SCREEN_HOME, app_a.ui.screen);
+    TEST_ASSERT_EQUAL(MESHPAY_UI_SCREEN_HOME, app_a->ui.screen);
     TEST_ASSERT_EQUAL(MESHPAY_APP_UI_TASK_NAME[0], 'u');
     TEST_ASSERT_EQUAL(MESHPAY_APP_CORE_TASK_NAME[0], 'c');
 
     meshpay_tx_t mint;
     make_mint(&mint, master, alice, 1000, config.currency_id);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&app_a, &mint));
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&app_b, &mint));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_a, &mint));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_b, &mint));
 
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_announce(&app_a));
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_announce(&app_b));
-    TEST_ASSERT_TRUE(app_a.announced);
-    TEST_ASSERT_TRUE(app_b.announced);
-    TEST_ASSERT_EQUAL_UINT8(0, app_a.ui.network_peers);
-    TEST_ASSERT_EQUAL_UINT8(0, app_b.ui.network_peers);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_announce(app_a));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_announce(app_b));
+    TEST_ASSERT_TRUE(app_a->announced);
+    TEST_ASSERT_TRUE(app_b->announced);
+    TEST_ASSERT_EQUAL_UINT8(0, app_a->ui.network_peers);
+    TEST_ASSERT_EQUAL_UINT8(0, app_b->ui.network_peers);
 
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_pay(&app_a, &app_b, 100, 1000));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_pay(app_a, app_b, 100, 1000));
     TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_CONFIRMED,
-                      app_a.ui.feedback);
-    TEST_ASSERT_EQUAL(MESHPAY_UI_SCREEN_HISTORY, app_a.ui.screen);
+                      app_a->ui.feedback);
+    TEST_ASSERT_EQUAL(MESHPAY_UI_SCREEN_HISTORY, app_a->ui.screen);
     TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_RECEIVED,
-                      app_b.ui.feedback);
-    TEST_ASSERT_EQUAL(MESHPAY_UI_SCREEN_RECEIVE, app_b.ui.screen);
+                      app_b->ui.feedback);
+    TEST_ASSERT_EQUAL(MESHPAY_UI_SCREEN_RECEIVE, app_b->ui.screen);
 
     uint32_t balance = 0;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&app_a.currency,
-                                                           &app_a.dag,
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&app_a->currency,
+                                                           &app_a->dag,
                                                            alice,
                                                            &balance));
     TEST_ASSERT_EQUAL_UINT32(895, balance);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&app_b.currency,
-                                                           &app_b.dag,
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&app_b->currency,
+                                                           &app_b->dag,
                                                            bob,
                                                            &balance));
     TEST_ASSERT_EQUAL_UINT32(100, balance);
-    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&app_a.dag));
-    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&app_b.dag));
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&app_a->dag));
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&app_b->dag));
 }
 
 TEST_CASE("app runtime creates queues and non recursive mutex", "[app_main]")
@@ -284,8 +286,8 @@ TEST_CASE("app runtime creates queues and non recursive mutex", "[app_main]")
     rns_identity_t identity;
     load_identity(&identity, 0x71);
 
-    meshpay_app_t app;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app, owner, &identity,
+    meshpay_app_t *app = test_pool_app(0);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app, owner, &identity,
                                                &config, 1, true));
 
     meshpay_app_runtime_config_t runtime_config =
@@ -295,7 +297,7 @@ TEST_CASE("app runtime creates queues and non recursive mutex", "[app_main]")
     runtime_config.core_queue_length = 2;
 
     meshpay_app_runtime_t runtime;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, &app,
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, app,
                                                        &runtime_config));
     TEST_ASSERT_NOT_NULL(runtime.ui_queue);
     TEST_ASSERT_NOT_NULL(runtime.reticulum_queue);
@@ -323,13 +325,13 @@ TEST_CASE("app runtime learns peer from announce packet", "[app_main]")
     load_identity(&identity_a, 0x29);
     load_identity(&identity_b, 0x69);
 
-    meshpay_app_t app;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app, alice, &identity_a,
+    meshpay_app_t *app = test_pool_app(0);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app, alice, &identity_a,
                                                &config, 1, true));
-    TEST_ASSERT_EQUAL_UINT8(0, app.ui.network_peers);
+    TEST_ASSERT_EQUAL_UINT8(0, app->ui.network_peers);
 
     meshpay_app_runtime_t runtime;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, &app, NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, app, NULL));
 
     rns_packet_t announce;
     build_wallet_announce_packet(&identity_b, 0xa0, &announce);
@@ -346,9 +348,9 @@ TEST_CASE("app runtime learns peer from announce packet", "[app_main]")
                                   &runtime,
                                   MESHPAY_APP_QUEUE_RETICULUM, 0));
     TEST_ASSERT_EQUAL_UINT32(1, rns_announce_known_count());
-    TEST_ASSERT_EQUAL_UINT8(1, app.ui.network_peers);
-    TEST_ASSERT_EQUAL_UINT8(1, app.ui.payment_peer_count);
-    TEST_ASSERT_EQUAL_STRING("test-peer", app.ui.payment_peer_label);
+    TEST_ASSERT_EQUAL_UINT8(1, app->ui.network_peers);
+    TEST_ASSERT_EQUAL_UINT8(1, app->ui.payment_peer_count);
+    TEST_ASSERT_EQUAL_STRING("test-peer", app->ui.payment_peer_label);
     TEST_ASSERT_EQUAL_UINT32(1, runtime.processed_reticulum);
 
     meshpay_app_runtime_destroy(&runtime);
@@ -373,16 +375,16 @@ TEST_CASE("app runtime processes core ui and reticulum queues", "[app_main]")
     rns_identity_t identity;
     load_identity(&identity, 0x33);
 
-    meshpay_app_t app;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app, alice, &identity,
+    meshpay_app_t *app = test_pool_app(0);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app, alice, &identity,
                                                &config, 1, true));
 
     meshpay_tx_t mint;
     make_mint(&mint, master, alice, 1000, config.currency_id);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&app, &mint));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app, &mint));
 
     meshpay_app_runtime_t runtime;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, &app, NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, app, NULL));
     packet_tx_probe_t tx_probe = {0};
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
                                   &runtime,
@@ -399,7 +401,7 @@ TEST_CASE("app runtime processes core ui and reticulum queues", "[app_main]")
                                     &runtime, MESHPAY_APP_QUEUE_CORE));
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime, MESHPAY_APP_QUEUE_CORE, 0));
-    TEST_ASSERT_TRUE(app.announced);
+    TEST_ASSERT_TRUE(app->announced);
     TEST_ASSERT_EQUAL_UINT32(1, runtime.processed_core);
 
     const meshpay_app_event_t refresh = {
@@ -411,7 +413,7 @@ TEST_CASE("app runtime processes core ui and reticulum queues", "[app_main]")
                                   &refresh, 0));
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime, MESHPAY_APP_QUEUE_UI, 0));
-    TEST_ASSERT_EQUAL_UINT32(1000, app.ui.balance);
+    TEST_ASSERT_EQUAL_UINT32(1000, app->ui.balance);
     TEST_ASSERT_EQUAL_UINT32(1, runtime.processed_ui);
 
     meshpay_app_event_t payment = {
@@ -425,8 +427,8 @@ TEST_CASE("app runtime processes core ui and reticulum queues", "[app_main]")
                                   &payment, 0));
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime, MESHPAY_APP_QUEUE_CORE, 0));
-    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_SENT, app.ui.feedback);
-    TEST_ASSERT_EQUAL_UINT32(895, app.ui.balance);
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_SENT, app->ui.feedback);
+    TEST_ASSERT_EQUAL_UINT32(895, app->ui.balance);
     TEST_ASSERT_EQUAL_UINT32(2, runtime.processed_core);
     TEST_ASSERT_EQUAL_UINT32(1, meshpay_app_runtime_queue_depth(
                                     &runtime, MESHPAY_APP_QUEUE_RETICULUM));
@@ -448,7 +450,7 @@ TEST_CASE("app runtime processes core ui and reticulum queues", "[app_main]")
     memcpy(ack_packet.destination_hash, alice,
            sizeof(ack_packet.destination_hash));
     ack_packet.data[0] = MESHPAY_PAYMENT_MSG_ACK;
-    memcpy(ack_packet.data + 1, app.payments.pending_tx.id,
+    memcpy(ack_packet.data + 1, app->payments.pending_tx.id,
            MESHPAY_TX_ID_SIZE);
     ack_packet.data_len = 1U + MESHPAY_TX_ID_SIZE;
 
@@ -463,11 +465,11 @@ TEST_CASE("app runtime processes core ui and reticulum queues", "[app_main]")
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime, MESHPAY_APP_QUEUE_RETICULUM, 0));
     TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_CONFIRMED,
-                      app.ui.feedback);
-    TEST_ASSERT_EQUAL_UINT32(100, app.ui.last_amount);
-    TEST_ASSERT_EQUAL_UINT32(895, app.ui.balance);
-    TEST_ASSERT_EQUAL_STRING("pair 7273", app.ui.last_peer_label);
-    TEST_ASSERT_FALSE(app.payments.has_pending);
+                      app->ui.feedback);
+    TEST_ASSERT_EQUAL_UINT32(100, app->ui.last_amount);
+    TEST_ASSERT_EQUAL_UINT32(895, app->ui.balance);
+    TEST_ASSERT_EQUAL_STRING("pair 7273", app->ui.last_peer_label);
+    TEST_ASSERT_FALSE(app->payments.has_pending);
     TEST_ASSERT_EQUAL_UINT32(2, runtime.processed_reticulum);
 
     const meshpay_app_event_t dag_summary = {
@@ -516,12 +518,12 @@ TEST_CASE("app runtime persists wallet sequence after creating payment",
     rns_identity_t identity;
     load_identity(&identity, 0x37);
 
-    meshpay_app_t app;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app, alice, &identity,
+    meshpay_app_t *app = test_pool_app(0);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app, alice, &identity,
                                                &config, 1, true));
     meshpay_tx_t mint;
     make_mint(&mint, master, alice, 500, config.currency_id);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&app, &mint));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app, &mint));
 
     meshpay_storage_mock_t mock;
     meshpay_storage_mock_init(&mock);
@@ -533,10 +535,10 @@ TEST_CASE("app runtime persists wallet sequence after creating payment",
                                                            private_key));
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_storage_record_set_identity(&record,
                                                                   private_key));
-    record.next_seq = app.wallet.next_seq;
+    record.next_seq = app->wallet.next_seq;
 
     meshpay_app_runtime_t runtime;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, &app, NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, app, NULL));
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_storage(&runtime,
                                                               &backend,
                                                               &record));
@@ -553,8 +555,8 @@ TEST_CASE("app runtime persists wallet sequence after creating payment",
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime,
                                   MESHPAY_APP_QUEUE_CORE, 0));
-    TEST_ASSERT_TRUE(app.payments.has_pending);
-    TEST_ASSERT_EQUAL_UINT32(2, app.wallet.next_seq);
+    TEST_ASSERT_TRUE(app->payments.has_pending);
+    TEST_ASSERT_EQUAL_UINT32(2, app->wallet.next_seq);
     TEST_ASSERT_EQUAL_UINT32(1, mock.write_count);
 
     meshpay_storage_record_t loaded;
@@ -582,15 +584,15 @@ TEST_CASE("app runtime allows a second committed payment",
     rns_identity_t identity;
     load_identity(&identity, 0x39);
 
-    meshpay_app_t app;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app, alice, &identity,
+    meshpay_app_t *app = test_pool_app(0);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app, alice, &identity,
                                                &config, 1, true));
     meshpay_tx_t mint;
     make_mint(&mint, master, alice, 100, config.currency_id);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&app, &mint));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app, &mint));
 
     meshpay_app_runtime_t runtime;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, &app, NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, app, NULL));
     packet_tx_probe_t tx_probe = {0};
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
                                   &runtime,
@@ -610,11 +612,11 @@ TEST_CASE("app runtime allows a second committed payment",
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime,
                                   MESHPAY_APP_QUEUE_CORE, 0));
-    TEST_ASSERT_TRUE(app.payments.has_pending);
-    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_SENT, app.ui.feedback);
-    TEST_ASSERT_EQUAL_UINT32(60, app.ui.balance);
+    TEST_ASSERT_TRUE(app->payments.has_pending);
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_SENT, app->ui.feedback);
+    TEST_ASSERT_EQUAL_UINT32(60, app->ui.balance);
     uint8_t pending_id[MESHPAY_TX_ID_SIZE];
-    memcpy(pending_id, app.payments.pending_tx.id, sizeof(pending_id));
+    memcpy(pending_id, app->payments.pending_tx.id, sizeof(pending_id));
 
     /* Option A : un 2e paiement n'est plus bloqué — il est committé lui aussi,
      * indépendamment du premier (le suivi de reçu pointe désormais la 2e tx). */
@@ -631,19 +633,19 @@ TEST_CASE("app runtime allows a second committed payment",
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime,
                                   MESHPAY_APP_QUEUE_CORE, 0));
-    TEST_ASSERT_TRUE(app.payments.has_pending);
-    TEST_ASSERT_TRUE(memcmp(pending_id, app.payments.pending_tx.id,
+    TEST_ASSERT_TRUE(app->payments.has_pending);
+    TEST_ASSERT_TRUE(memcmp(pending_id, app->payments.pending_tx.id,
                             sizeof(pending_id)) != 0);
-    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_SENT, app.ui.feedback);
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_SENT, app->ui.feedback);
     /* 100 - 40 - 20 = 40 : les deux paiements ont débité le solde. */
-    TEST_ASSERT_EQUAL_UINT32(40, app.ui.balance);
-    TEST_ASSERT_EQUAL_UINT32(3, app.wallet.next_seq);
+    TEST_ASSERT_EQUAL_UINT32(40, app->ui.balance);
+    TEST_ASSERT_EQUAL_UINT32(3, app->wallet.next_seq);
     /* Les deux tx sont en file d'émission directe. */
     TEST_ASSERT_EQUAL_UINT32(2, meshpay_app_runtime_queue_depth(
                                     &runtime,
                                     MESHPAY_APP_QUEUE_RETICULUM));
     uint8_t pending_id2[MESHPAY_TX_ID_SIZE];
-    memcpy(pending_id2, app.payments.pending_tx.id, sizeof(pending_id2));
+    memcpy(pending_id2, app->payments.pending_tx.id, sizeof(pending_id2));
 
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime,
@@ -677,10 +679,10 @@ TEST_CASE("app runtime allows a second committed payment",
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime,
                                   MESHPAY_APP_QUEUE_RETICULUM, 0));
-    TEST_ASSERT_FALSE(app.payments.has_pending);
-    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_CONFIRMED, app.ui.feedback);
-    TEST_ASSERT_EQUAL_UINT32(20, app.ui.last_amount);
-    TEST_ASSERT_EQUAL_UINT32(40, app.ui.balance);
+    TEST_ASSERT_FALSE(app->payments.has_pending);
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_CONFIRMED, app->ui.feedback);
+    TEST_ASSERT_EQUAL_UINT32(20, app->ui.last_amount);
+    TEST_ASSERT_EQUAL_UINT32(40, app->ui.balance);
 
     meshpay_app_runtime_destroy(&runtime);
 }
@@ -703,12 +705,12 @@ TEST_CASE("app runtime cancels payment when sequence persistence fails",
     rns_identity_t identity;
     load_identity(&identity, 0x38);
 
-    meshpay_app_t app;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app, alice, &identity,
+    meshpay_app_t *app = test_pool_app(0);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app, alice, &identity,
                                                &config, 1, true));
     meshpay_tx_t mint;
     make_mint(&mint, master, alice, 500, config.currency_id);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&app, &mint));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app, &mint));
 
     meshpay_storage_backend_t backend = {
         .write_blob = failing_storage_write,
@@ -720,10 +722,10 @@ TEST_CASE("app runtime cancels payment when sequence persistence fails",
                                                            private_key));
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_storage_record_set_identity(&record,
                                                                   private_key));
-    record.next_seq = app.wallet.next_seq;
+    record.next_seq = app->wallet.next_seq;
 
     meshpay_app_runtime_t runtime;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, &app, NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, app, NULL));
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_storage(&runtime,
                                                               &backend,
                                                               &record));
@@ -740,9 +742,9 @@ TEST_CASE("app runtime cancels payment when sequence persistence fails",
     TEST_ASSERT_EQUAL(ESP_FAIL, meshpay_app_runtime_process_one(
                                     &runtime,
                                     MESHPAY_APP_QUEUE_CORE, 0));
-    TEST_ASSERT_FALSE(app.payments.has_pending);
-    TEST_ASSERT_FALSE(meshpay_wallet_lock_active(&app.wallet, 2201));
-    TEST_ASSERT_EQUAL_UINT32(1, app.wallet.next_seq);
+    TEST_ASSERT_FALSE(app->payments.has_pending);
+    TEST_ASSERT_FALSE(meshpay_wallet_lock_active(&app->wallet, 2201));
+    TEST_ASSERT_EQUAL_UINT32(1, app->wallet.next_seq);
     TEST_ASSERT_EQUAL_UINT32(0, meshpay_app_runtime_queue_depth(
                                     &runtime,
                                     MESHPAY_APP_QUEUE_RETICULUM));
@@ -770,26 +772,26 @@ TEST_CASE("app runtime accepts incoming payment packet", "[app_main]")
     load_identity(&identity_a, 0x13);
     load_identity(&identity_b, 0x53);
 
-    meshpay_app_t app_a;
-    meshpay_app_t app_b;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app_a, alice, &identity_a,
+    meshpay_app_t *app_a = test_pool_app(0);
+    meshpay_app_t *app_b = test_pool_app(1);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_a, alice, &identity_a,
                                                &config, 1, true));
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app_b, bob, &identity_b,
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_b, bob, &identity_b,
                                                &config, 1, true));
 
     meshpay_tx_t mint;
     make_mint(&mint, master, alice, 1000, config.currency_id);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&app_a, &mint));
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&app_b, &mint));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_a, &mint));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_b, &mint));
 
     rns_packet_t payment_packet;
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_payment_engine_create_payment(
-                                  &app_a.payments, bob, 100, 1000,
+                                  &app_a->payments, bob, 100, 1000,
                                   &payment_packet));
 
     meshpay_app_runtime_t runtime_b;
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime_b,
-                                                       &app_b, NULL));
+                                                       app_b, NULL));
     packet_tx_probe_t tx_probe = {0};
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
                                   &runtime_b,
@@ -808,18 +810,18 @@ TEST_CASE("app runtime accepts incoming payment packet", "[app_main]")
                                   &runtime_b, MESHPAY_APP_QUEUE_RETICULUM,
                                   0));
     TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_RECEIVED,
-                      app_b.ui.feedback);
-    TEST_ASSERT_EQUAL(MESHPAY_UI_SCREEN_RECEIVE, app_b.ui.screen);
-    TEST_ASSERT_EQUAL_UINT32(100, app_b.ui.last_amount);
-    TEST_ASSERT_EQUAL_UINT32(100, app_b.ui.balance);
-    TEST_ASSERT_EQUAL_STRING("pair 4849", app_b.ui.last_peer_label);
+                      app_b->ui.feedback);
+    TEST_ASSERT_EQUAL(MESHPAY_UI_SCREEN_RECEIVE, app_b->ui.screen);
+    TEST_ASSERT_EQUAL_UINT32(100, app_b->ui.last_amount);
+    TEST_ASSERT_EQUAL_UINT32(100, app_b->ui.balance);
+    TEST_ASSERT_EQUAL_STRING("pair 4849", app_b->ui.last_peer_label);
     TEST_ASSERT_EQUAL_UINT32(1, runtime_b.processed_reticulum);
     TEST_ASSERT_EQUAL_UINT32(1, tx_probe.count);
     TEST_ASSERT_EQUAL(RNS_PACKET_TYPE_DATA, tx_probe.last_packet.packet_type);
     TEST_ASSERT_EQUAL(MESHPAY_PAYMENT_MSG_ACK, tx_probe.last_packet.data[0]);
     TEST_ASSERT_EQUAL_UINT32(1U + MESHPAY_TX_ID_SIZE,
                              tx_probe.last_packet.data_len);
-    TEST_ASSERT_EQUAL_MEMORY(app_a.payments.pending_tx.id,
+    TEST_ASSERT_EQUAL_MEMORY(app_a->payments.pending_tx.id,
                              tx_probe.last_packet.data + 1,
                              MESHPAY_TX_ID_SIZE);
 
@@ -847,23 +849,23 @@ TEST_CASE("app runtime reject packet does not undo committed payment",
     load_identity(&identity_a, 0x14);
     load_identity(&identity_b, 0x54);
 
-    meshpay_app_t app_a;
-    meshpay_app_t app_b;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app_a, alice, &identity_a,
+    meshpay_app_t *app_a = test_pool_app(0);
+    meshpay_app_t *app_b = test_pool_app(1);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_a, alice, &identity_a,
                                                &config, 1, true));
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app_b, bob, &identity_b,
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_b, bob, &identity_b,
                                                &config, 1, true));
 
     meshpay_tx_t mint;
     make_mint(&mint, master, alice, 1000, config.currency_id);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&app_a, &mint));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_a, &mint));
 
     meshpay_app_runtime_t runtime_a;
     meshpay_app_runtime_t runtime_b;
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime_a,
-                                                       &app_a, NULL));
+                                                       app_a, NULL));
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime_b,
-                                                       &app_b, NULL));
+                                                       app_b, NULL));
 
     packet_tx_probe_t tx_probe = {0};
     packet_tx_probe_t reject_probe = {0};
@@ -887,8 +889,8 @@ TEST_CASE("app runtime reject packet does not undo committed payment",
                                   &payment, 0));
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime_a, MESHPAY_APP_QUEUE_CORE, 0));
-    TEST_ASSERT_EQUAL_UINT32(900, app_a.ui.balance);
-    TEST_ASSERT_TRUE(app_a.payments.has_pending);
+    TEST_ASSERT_EQUAL_UINT32(900, app_a->ui.balance);
+    TEST_ASSERT_TRUE(app_a->payments.has_pending);
 
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime_a,
@@ -910,8 +912,8 @@ TEST_CASE("app runtime reject packet does not undo committed payment",
     TEST_ASSERT_EQUAL_UINT32(1, reject_probe.count);
     TEST_ASSERT_EQUAL_UINT8(MESHPAY_PAYMENT_MSG_REJECT,
                             reject_probe.last_packet.data[0]);
-    TEST_ASSERT_EQUAL_UINT32(0, app_b.ui.balance);
-    TEST_ASSERT_EQUAL_UINT32(0, meshpay_dag_count(&app_b.dag));
+    TEST_ASSERT_EQUAL_UINT32(0, app_b->ui.balance);
+    TEST_ASSERT_EQUAL_UINT32(0, meshpay_dag_count(&app_b->dag));
 
     meshpay_app_event_t rx_reject = {
         .type = MESHPAY_APP_EVENT_RETICULUM_RX,
@@ -927,12 +929,12 @@ TEST_CASE("app runtime reject packet does not undo committed payment",
                                   MESHPAY_APP_QUEUE_RETICULUM, 0));
     /* Option A : un REJECT du destinataire n'annule PAS la tx déjà committée.
      * Le solde (900) et le seq (2) ne sont PAS restaurés ; la tx reste en DAG. */
-    TEST_ASSERT_FALSE(app_a.payments.has_pending);
-    TEST_ASSERT_FALSE(meshpay_wallet_lock_active(&app_a.wallet, 5003));
-    TEST_ASSERT_EQUAL_UINT32(900, app_a.ui.balance);
-    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_REJECTED, app_a.ui.feedback);
-    TEST_ASSERT_EQUAL_UINT32(2, app_a.wallet.next_seq);
-    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&app_a.dag));
+    TEST_ASSERT_FALSE(app_a->payments.has_pending);
+    TEST_ASSERT_FALSE(meshpay_wallet_lock_active(&app_a->wallet, 5003));
+    TEST_ASSERT_EQUAL_UINT32(900, app_a->ui.balance);
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_REJECTED, app_a->ui.feedback);
+    TEST_ASSERT_EQUAL_UINT32(2, app_a->wallet.next_seq);
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&app_a->dag));
 
     meshpay_app_runtime_destroy(&runtime_b);
     meshpay_app_runtime_destroy(&runtime_a);
@@ -957,15 +959,15 @@ TEST_CASE("app runtime ui refresh expires receipt tracking without undoing payme
     rns_identity_t identity;
     load_identity(&identity, 0x15);
 
-    meshpay_app_t app;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app, alice, &identity,
+    meshpay_app_t *app = test_pool_app(0);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app, alice, &identity,
                                                &config, 1, true));
     meshpay_tx_t mint;
     make_mint(&mint, master, alice, 1000, config.currency_id);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&app, &mint));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app, &mint));
 
     meshpay_app_runtime_t runtime;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, &app, NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, app, NULL));
     packet_tx_probe_t tx_probe = {0};
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
                                   &runtime,
@@ -985,8 +987,8 @@ TEST_CASE("app runtime ui refresh expires receipt tracking without undoing payme
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
                                   &runtime,
                                   MESHPAY_APP_QUEUE_CORE, 0));
-    TEST_ASSERT_TRUE(app.payments.has_pending);
-    TEST_ASSERT_EQUAL_UINT32(900, app.ui.balance);
+    TEST_ASSERT_TRUE(app->payments.has_pending);
+    TEST_ASSERT_EQUAL_UINT32(900, app->ui.balance);
 
     meshpay_app_event_t refresh = {
         .type = MESHPAY_APP_EVENT_UI_REFRESH,
@@ -1002,12 +1004,12 @@ TEST_CASE("app runtime ui refresh expires receipt tracking without undoing payme
     /* Option A : l'expiration du suivi de reçu est NON destructive — le solde
      * reste celui de la tx committée (900) et le seq n'est pas restauré (2).
      * Le feedback reste « envoyé » (le paiement a réussi, seul l'accusé manque). */
-    TEST_ASSERT_FALSE(app.payments.has_pending);
-    TEST_ASSERT_FALSE(meshpay_wallet_lock_active(&app.wallet,
+    TEST_ASSERT_FALSE(app->payments.has_pending);
+    TEST_ASSERT_FALSE(meshpay_wallet_lock_active(&app->wallet,
                                                  refresh.now_ms + 1));
-    TEST_ASSERT_EQUAL_UINT32(900, app.ui.balance);
-    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_SENT, app.ui.feedback);
-    TEST_ASSERT_EQUAL_UINT32(2, app.wallet.next_seq);
+    TEST_ASSERT_EQUAL_UINT32(900, app->ui.balance);
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_SENT, app->ui.feedback);
+    TEST_ASSERT_EQUAL_UINT32(2, app->wallet.next_seq);
 
     meshpay_app_runtime_destroy(&runtime);
 }
@@ -1041,21 +1043,21 @@ TEST_CASE("app runtime encrypts payment when destination announce is known",
     memcpy(bob, destination_b.hash, sizeof(bob));
     remember_announced_wallet(&identity_b, 0x90);
 
-    meshpay_app_t app_a;
-    meshpay_app_t app_b;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app_a, alice, &identity_a,
+    meshpay_app_t *app_a = test_pool_app(0);
+    meshpay_app_t *app_b = test_pool_app(1);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_a, alice, &identity_a,
                                                &config, 1, true));
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app_b, bob, &identity_b,
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_b, bob, &identity_b,
                                                &config, 1, true));
 
     meshpay_tx_t mint;
     make_mint(&mint, master, alice, 900, config.currency_id);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&app_a, &mint));
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&app_b, &mint));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_a, &mint));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_b, &mint));
 
     meshpay_app_runtime_t runtime_a;
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime_a,
-                                                       &app_a, NULL));
+                                                       app_a, NULL));
     packet_tx_probe_t tx_probe = {0};
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
                                   &runtime_a,
@@ -1083,7 +1085,7 @@ TEST_CASE("app runtime encrypts payment when destination announce is known",
 
     meshpay_app_runtime_t runtime_b;
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime_b,
-                                                       &app_b, NULL));
+                                                       app_b, NULL));
     packet_tx_probe_t ack_probe = {0};
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
                                   &runtime_b,
@@ -1103,11 +1105,11 @@ TEST_CASE("app runtime encrypts payment when destination announce is known",
                                   &runtime_b,
                                   MESHPAY_APP_QUEUE_RETICULUM, 0));
     TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_RECEIVED,
-                      app_b.ui.feedback);
-    TEST_ASSERT_EQUAL_UINT32(120, app_b.ui.last_amount);
-    TEST_ASSERT_EQUAL_UINT32(120, app_b.ui.balance);
-    TEST_ASSERT_TRUE(app_b.payments.has_last_received);
-    TEST_ASSERT_EQUAL_UINT32(120, app_b.payments.last_received_tx.amount);
+                      app_b->ui.feedback);
+    TEST_ASSERT_EQUAL_UINT32(120, app_b->ui.last_amount);
+    TEST_ASSERT_EQUAL_UINT32(120, app_b->ui.balance);
+    TEST_ASSERT_TRUE(app_b->payments.has_last_received);
+    TEST_ASSERT_EQUAL_UINT32(120, app_b->payments.last_received_tx.amount);
     TEST_ASSERT_EQUAL_UINT32(1, ack_probe.count);
     TEST_ASSERT_EQUAL_UINT8(MESHPAY_PAYMENT_MSG_ACK,
                             ack_probe.last_packet.data[0]);
@@ -1145,15 +1147,15 @@ TEST_CASE("app runtime pays through in memory reticulum nodes",
                           &config,
                           destination_a->hash));
 
-    meshpay_app_t app_a;
-    meshpay_app_t app_b;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app_a,
+    meshpay_app_t *app_a = test_pool_app(0);
+    meshpay_app_t *app_b = test_pool_app(1);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_a,
                                                destination_a->hash,
                                                &identity_a,
                                                &config,
                                                1,
                                                true));
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&app_b,
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_b,
                                                destination_b->hash,
                                                &identity_b,
                                                &config,
@@ -1163,16 +1165,16 @@ TEST_CASE("app runtime pays through in memory reticulum nodes",
     meshpay_tx_t mint;
     make_mint(&mint, destination_a->hash, destination_a->hash, 700,
               config.currency_id);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&app_a, &mint));
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&app_b, &mint));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_a, &mint));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_b, &mint));
 
     meshpay_app_runtime_t runtime_a;
     meshpay_app_runtime_t runtime_b;
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime_a,
-                                                       &app_a,
+                                                       app_a,
                                                        NULL));
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime_b,
-                                                       &app_b,
+                                                       app_b,
                                                        NULL));
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
                                   &runtime_a,
@@ -1215,14 +1217,14 @@ TEST_CASE("app runtime pays through in memory reticulum nodes",
                                                 sizeof(alias_b) - 1));
     process_reticulum_until_idle(&runtime_a);
     process_reticulum_until_idle(&runtime_b);
-    TEST_ASSERT_EQUAL_UINT8(1, app_a.ui.network_peers);
+    TEST_ASSERT_EQUAL_UINT8(1, app_a->ui.network_peers);
 
     TEST_ASSERT_EQUAL(ESP_OK, rns_node_announce(&node_a,
                                                 alias_a,
                                                 sizeof(alias_a) - 1));
     process_reticulum_until_idle(&runtime_a);
     process_reticulum_until_idle(&runtime_b);
-    TEST_ASSERT_EQUAL_UINT8(1, app_b.ui.network_peers);
+    TEST_ASSERT_EQUAL_UINT8(1, app_b->ui.network_peers);
 
     meshpay_app_event_t payment = {
         .type = MESHPAY_APP_EVENT_CORE_PAYMENT,
@@ -1246,20 +1248,24 @@ TEST_CASE("app runtime pays through in memory reticulum nodes",
     process_reticulum_until_idle(&runtime_a);
 
     TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_CONFIRMED,
-                      app_a.ui.feedback);
+                      app_a->ui.feedback);
     TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_RECEIVED,
-                      app_b.ui.feedback);
-    TEST_ASSERT_EQUAL_UINT32(606, app_a.ui.balance);
-    TEST_ASSERT_EQUAL_UINT32(90, app_b.ui.balance);
-    TEST_ASSERT_EQUAL_STRING("Bob", app_a.ui.last_peer_label);
-    TEST_ASSERT_EQUAL_STRING("Alice", app_b.ui.last_peer_label);
-    TEST_ASSERT_FALSE(app_a.payments.has_pending);
-    TEST_ASSERT_EQUAL_UINT32(90, app_b.ui.last_amount);
-    TEST_ASSERT_TRUE(app_b.payments.has_last_received);
+                      app_b->ui.feedback);
+    /* Alice = autorité MINT, donc destinataire de la fee (fee_recipient =
+     * mint_authorities[0]). En s'envoyant -90 -4(fee) puis en récupérant +4 en
+     * tant qu'autorité, son solde net ne baisse que de 90 : 700 - 90 = 610.
+     * (L'attente 606 d'origine oubliait ce retour de fee à l'émetteur-autorité.) */
+    TEST_ASSERT_EQUAL_UINT32(610, app_a->ui.balance);
+    TEST_ASSERT_EQUAL_UINT32(90, app_b->ui.balance);
+    TEST_ASSERT_EQUAL_STRING("Bob", app_a->ui.last_peer_label);
+    TEST_ASSERT_EQUAL_STRING("Alice", app_b->ui.last_peer_label);
+    TEST_ASSERT_FALSE(app_a->payments.has_pending);
+    TEST_ASSERT_EQUAL_UINT32(90, app_b->ui.last_amount);
+    TEST_ASSERT_TRUE(app_b->payments.has_last_received);
 
     uint32_t balance = 0;
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&config,
-                                                           &app_b.dag,
+                                                           &app_b->dag,
                                                            destination_b->hash,
                                                            &balance));
     TEST_ASSERT_EQUAL_UINT32(90, balance);
@@ -1287,11 +1293,11 @@ TEST_CASE("app runtime requests and applies dag sync resource batch",
     load_identity(&identity_a, 0x1a);
     load_identity(&identity_b, 0x5a);
 
-    meshpay_app_t full;
-    meshpay_app_t slow;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&full, alice, &identity_a,
+    meshpay_app_t *full = test_pool_app(0);
+    meshpay_app_t *slow = test_pool_app(1);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(full, alice, &identity_a,
                                                &config, 1, true));
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(&slow, bob, &identity_b,
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(slow, bob, &identity_b,
                                                &config, 1, true));
 
     meshpay_tx_t tx0;
@@ -1300,19 +1306,19 @@ TEST_CASE("app runtime requests and applies dag sync resource batch",
     make_mint(&tx0, master, alice, 1000, config.currency_id);
     make_transfer(&tx1, 0xa1, alice, bob, 100, 1, tx0.id);
     make_transfer(&tx2, 0xb1, bob, alice, 40, 1, tx1.id);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&full, &tx0));
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&full, &tx1));
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&full, &tx2));
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(&slow, &tx0));
-    TEST_ASSERT_EQUAL_UINT32(3, meshpay_dag_count(&full.dag));
-    TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(&slow.dag));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(full, &tx0));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(full, &tx1));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(full, &tx2));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(slow, &tx0));
+    TEST_ASSERT_EQUAL_UINT32(3, meshpay_dag_count(&full->dag));
+    TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(&slow->dag));
 
     meshpay_app_runtime_t slow_runtime;
     meshpay_app_runtime_t full_runtime;
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&slow_runtime,
-                                                       &slow, NULL));
+                                                       slow, NULL));
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&full_runtime,
-                                                       &full, NULL));
+                                                       full, NULL));
 
     packet_list_probe_t slow_tx = {0};
     packet_list_probe_t full_tx = {0};
@@ -1327,7 +1333,7 @@ TEST_CASE("app runtime requests and applies dag sync resource batch",
 
     rns_packet_t summary;
     TEST_ASSERT_EQUAL(ESP_OK,
-                      meshpay_dag_sync_build_summary(&full.dag,
+                      meshpay_dag_sync_build_summary(&full->dag,
                                                      alice,
                                                      &summary));
     const meshpay_app_event_t summary_rx = {
@@ -1352,7 +1358,12 @@ TEST_CASE("app runtime requests and applies dag sync resource batch",
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_dag_sync_request_known_count(&slow_tx.packets[0],
                                                            &request_known_count));
-    TEST_ASSERT_EQUAL_UINT16(1, request_known_count);
+    /* known=0 par conception : le runtime émet TOUJOURS known=0 (cf.
+     * app_main_logic.c, handler de summary), car le découpage du batch côté
+     * répondeur est POSITIONNEL et repart de l'offset 0 — c'est le fix de
+     * réconciliation DAG sous fork. (L'attente 1 d'origine reflétait l'ancien
+     * comportement « known = count(DAG locale) ».) */
+    TEST_ASSERT_EQUAL_UINT16(0, request_known_count);
     bool request_has_source = false;
     uint8_t request_source[MESHPAY_TX_DESTINATION_HASH_SIZE];
     TEST_ASSERT_EQUAL(ESP_OK,
@@ -1394,8 +1405,8 @@ TEST_CASE("app runtime requests and applies dag sync resource batch",
                                       MESHPAY_APP_QUEUE_RETICULUM, 0));
     }
 
-    TEST_ASSERT_EQUAL_UINT32(3, meshpay_dag_count(&slow.dag));
-    TEST_ASSERT_TRUE(meshpay_dag_contains(&slow.dag, tx2.id));
+    TEST_ASSERT_EQUAL_UINT32(3, meshpay_dag_count(&slow->dag));
+    TEST_ASSERT_TRUE(meshpay_dag_contains(&slow->dag, tx2.id));
     TEST_ASSERT_EQUAL_UINT32(2, slow_runtime.dag_sync_merged);
 
     meshpay_app_runtime_destroy(&full_runtime);

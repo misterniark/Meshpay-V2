@@ -2,15 +2,10 @@
 #include "meshpay/currency_descriptor.h"
 #include "meshpay/meshpay_tx.h"
 #include "meshpay/rns/rns_identity.h"
+#include "test_pool.h"
 #include "unity.h"
+#include <stdlib.h>
 #include <string.h>
-
-/* DAG de test PARTAGÉE (une seule instance, file-scope) : meshpay_dag_t fait
- * ~57 Ko (fenêtre de 250 TX). La placer sur la pile déborderait la pile du main
- * (corruption mémoire) ; une instance static PAR fonction déborderait la .bss
- * DRAM. Une seule instance, réinitialisée via meshpay_dag_init() au début de
- * chaque test qui l'utilise. */
-static meshpay_dag_t dag;
 
 static void fill_sequence(uint8_t *out, size_t len, uint8_t start)
 {
@@ -64,15 +59,15 @@ TEST_CASE("currency computes balance and routes fee to first mint authority", "[
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_currency_add_mint_authority(&config, master));
 
-    meshpay_dag_init(&dag); /* DAG partagée (file-scope), réinitialisée ici */
+    meshpay_dag_t *dag = test_pool_dag(0); /* DAG du pool partagé (slot 0) */
 
     meshpay_tx_t mint;
     make_tx(&mint, MESHPAY_TX_TYPE_MINT, 0x20,
             master, alice, 1000, 0, 0, config.currency_id, NULL, 0);
     TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
-                      meshpay_currency_validate_tx(&config, &dag, &mint));
+                      meshpay_currency_validate_tx(&config, dag, &mint));
     TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
-                      meshpay_dag_merge_tx(&dag, &mint));
+                      meshpay_dag_merge_tx(dag, &mint));
 
     uint8_t parents[1][MESHPAY_TX_PARENT_ID_SIZE];
     memcpy(parents[0], mint.id, MESHPAY_TX_PARENT_ID_SIZE);
@@ -81,23 +76,23 @@ TEST_CASE("currency computes balance and routes fee to first mint authority", "[
             alice, bob, 100, 1, config.transfer_fee, config.currency_id,
             parents, 1);
     TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
-                      meshpay_currency_validate_tx(&config, &dag, &transfer));
+                      meshpay_currency_validate_tx(&config, dag, &transfer));
     TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
-                      meshpay_dag_merge_tx(&dag, &transfer));
+                      meshpay_dag_merge_tx(dag, &transfer));
 
     uint32_t balance = 0;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&config, &dag,
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&config, dag,
                                                            alice, &balance));
     TEST_ASSERT_EQUAL_UINT32(893, balance);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&config, &dag,
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&config, dag,
                                                            bob, &balance));
     TEST_ASSERT_EQUAL_UINT32(100, balance);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&config, &dag,
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&config, dag,
                                                            master, &balance));
     TEST_ASSERT_EQUAL_UINT32(7, balance);
 
     uint64_t total_minted = 0;
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_total_minted(&config, &dag,
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_total_minted(&config, dag,
                                                             &total_minted));
     TEST_ASSERT_EQUAL_UINT64(1000, total_minted);
 }
@@ -116,14 +111,14 @@ TEST_CASE("currency rejects unauthorized mint", "[currency]")
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_currency_add_mint_authority(&config, master));
 
-    meshpay_dag_init(&dag); /* DAG partagée (file-scope), réinitialisée ici */
+    meshpay_dag_t *dag = test_pool_dag(0); /* DAG du pool partagé (slot 0) */
 
     meshpay_tx_t mint;
     make_tx(&mint, MESHPAY_TX_TYPE_MINT, 0x22,
             impostor, alice, 1000, 0, 0, config.currency_id, NULL, 0);
 
     TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_NOT_AUTHORITY,
-                      meshpay_currency_validate_tx(&config, &dag, &mint));
+                      meshpay_currency_validate_tx(&config, dag, &mint));
 }
 
 TEST_CASE("currency mint authority add is idempotent when full", "[currency]")
@@ -173,14 +168,14 @@ TEST_CASE("currency rejects transfer with insufficient balance", "[currency]")
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_currency_add_mint_authority(&config, master));
 
-    meshpay_dag_init(&dag); /* DAG partagée (file-scope), réinitialisée ici */
+    meshpay_dag_t *dag = test_pool_dag(0); /* DAG du pool partagé (slot 0) */
 
     meshpay_tx_t transfer;
     make_tx(&transfer, MESHPAY_TX_TYPE_TRANSFER, 0x52,
             alice, bob, 100, 1, config.transfer_fee, config.currency_id,
             NULL, 0);
     TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_INSUFFICIENT,
-                      meshpay_currency_validate_tx(&config, &dag, &transfer));
+                      meshpay_currency_validate_tx(&config, dag, &transfer));
 }
 
 TEST_CASE("currency applies demurrage by bps ticks", "[currency]")
@@ -305,7 +300,7 @@ TEST_CASE("currency accepts founder-signed mint under descriptor", "[currency]")
     uint8_t alice[MESHPAY_TX_DESTINATION_HASH_SIZE];
     fill_sequence(alice, sizeof(alice), 0x40);
 
-    meshpay_dag_init(&dag); /* DAG partagée (file-scope), réinitialisée ici */
+    meshpay_dag_t *dag = test_pool_dag(0); /* DAG du pool partagé (slot 0) */
 
     /* MINT réellement signé par le fondateur -> accepté. */
     meshpay_tx_t mint;
@@ -313,7 +308,7 @@ TEST_CASE("currency accepts founder-signed mint under descriptor", "[currency]")
         meshpay_tx_create_mint(&mint, &founder, founder_hash, alice, 1000, 0,
                                config.currency_id, NULL, 0, 1000));
     TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
-                      meshpay_currency_validate_tx(&config, &dag, &mint));
+                      meshpay_currency_validate_tx(&config, dag, &mint));
 }
 
 TEST_CASE("currency rejects mint forged with founder hash but wrong signature", "[currency]")
@@ -339,7 +334,7 @@ TEST_CASE("currency rejects mint forged with founder hash but wrong signature", 
     uint8_t alice[MESHPAY_TX_DESTINATION_HASH_SIZE];
     fill_sequence(alice, sizeof(alice), 0x41);
 
-    meshpay_dag_init(&dag); /* DAG partagée (file-scope), réinitialisée ici */
+    meshpay_dag_t *dag = test_pool_dag(0); /* DAG du pool partagé (slot 0) */
 
     /* L'attaquant forge un MINT avec from = hash fondateur (public) mais le
      * signe avec SA clé : from passe is_mint_authority, mais la signature ne
@@ -349,7 +344,7 @@ TEST_CASE("currency rejects mint forged with founder hash but wrong signature", 
         meshpay_tx_create_mint(&forged, &attacker, founder_hash, alice, 1000, 0,
                                config.currency_id, NULL, 0, 1000));
     TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_BAD_SIGNATURE,
-                      meshpay_currency_validate_tx(&config, &dag, &forged));
+                      meshpay_currency_validate_tx(&config, dag, &forged));
 }
 
 TEST_CASE("currency without descriptor does not require mint signature", "[currency]")
@@ -368,11 +363,11 @@ TEST_CASE("currency without descriptor does not require mint signature", "[curre
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_currency_add_mint_authority(&config, master));
 
-    meshpay_dag_init(&dag); /* DAG partagée (file-scope), réinitialisée ici */
+    meshpay_dag_t *dag = test_pool_dag(0); /* DAG du pool partagé (slot 0) */
 
     meshpay_tx_t mint; /* signature factice, mais has_descriptor=false */
     make_tx(&mint, MESHPAY_TX_TYPE_MINT, 0x23,
             master, alice, 1000, 0, 0, config.currency_id, NULL, 0);
     TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
-                      meshpay_currency_validate_tx(&config, &dag, &mint));
+                      meshpay_currency_validate_tx(&config, dag, &mint));
 }

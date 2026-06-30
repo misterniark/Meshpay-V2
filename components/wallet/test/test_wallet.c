@@ -1,5 +1,7 @@
 #include "meshpay/wallet.h"
 #include "unity.h"
+#include "test_pool.h"
+#include <stdlib.h>
 #include <string.h>
 
 static void fill_sequence(uint8_t *out, size_t len, uint8_t start)
@@ -45,13 +47,12 @@ TEST_CASE("wallet reports available balance with local lock", "[wallet]")
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_currency_add_mint_authority(&config, master));
 
-    meshpay_dag_t dag;
-    meshpay_dag_init(&dag);
+    meshpay_dag_t *dag = test_pool_dag(0);
     meshpay_tx_t mint;
     make_tx(&mint, MESHPAY_TX_TYPE_MINT, 0x20,
             master, alice, 1000, 0, 0, config.currency_id);
     TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
-                      meshpay_dag_merge_tx(&dag, &mint));
+                      meshpay_dag_merge_tx(dag, &mint));
 
     meshpay_wallet_t wallet;
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_wallet_init(&wallet, alice, 1));
@@ -59,7 +60,7 @@ TEST_CASE("wallet reports available balance with local lock", "[wallet]")
     uint32_t balance = 0;
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_wallet_get_available_balance(&wallet, &config,
-                                                           &dag, 1000,
+                                                           dag, 1000,
                                                            &balance));
     TEST_ASSERT_EQUAL_UINT32(1000, balance);
 
@@ -69,14 +70,14 @@ TEST_CASE("wallet reports available balance with local lock", "[wallet]")
                                                   205, 1000));
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_wallet_get_available_balance(&wallet, &config,
-                                                           &dag, 2000,
+                                                           dag, 2000,
                                                            &balance));
     TEST_ASSERT_EQUAL_UINT32(795, balance);
 
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_wallet_unlock(&wallet, tx_id));
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_wallet_get_available_balance(&wallet, &config,
-                                                           &dag, 3000,
+                                                           dag, 3000,
                                                            &balance));
     TEST_ASSERT_EQUAL_UINT32(1000, balance);
 }

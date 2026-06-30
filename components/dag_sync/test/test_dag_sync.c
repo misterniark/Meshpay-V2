@@ -1,5 +1,7 @@
 #include "meshpay/dag_sync.h"
+#include "test_pool.h"
 #include "unity.h"
+#include <stdlib.h>
 #include <string.h>
 
 static void fill_sequence(uint8_t *out, size_t len, uint8_t start)
@@ -81,18 +83,18 @@ static void build_dags(meshpay_dag_t *full,
 
 TEST_CASE("dag sync summary exposes count and current tip", "[dag_sync]")
 {
-    meshpay_dag_t full;
-    meshpay_dag_t slow;
+    meshpay_dag_t *full = test_pool_dag(0);
+    meshpay_dag_t *slow = test_pool_dag(1);
     meshpay_tx_t tx0;
     meshpay_tx_t tx1;
     meshpay_tx_t tx2;
-    build_dags(&full, &slow, &tx0, &tx1, &tx2);
+    build_dags(full, slow, &tx0, &tx1, &tx2);
 
     uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE];
     fill_sequence(source, sizeof(source), 0xaa);
     rns_packet_t packet;
     TEST_ASSERT_EQUAL(ESP_OK,
-                      meshpay_dag_sync_build_summary(&full, source, &packet));
+                      meshpay_dag_sync_build_summary(full, source, &packet));
     TEST_ASSERT_EQUAL_UINT8(MESHPAY_DAG_SYNC_MSG_SUMMARY, packet.data[0]);
 
     meshpay_dag_sync_summary_t summary;
@@ -105,12 +107,12 @@ TEST_CASE("dag sync summary exposes count and current tip", "[dag_sync]")
 
 TEST_CASE("dag sync rejects zero routing identifiers", "[dag_sync]")
 {
-    meshpay_dag_t full;
-    meshpay_dag_t slow;
+    meshpay_dag_t *full = test_pool_dag(0);
+    meshpay_dag_t *slow = test_pool_dag(1);
     meshpay_tx_t tx0;
     meshpay_tx_t tx1;
     meshpay_tx_t tx2;
-    build_dags(&full, &slow, &tx0, &tx1, &tx2);
+    build_dags(full, slow, &tx0, &tx1, &tx2);
 
     uint8_t zero[MESHPAY_TX_DESTINATION_HASH_SIZE] = {0};
     uint8_t peer[MESHPAY_TX_DESTINATION_HASH_SIZE];
@@ -118,15 +120,15 @@ TEST_CASE("dag sync rejects zero routing identifiers", "[dag_sync]")
 
     rns_packet_t packet;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
-                      meshpay_dag_sync_build_summary(&full,
+                      meshpay_dag_sync_build_summary(full,
                                                      zero,
                                                      &packet));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
-                      meshpay_dag_sync_build_request(&slow,
+                      meshpay_dag_sync_build_request(slow,
                                                      zero,
                                                      &packet));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
-                      meshpay_dag_sync_build_request_from(&slow,
+                      meshpay_dag_sync_build_request_from(slow,
                                                           peer,
                                                           zero,
                                                           &packet));
@@ -134,19 +136,19 @@ TEST_CASE("dag sync rejects zero routing identifiers", "[dag_sync]")
 
 TEST_CASE("dag sync catches up missing transactions through resource batch", "[dag_sync]")
 {
-    meshpay_dag_t full;
-    meshpay_dag_t slow;
+    meshpay_dag_t *full = test_pool_dag(0);
+    meshpay_dag_t *slow = test_pool_dag(1);
     meshpay_tx_t tx0;
     meshpay_tx_t tx1;
     meshpay_tx_t tx2;
-    build_dags(&full, &slow, &tx0, &tx1, &tx2);
-    TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(&slow));
+    build_dags(full, slow, &tx0, &tx1, &tx2);
+    TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(slow));
 
     uint8_t peer[MESHPAY_TX_DESTINATION_HASH_SIZE];
     fill_sequence(peer, sizeof(peer), 0xbb);
     rns_packet_t request;
     TEST_ASSERT_EQUAL(ESP_OK,
-                      meshpay_dag_sync_build_request(&slow, peer, &request));
+                      meshpay_dag_sync_build_request(slow, peer, &request));
     TEST_ASSERT_EQUAL(RNS_PACKET_CONTEXT_REQUEST, request.context);
     TEST_ASSERT_EQUAL(RNS_DESTINATION_TYPE_LINK, request.destination_type);
     TEST_ASSERT_EQUAL_MEMORY(peer, request.destination_hash, sizeof(peer));
@@ -159,7 +161,7 @@ TEST_CASE("dag sync catches up missing transactions through resource batch", "[d
     uint8_t requester[MESHPAY_TX_DESTINATION_HASH_SIZE];
     fill_sequence(requester, sizeof(requester), 0xcc);
     TEST_ASSERT_EQUAL(ESP_OK,
-                      meshpay_dag_sync_build_request_from(&slow,
+                      meshpay_dag_sync_build_request_from(slow,
                                                           peer,
                                                           requester,
                                                           &request));
@@ -183,7 +185,7 @@ TEST_CASE("dag sync catches up missing transactions through resource batch", "[d
     rns_packet_t packets[RNS_RESOURCE_MAX_FRAGMENTS];
     size_t packet_count = 0;
     TEST_ASSERT_EQUAL(ESP_OK,
-                      meshpay_dag_sync_build_batch_resource(&full,
+                      meshpay_dag_sync_build_batch_resource(full,
                                                             known_count,
                                                             &link,
                                                             packets,
@@ -209,11 +211,11 @@ TEST_CASE("dag sync catches up missing transactions through resource batch", "[d
 
     size_t merged = 0;
     TEST_ASSERT_EQUAL(ESP_OK,
-                      meshpay_dag_sync_apply_batch(&slow, batch, batch_len,
+                      meshpay_dag_sync_apply_batch(slow, batch, batch_len,
                                                    &merged));
     TEST_ASSERT_EQUAL_UINT32(2, merged);
-    TEST_ASSERT_EQUAL_UINT32(3, meshpay_dag_count(&slow));
-    TEST_ASSERT_TRUE(meshpay_dag_contains(&slow, tx2.id));
+    TEST_ASSERT_EQUAL_UINT32(3, meshpay_dag_count(slow));
+    TEST_ASSERT_TRUE(meshpay_dag_contains(slow, tx2.id));
 }
 
 /* Encode un batch DAG-sync a la main, dans l'ordre exact du tableau fourni.
@@ -269,15 +271,14 @@ TEST_CASE("dag sync apply_batch applies out-of-order batch (child before parent)
     size_t batch_len = 0;
     encode_batch_manual(ordered, 2, batch, sizeof(batch), &batch_len);
 
-    meshpay_dag_t dag;
-    meshpay_dag_init(&dag);
+    meshpay_dag_t *dag = test_pool_dag(0);
     size_t merged = 0;
     TEST_ASSERT_EQUAL(ESP_OK,
-                      meshpay_dag_sync_apply_batch(&dag, batch, batch_len, &merged));
+                      meshpay_dag_sync_apply_batch(dag, batch, batch_len, &merged));
     TEST_ASSERT_EQUAL_UINT32(2, merged);
-    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(&dag));
-    TEST_ASSERT_TRUE(meshpay_dag_contains(&dag, parent_tx.id));
-    TEST_ASSERT_TRUE(meshpay_dag_contains(&dag, child_tx.id));
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(dag));
+    TEST_ASSERT_TRUE(meshpay_dag_contains(dag, parent_tx.id));
+    TEST_ASSERT_TRUE(meshpay_dag_contains(dag, child_tx.id));
 }
 
 /* Garde anti-regression : le fix multi-passes ne doit PAS rendre le merge
@@ -302,10 +303,9 @@ TEST_CASE("dag sync apply_batch still rejects a conflicting tx", "[dag_sync]")
     memcpy(p0[0], tx0.id, MESHPAY_TX_PARENT_ID_SIZE);
     make_tx(&tx_a, MESHPAY_TX_TYPE_TRANSFER, 0x50, alice, bob, 100, 5, p0, 1);
 
-    meshpay_dag_t dag;
-    meshpay_dag_init(&dag);
-    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(&dag, &tx0));
-    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(&dag, &tx_a));
+    meshpay_dag_t *dag = test_pool_dag(0);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &tx0));
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &tx_a));
 
     /* Batch contenant tx_b : meme from=alice + meme seq=5, id different => CONFLICT. */
     meshpay_tx_t tx_b;
@@ -317,8 +317,8 @@ TEST_CASE("dag sync apply_batch still rejects a conflicting tx", "[dag_sync]")
 
     size_t merged = 0;
     TEST_ASSERT_NOT_EQUAL(ESP_OK,
-                          meshpay_dag_sync_apply_batch(&dag, batch, batch_len, &merged));
-    TEST_ASSERT_FALSE(meshpay_dag_contains(&dag, tx_b.id));
+                          meshpay_dag_sync_apply_batch(dag, batch, batch_len, &merged));
+    TEST_ASSERT_FALSE(meshpay_dag_contains(dag, tx_b.id));
 }
 
 
@@ -337,31 +337,29 @@ TEST_CASE("dag sync build_batch_resource_from paginates a large dag", "[dag_sync
     /* 100 MINT independants (sans parent) -> encodage tres au-dessus de la
      * capacite d'un batch (~29 tx) => plusieurs chunks garantis. (from,seq)
      * distincts (seq=i) => aucun conflit ; id distinct via id_seed. */
-    meshpay_dag_t src;
-    meshpay_dag_init(&src);
+    meshpay_dag_t *src = test_pool_dag(0);
     const uint32_t N = 100;
     for (uint32_t i = 0; i < N; ++i) {
         meshpay_tx_t tx;
         make_tx(&tx, MESHPAY_TX_TYPE_MINT, (uint8_t)(0x10 + i), master, alice,
                 1000 + i, i, NULL, 0);
-        TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(&src, &tx));
+        TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(src, &tx));
     }
-    TEST_ASSERT_EQUAL_UINT32(N, meshpay_dag_count(&src));
+    TEST_ASSERT_EQUAL_UINT32(N, meshpay_dag_count(src));
 
     rns_link_t link;
     make_active_link(&link);
-    meshpay_dag_t dst; /* recepteur vide */
-    meshpay_dag_init(&dst);
+    meshpay_dag_t *dst = test_pool_dag(1); /* recepteur vide */
 
     uint16_t cursor = 0;
     size_t chunk_count = 0;
-    while (cursor < meshpay_dag_count(&src)) {
+    while (cursor < meshpay_dag_count(src)) {
         rns_packet_t packets[RNS_RESOURCE_MAX_FRAGMENTS];
         size_t pc = 0;
         uint16_t next = cursor;
         TEST_ASSERT_EQUAL(ESP_OK,
                           meshpay_dag_sync_build_batch_resource_from(
-                              &src, cursor, &link, packets,
+                              src, cursor, &link, packets,
                               RNS_RESOURCE_MAX_FRAGMENTS, &pc, &next));
         TEST_ASSERT_TRUE(pc >= 1);
         TEST_ASSERT_TRUE(next > cursor); /* progression stricte (>=1 tx/chunk) */
@@ -381,15 +379,15 @@ TEST_CASE("dag sync build_batch_resource_from paginates a large dag", "[dag_sync
         TEST_ASSERT_TRUE(complete);
         size_t merged = 0;
         TEST_ASSERT_EQUAL(ESP_OK,
-                          meshpay_dag_sync_apply_batch(&dst, batch, bl, &merged));
+                          meshpay_dag_sync_apply_batch(dst, batch, bl, &merged));
         cursor = next;
         chunk_count++;
     }
 
     TEST_ASSERT_TRUE(chunk_count >= 2);                    /* pagination effective */
-    TEST_ASSERT_EQUAL_UINT16(meshpay_dag_count(&src), cursor); /* couverture [0,count) */
-    TEST_ASSERT_EQUAL_UINT32(meshpay_dag_count(&src),
-                             meshpay_dag_count(&dst));     /* recepteur complet */
+    TEST_ASSERT_EQUAL_UINT16(meshpay_dag_count(src), cursor); /* couverture [0,count) */
+    TEST_ASSERT_EQUAL_UINT32(meshpay_dag_count(src),
+                             meshpay_dag_count(dst));     /* recepteur complet */
 }
 
 
@@ -398,33 +396,33 @@ TEST_CASE("dag sync build_batch_resource_from paginates a large dag", "[dag_sync
  * donnent des digests differents. */
 TEST_CASE("dag sync summary carries the dag digest", "[dag_sync]")
 {
-    meshpay_dag_t full;
-    meshpay_dag_t slow;
+    meshpay_dag_t *full = test_pool_dag(0);
+    meshpay_dag_t *slow = test_pool_dag(1);
     meshpay_tx_t tx0;
     meshpay_tx_t tx1;
     meshpay_tx_t tx2;
-    build_dags(&full, &slow, &tx0, &tx1, &tx2);
+    build_dags(full, slow, &tx0, &tx1, &tx2);
 
     uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE];
     fill_sequence(source, sizeof(source), 0xaa);
 
     rns_packet_t packet;
     TEST_ASSERT_EQUAL(ESP_OK,
-                      meshpay_dag_sync_build_summary(&full, source, &packet));
+                      meshpay_dag_sync_build_summary(full, source, &packet));
     meshpay_dag_sync_summary_t summary;
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_dag_sync_parse_summary(&packet, &summary));
     TEST_ASSERT_TRUE(summary.has_digest);
 
     uint8_t expected[RNS_CRYPTO_SHA256_SIZE];
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(&full, expected));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(full, expected));
     TEST_ASSERT_EQUAL_MEMORY(expected, summary.digest,
                              MESHPAY_DAG_SYNC_DIGEST_SIZE);
 
     /* DAG de contenu different (slow = 1 tx) => digest different. */
     rns_packet_t packet_slow;
     TEST_ASSERT_EQUAL(ESP_OK,
-                      meshpay_dag_sync_build_summary(&slow, source, &packet_slow));
+                      meshpay_dag_sync_build_summary(slow, source, &packet_slow));
     meshpay_dag_sync_summary_t summary_slow;
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_dag_sync_parse_summary(&packet_slow, &summary_slow));

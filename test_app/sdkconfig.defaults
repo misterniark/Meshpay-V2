@@ -1,12 +1,41 @@
 # Defaults du banc de test Unity (test_app).
 #
-# La tâche `main` exécute les TEST_CASE Unity, dont des tests crypto-lourds
-# (vérif Ed25519 Monocypher ~2 Ko de pile + buffers CBOR 384 o). La pile par
-# défaut du main (3584 o) déborde -> « stack overflow in task main » détecté au
-# changement de contexte. On la remonte largement pour le banc.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+# La tâche `main` exécute les TEST_CASE Unity, dont des tests qui déclarent SUR
+# LA PILE de grosses structures légitimes :
+#  - app_main : meshpay_app_runtime_t ~29 Ko (il embarque un pool de 4
+#    reassembleurs Resource), souvent DEUX par test (runtime_a + runtime_b),
+#    plus parfois 2 rns_node_t -> pire cas mesuré ~77 Ko ;
+#  - dag_sync / rns_resource : rns_packet_t[16] + reassembler + batch ~24 Ko ;
+#  - crypto : vérif Ed25519 Monocypher ~2 Ko + CBOR.
+# La pile FreeRTOS du main étant allouée sur le TAS, un débordement n'est pas
+# détecté tout de suite : il écrase les métadonnées heap adjacentes et provoque
+# un crash différé (assert spinlock heap, NO_MEM trompeur, watchdog verrou log).
+# La PSRAM (ci-dessus) ayant libéré la RAM interne (pool + gros buffers en
+# externe), on peut dimensionner largement la pile interne. 128 Ko couvre le pire
+# cas + la profondeur d'appels imbriqués.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=131072
 
 # Les suites de tests comparent des valeurs 64 bits (TEST_ASSERT_EQUAL_UINT64
 # sur max_supply / total_minted). Sans ce flag, Unity échoue avec « 64-bit
 # Support Disabled » puis crashe dans son longjmp de gestion d'échec.
 CONFIG_UNITY_ENABLE_64BIT=y
+
+# PSRAM (T-Deck : 8 Mo octal, mirror de sdkconfig.defaults.tdeck). Le banc linke
+# TOUTES les suites dans un seul binaire mono-tâche : la RAM interne (~255 Ko) ne
+# suffit pas pour le pool de grosses structs (2× meshpay_app_t ~120 Ko) + le buffer
+# dag_store (64 Ko) + les piles + les queues. Avec SPIRAM_USE_MALLOC, les grosses
+# allocations (> ALWAYSINTERNAL) partent en PSRAM et libèrent la RAM interne.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# Console : le T-Deck est en USB-Serial/JTAG natif. Sans ce réglage, la console
+# primaire retombe sur UART0 (broches physiques) et les logs applicatifs ESP_LOG
+# n'apparaissent PAS sur le port USB où l'on monitore (seuls les logs ROM du
+# bootloader passent). Mirror de sdkconfig.defaults.tdeck.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Flash 16 Mo (module N16R8 du T-Deck), comme la prod : évite le mismatch
+# 2 Mo et aligne le banc sur la configuration matérielle réelle.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y

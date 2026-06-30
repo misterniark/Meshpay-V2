@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "test_main.c"
+        "test_pool.c"
         "../../components/project_skeleton/test/test_project_skeleton.c"
         "../../components/rns_fixtures/test/test_rns_fixtures.c"
         "../../components/rns_crypto/test/test_rns_crypto.c"

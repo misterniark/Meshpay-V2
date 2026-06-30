@@ -2,12 +2,13 @@
 
 #include "meshpay/dag_sync.h"
 #include "meshpay/rns/rns_link_request.h"
+#include "test_pool.h"
 #include "unity.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 static meshpay_dag_monitor_t s_monitor;
-static meshpay_dag_t s_dag;
 static meshpay_tx_t s_tx0;
 static meshpay_tx_t s_tx1;
 static rns_packet_t s_packet;
@@ -86,8 +87,7 @@ TEST_CASE("dag monitor records lora-only summaries without transmitting",
     meshpay_dag_monitor_t *monitor = &s_monitor;
     meshpay_dag_monitor_init(monitor);
 
-    meshpay_dag_t *dag = &s_dag;
-    meshpay_dag_init(dag);
+    meshpay_dag_t *dag = test_pool_dag(0);
     meshpay_tx_t *tx = &s_tx0;
     make_tx(tx, 0x21, 0, NULL, 0);
     TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, tx));
@@ -190,8 +190,7 @@ TEST_CASE("dag monitor inspects resource batches without merging into a dag",
     meshpay_dag_monitor_t *monitor = &s_monitor;
     meshpay_dag_monitor_init(monitor);
 
-    meshpay_dag_t *dag = &s_dag;
-    meshpay_dag_init(dag);
+    meshpay_dag_t *dag = test_pool_dag(0);
     meshpay_tx_t *tx0 = &s_tx0;
     make_tx(tx0, 0x31, 0, NULL, 0);
     TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, tx0));

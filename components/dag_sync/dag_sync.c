@@ -444,9 +444,12 @@ esp_err_t meshpay_dag_sync_apply_batch(meshpay_dag_t *target_dag,
                 progress = true;
             } else if (result == MESHPAY_DAG_MERGE_CONFLICT ||
                        result == MESHPAY_DAG_MERGE_INVALID) {
-                /* DIAG : identifie la tx fautive (confirme H2 = rejet du batch
-                 * entier sur conflit (from,seq) ; revele le compte et le seq). */
-                ESP_LOGW("dag_sync",
+                /* Niveau DEBUG (et non WARN) : ce log est un outil de diagnostic
+                 * de la reconciliation, pas un evenement de prod. Un pair distant
+                 * peut emettre a volonte des batches en conflit ; logguer en WARN
+                 * a chaque tx fautive serait un vecteur de spam de logs via radio.
+                 * Compile hors des builds par defaut (LOG niveau INFO). */
+                ESP_LOGD("dag_sync",
                          "apply_batch fatal result=%d seq=%u from=%02x%02x%02x%02x",
                          (int)result, (unsigned)tx.seq,
                          tx.from[0], tx.from[1], tx.from[2], tx.from[3]);
