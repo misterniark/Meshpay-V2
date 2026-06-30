@@ -4,4 +4,9 @@
 # (vérif Ed25519 Monocypher ~2 Ko de pile + buffers CBOR 384 o). La pile par
 # défaut du main (3584 o) déborde -> « stack overflow in task main » détecté au
 # changement de contexte. On la remonte largement pour le banc.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# Les suites de tests comparent des valeurs 64 bits (TEST_ASSERT_EQUAL_UINT64
+# sur max_supply / total_minted). Sans ce flag, Unity échoue avec « 64-bit
+# Support Disabled » puis crashe dans son longjmp de gestion d'échec.
+CONFIG_UNITY_ENABLE_64BIT=y

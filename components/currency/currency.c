@@ -1,6 +1,8 @@
 #include "meshpay/currency.h"
 
+#include "meshpay/meshpay_tx.h"
 #include "meshpay/rns/rns_crypto.h"
+#include "meshpay/rns/rns_identity.h"
 #include <string.h>
 
 static bool account_equal(const uint8_t a[MESHPAY_TX_DESTINATION_HASH_SIZE],
@@ -60,6 +62,46 @@ bool meshpay_currency_is_mint_authority(
         }
     }
     return false;
+}
+
+esp_err_t meshpay_currency_config_from_descriptor(
+    meshpay_currency_config_t *config,
+    const meshpay_currency_descriptor_signed_t *descriptor)
+{
+    if (config == NULL || descriptor == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Hash d'identité 16 o du fondateur = autorité MINT unique. On le calcule
+     * AVANT de toucher à config, pour ne rien laisser à moitié initialisé en
+     * cas d'échec (descripteur sans clés publiques valides). */
+    uint8_t founder_hash[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    esp_err_t err =
+        meshpay_currency_descriptor_founder_hash(descriptor, founder_hash);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* Règles reprises telles quelles depuis le corps signé. currency_id est le
+     * champ DÉRIVÉ du genesis (rempli par decode/sign du descripteur). */
+    meshpay_currency_config_init(config, descriptor->currency_id);
+    config->max_supply = descriptor->body.max_supply;
+    config->transfer_fee = descriptor->body.transfer_fee;
+    config->demurrage_enabled = descriptor->body.demurrage_enabled;
+    config->demurrage_bps = descriptor->body.demurrage_bps;
+
+    /* Le fondateur est la SEULE autorité de frappe. */
+    err = meshpay_currency_add_mint_authority(config, founder_hash);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* Clés publiques du fondateur : servent à vérifier la signature des MINT
+     * (cf. meshpay_currency_validate_tx, durcissement Palier A). */
+    memcpy(config->founder_public, descriptor->body.founder_public,
+           sizeof(config->founder_public));
+    config->has_descriptor = true;
+    return ESP_OK;
 }
 
 esp_err_t meshpay_currency_total_minted(
@@ -153,6 +195,23 @@ meshpay_currency_result_t meshpay_currency_validate_tx(
     if (tx->type == MESHPAY_TX_TYPE_MINT) {
         if (!meshpay_currency_is_mint_authority(config, tx->from)) {
             return MESHPAY_CURRENCY_ERR_NOT_AUTHORITY;
+        }
+
+        /* Durcissement Palier A : si la config est ancrée sur un descripteur
+         * signé, la signature de la TX MINT est vérifiée INCONDITIONNELLEMENT
+         * contre la clé publique embarquée du fondateur. Sans cela, un attaquant
+         * pourrait forger un MINT avec from = hash fondateur (public) et une
+         * signature bidon, accepté par un pair qui ne connaît pas encore
+         * l'identité du fondateur (faille d'inflation). */
+        if (config->has_descriptor) {
+            rns_identity_t founder;
+            if (rns_identity_load_public(&founder, config->founder_public) !=
+                ESP_OK) {
+                return MESHPAY_CURRENCY_ERR_INVALID;
+            }
+            if (meshpay_tx_verify(tx, &founder) != ESP_OK) {
+                return MESHPAY_CURRENCY_ERR_BAD_SIGNATURE;
+            }
         }
 
         if (config->max_supply > 0) {

@@ -1,7 +1,9 @@
 #pragma once
 
 #include "esp_err.h"
+#include "meshpay/currency_descriptor.h"
 #include "meshpay/dag.h"
+#include "meshpay/rns/rns_identity.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -20,6 +22,7 @@ typedef enum {
     MESHPAY_CURRENCY_ERR_SUPPLY_EXCEEDED,
     MESHPAY_CURRENCY_ERR_BAD_FEE,
     MESHPAY_CURRENCY_ERR_INSUFFICIENT,
+    MESHPAY_CURRENCY_ERR_BAD_SIGNATURE,
 } meshpay_currency_result_t;
 
 typedef struct {
@@ -31,6 +34,9 @@ typedef struct {
     uint8_t mint_authority_count;
     bool demurrage_enabled;
     uint16_t demurrage_bps;
+    /* Palier A — ancrage sur le descripteur de monnaie signé. */
+    uint8_t founder_public[RNS_IDENTITY_PUBLIC_SIZE]; /* clés pub fondateur (autorité MINT) */
+    bool has_descriptor;                              /* config dérivée d'un descripteur signé */
 } meshpay_currency_config_t;
 
 void meshpay_currency_config_init(meshpay_currency_config_t *config,
@@ -41,6 +47,18 @@ esp_err_t meshpay_currency_add_mint_authority(
 bool meshpay_currency_is_mint_authority(
     const meshpay_currency_config_t *config,
     const uint8_t authority[MESHPAY_TX_DESTINATION_HASH_SIZE]);
+
+/*
+ * Dérive la config runtime depuis un descripteur de monnaie signé :
+ *  - règles (currency_id dérivé, max_supply, transfer_fee, demurrage) ;
+ *  - autorité MINT UNIQUE = hash d'identité du fondateur ;
+ *  - clés publiques du fondateur (pour vérifier la signature des MINT).
+ * Positionne has_descriptor = true. Le descripteur DOIT déjà avoir été vérifié
+ * par l'appelant (meshpay_currency_descriptor_verify).
+ */
+esp_err_t meshpay_currency_config_from_descriptor(
+    meshpay_currency_config_t *config,
+    const meshpay_currency_descriptor_signed_t *descriptor);
 
 meshpay_currency_result_t meshpay_currency_validate_tx(
     const meshpay_currency_config_t *config,
