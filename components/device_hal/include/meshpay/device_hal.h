@@ -92,6 +92,9 @@ typedef struct {
     esp_err_t (*espnow_recv)(void *ctx, uint8_t *data, size_t size, size_t *len);
     esp_err_t (*battery_mv)(void *ctx, uint16_t *mv);
     esp_err_t (*battery_status)(void *ctx, uint16_t *mv, uint8_t *percent);
+    /* Lecture d'une touche clavier I2C (T-Deck). NULL sur les cartes sans clavier.
+     * Retourne le code ASCII de la touche pressée, ou 0 si aucune touche en attente. */
+    esp_err_t (*keyboard_read)(void *ctx, uint8_t *out_ascii);
 } meshpay_hal_ops_t;
 
 typedef struct {
@@ -212,6 +215,9 @@ esp_err_t meshpay_hal_battery_mv(meshpay_hal_t *hal, uint16_t *mv);
 esp_err_t meshpay_hal_battery_status(meshpay_hal_t *hal,
                                      uint16_t *mv,
                                      uint8_t *percent);
+/* Lit une touche clavier I2C (T-Deck). *out_ascii vaut 0 si aucune touche en attente.
+ * Retourne ESP_ERR_INVALID_ARG si out_ascii est NULL ou si l'op n'est pas câblée. */
+esp_err_t meshpay_hal_keyboard_read(meshpay_hal_t *hal, uint8_t *out_ascii);
 
 typedef struct {
     bool display_initialized;
@@ -226,6 +232,8 @@ typedef struct {
     uint8_t espnow_packet[MESHPAY_HAL_PACKET_MAX];
     size_t espnow_len;
     uint16_t battery_mv;
+    /* Octet clavier mis en file par meshpay_hal_mock_queue_keyboard ; 0 = aucune touche. */
+    uint8_t keyboard_byte;
 } meshpay_hal_mock_t;
 
 void meshpay_hal_mock_init(meshpay_hal_mock_t *mock,
@@ -237,6 +245,8 @@ void meshpay_hal_mock_queue_lora(meshpay_hal_mock_t *mock,
                                  const uint8_t *data, size_t len);
 void meshpay_hal_mock_queue_espnow(meshpay_hal_mock_t *mock,
                                    const uint8_t *data, size_t len);
+/* Met un octet ASCII en file pour le prochain meshpay_hal_keyboard_read (one-shot). */
+void meshpay_hal_mock_queue_keyboard(meshpay_hal_mock_t *mock, uint8_t ascii);
 
 void meshpay_hal_espnow_default_config(meshpay_hal_espnow_config_t *config);
 esp_err_t meshpay_hal_espnow_driver_init(

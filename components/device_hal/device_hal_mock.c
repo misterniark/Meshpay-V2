@@ -123,6 +123,20 @@ static esp_err_t mock_battery_mv(void *ctx, uint16_t *mv)
     return ESP_OK;
 }
 
+/* Lecture d'une touche clavier simulée.
+ * Retourne keyboard_byte puis le remet à 0 (comportement one-shot).
+ * 0 = aucune touche en attente. */
+static esp_err_t mock_keyboard_read(void *ctx, uint8_t *out_ascii)
+{
+    if (out_ascii == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    meshpay_hal_mock_t *mock = (meshpay_hal_mock_t *)ctx;
+    *out_ascii = mock->keyboard_byte;   /* 0 = aucune touche */
+    mock->keyboard_byte = 0;            /* consommée (one-shot) */
+    return ESP_OK;
+}
+
 static esp_err_t mock_battery_status(void *ctx, uint16_t *mv, uint8_t *percent)
 {
     if (mv == NULL || percent == NULL) {
@@ -146,6 +160,8 @@ static const meshpay_hal_ops_t MOCK_OPS = {
     .espnow_recv = mock_espnow_recv,
     .battery_mv = mock_battery_mv,
     .battery_status = mock_battery_status,
+    /* Clavier simulé : disponible dans tous les mocks (retourne 0 sur cartes sans clavier). */
+    .keyboard_read = mock_keyboard_read,
 };
 
 void meshpay_hal_mock_init(meshpay_hal_mock_t *mock,
@@ -183,5 +199,14 @@ void meshpay_hal_mock_queue_espnow(meshpay_hal_mock_t *mock,
     if (mock != NULL && data != NULL && len <= sizeof(mock->espnow_packet)) {
         memcpy(mock->espnow_packet, data, len);
         mock->espnow_len = len;
+    }
+}
+
+/* Met un octet ASCII en file pour le prochain meshpay_hal_keyboard_read.
+ * Comportement one-shot : l'octet est remis à 0 après la première lecture. */
+void meshpay_hal_mock_queue_keyboard(meshpay_hal_mock_t *mock, uint8_t ascii)
+{
+    if (mock != NULL) {
+        mock->keyboard_byte = ascii;
     }
 }

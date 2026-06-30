@@ -83,6 +83,17 @@ esp_err_t meshpay_hal_battery_mv(meshpay_hal_t *hal, uint16_t *mv)
     return CALL_OP(hal, battery_mv, mv);
 }
 
+/* Lecture d'une touche clavier I2C (T-Deck).
+ * Retourne ESP_ERR_INVALID_ARG si out_ascii est NULL ou si l'op n'est pas câblée
+ * (cartes sans clavier : keyboard_read = NULL dans la table d'ops). */
+esp_err_t meshpay_hal_keyboard_read(meshpay_hal_t *hal, uint8_t *out_ascii)
+{
+    if (out_ascii == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return CALL_OP(hal, keyboard_read, out_ascii);
+}
+
 esp_err_t meshpay_hal_battery_status(meshpay_hal_t *hal,
                                      uint16_t *mv,
                                      uint8_t *percent)

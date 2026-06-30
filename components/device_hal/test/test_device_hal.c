@@ -494,3 +494,25 @@ TEST_CASE("lilygo h752 driver rejects invalid handles",
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
                       meshpay_hal_lilygo_t5s3_h752_driver_deinit(NULL));
 }
+
+TEST_CASE("device hal mock keyboard read returns queued ascii", "[device_hal]")
+{
+    meshpay_hal_t hal;
+    meshpay_hal_mock_t mock;
+    meshpay_hal_mock_init(&mock, &hal, MESHPAY_BOARD_LILYGO_TDECK);
+
+    uint8_t ch = 0xFF;
+    /* Sans touche en attente : 0 (aucune touche), ESP_OK. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_hal_keyboard_read(&hal, &ch));
+    TEST_ASSERT_EQUAL_UINT8(0, ch);
+
+    /* Une touche mise en file est restituée puis consommée. */
+    meshpay_hal_mock_queue_keyboard(&mock, 'A');
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_hal_keyboard_read(&hal, &ch));
+    TEST_ASSERT_EQUAL_UINT8('A', ch);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_hal_keyboard_read(&hal, &ch));
+    TEST_ASSERT_EQUAL_UINT8(0, ch);
+
+    /* Garde-fou argument. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, meshpay_hal_keyboard_read(&hal, NULL));
+}
