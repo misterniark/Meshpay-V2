@@ -10,11 +10,16 @@
 
 **Référence spec :** `Doctech V2/chantier_palier0_bringup_tdeck.md`.
 
-> **État (2026-06-30) : Phase 1 ✅ TERMINÉE et fusionnée sur `main`** (commits
-> `9cf99ff..f333abe`). Tâches 1-5 faites en TDD (sous-agents) ; `test_app` et le
-> firmware T-Deck compilent. ⚠️ Assertions Unity **non encore exécutées on-device**
-> (cible-only S3). **Phase 2 (drivers au banc) = prochaine étape**, nécessite le
-> T-Deck branché.
+> **État (2026-06-30) :**
+> - **Phase 1 ✅** fusionnée sur `main` (`9cf99ff..f333abe`). Tests Unity `[device_hal]`
+>   **exécutés on-device** sur le T-Deck (18/18 PASS).
+> - **Phase 2 ✅ (l'essentiel)** au banc (T-Deck Plus, MAC f0:9e:9e:00:f9:90) :
+>   écran ST7789 (bleu), tactile GT911 (@0x14), clavier (@0x55), ESP-NOW + LoRa
+>   Core1262 (bearer up sur bus SPI partagé sans conflit), KB_POWERON. Commits
+>   `c00a8d9` (écran) + `b08f806` (tactile+clavier+fix i2c). Voir « Résultats banc »
+>   en fin de doc.
+> - **Reste** : batterie ADC (en cours), LoRa TX/RX réel (différé), transform
+>   tactile→écran (Phase D, UI).
 
 ---
 
@@ -714,3 +719,50 @@ static TaskHandle_t s_tdeck_touch_task;
 2. BUSY LoRa = 13 (divergence sources).
 3. Séquence/orientation ST7789 (Task 7).
 4. Firmware factory du C3 clavier présent.
+
+---
+
+## Résultats banc — Phase 2 (2026-06-30, T-Deck Plus, MAC f0:9e:9e:00:f9:90)
+
+Validé sur le matériel. Commits : `c00a8d9` (écran), `b08f806` (tactile+clavier+fix i2c),
+`4e6920d` (batterie).
+
+| Périphérique | Résultat |
+|---|---|
+| Écran ST7789 | ✅ bleu plein écran (power+SPI+init+BL+flush OK) |
+| Tactile GT911 | ✅ **à 0x14** (pas 0x5D), 43 événements, coords variables |
+| Clavier I2C 0x55 | ✅ touches captées (a/b/c/…) |
+| ESP-NOW | ✅ announces + sync DAG |
+| LoRa Core1262 | ✅ bearer up sur bus SPI **partagé** écran/LoRa, sans conflit (init ; TX réel différé) |
+| Batterie ADC | ✅ ~4977 mV sur USB (multiplicateur ×2.11 à calibrer sur batterie réelle) |
+| KB_POWERON | ✅ |
+| Tests Unity `[device_hal]` | ✅ 18/18 PASS on-device |
+
+### Pièges rencontrés et résolus (importants)
+1. **Conflit de driver I2C → boucle de crash.** Le fichier Waveshare (toujours compilé)
+   embarque le NOUVEAU driver i2c (`i2c_new_master_bus`) ; le tactile/clavier T-Deck
+   utilisait l'ANCIEN (`i2c_driver_install`). Les deux liés → `abort()` dans le
+   constructeur global `check_i2c_driver_conflict` AVANT `app_main` → reboot en boucle
+   (écran noir, série muette, esptool « no serial data »). **Fix** : supprimer la seule
+   référence au fichier Waveshare (`rgb565_to_be`) → conversion RGB565→BE locale →
+   nouveau driver non lié (vérifié : `i2c_new_master_bus` absent du `.elf`).
+2. **GT911 à 0x14** (pas 0x5D) — l'adresse dépend du niveau d'INT au reset. Fix : scan
+   I2C + détection auto 0x5D/0x14 au boot.
+
+### Flash sur T-Deck Plus (USB natif + batterie) — procédure
+- Pas de pont USB-UART → DTR/RTS ne resettent PAS la carte ; **batterie** → débrancher
+  l'USB ne l'éteint pas. esptool `default_reset`/`usb_reset` marchent quand le firmware
+  est **sain**, mais **échouent si le firmware plante** (boucle de crash).
+- **Recovery d'un firmware planté** : **maintenir BOOT enfoncé** (ou presser le trackball =
+  GPIO0) **pendant le flash** — la boucle de crash fournit le reset, BOOT bas sélectionne
+  le download mode. Relâcher quand « Writing… » apparaît.
+- **Capture série** : fiable seulement **juste après un flash** (le hard-reset d'esptool).
+  `idf.py monitor` exige un TTY (indispo en arrière-plan) → utiliser pyserial.
+
+### Reste (hors « bring-up fonctionnel »)
+- LoRa TX/RX réel sur bus partagé (TX simultané écran/LoRa) — différé (wallets aussi en
+  `espnow-only`).
+- Transform tactile→écran : GT911 en **portrait panneau 240×320**, écran en **paysage
+  320×240** → rotation à appliquer à l'intégration UI (**Palier D**).
+- Calibration du multiplicateur batterie (multimètre sur batterie réelle).
+- Orientation MADCTL (0x60) à confirmer au premier rendu de texte/UI.

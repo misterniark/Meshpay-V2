@@ -200,9 +200,16 @@ Aucun `TEST_IGNORE`, aucune désactivation de test (CLAUDE.md).
 
 ---
 
-## 9. Décisions ouvertes (non bloquantes pour le plan, à lever au banc)
+## 9. Décisions ouvertes — RÉSOLUES au banc (2026-06-30)
 
-- Valeur exacte du pin **BUSY** LoRa (13 probable).
-- Init ST7789 exacte (orientation, offsets, RGB/BGR).
-- Présence/firmware du C3 clavier.
-- Bus/port I2C exact pour GT911 (partagé avec le clavier sur SDA 18 / SCL 8).
+- ~~Valeur exacte du pin **BUSY** LoRa~~ → **13** confirmé (Core1262 bearer up).
+- ~~Init ST7789 (couleurs/offsets)~~ → couleurs OK (INVON + BE), plein écran sans offset.
+  Reste l'**orientation MADCTL** (0x60) à confirmer au 1er rendu de texte (Palier D).
+- ~~Présence/firmware du C3 clavier~~ → **OK**, clavier @0x55 fonctionnel.
+- ~~Bus/port I2C exact pour GT911~~ → I2C_NUM_0 SDA 18 / SCL 8 ; **GT911 à 0x14** (pas
+  0x5D) — détection auto ajoutée.
+- **Nouveau piège résolu** : conflit de driver I2C (ancien vs nouveau, via le fichier
+  Waveshare) → `abort()` au boot. Voir « Résultats banc » du plan d'implémentation.
+
+> **Bilan : bring-up fonctionnel** (écran, tactile, clavier, ESP-NOW, LoRa-init,
+> batterie, power). Détails + procédure de flash USB-natif/BOOT : `plan_palier0_bringup_tdeck.md`.

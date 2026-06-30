@@ -28,6 +28,7 @@ Actions:
   build-s3-secure   Build ESP32-S3 with flash encryption + encrypted NVS.
   build-h752        Build the LilyGo H752 e-paper firmware profile.
   build-cyd         Build an ESP32/CYD firmware profile.
+  build-tdeck       Build the LilyGo T-Deck Plus founder firmware profile.
   flash-encrypted   Run encrypted flash. Requires MESHPAY_HW_CONFIRM=flash.
   monitor           Open idf.py monitor on PORT.
   help              Show this help.
@@ -58,6 +59,11 @@ case "$ACTION" in
         idf_build esp32 \
             "$ROOT_DIR/$BUILD_BASE-cyd" \
             "$ROOT_DIR/sdkconfig.defaults;$ROOT_DIR/sdkconfig.defaults.esp32"
+        ;;
+    build-tdeck)
+        idf_build esp32s3 \
+            "$ROOT_DIR/$BUILD_BASE-tdeck" \
+            "$ROOT_DIR/sdkconfig.defaults;$ROOT_DIR/sdkconfig.defaults.tdeck"
         ;;
     flash-encrypted)
         if [[ "${MESHPAY_HW_CONFIRM:-}" != "flash" ]]; then
