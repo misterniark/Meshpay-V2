@@ -236,6 +236,17 @@ esp_err_t meshpay_app_runtime_emit_join_request(meshpay_app_runtime_t *runtime,
 meshpay_app_join_state_t meshpay_app_runtime_join_state(
     const meshpay_app_runtime_t *runtime);
 
+/*
+ * Palier B5 — produit le CODE D'INVITATION affichable de la monnaie détenue par
+ * ce device (décode le descripteur stocké puis meshpay_currency_invite_encode).
+ * Destiné à l'UI (le fondateur l'affiche). Rejette ESP_ERR_INVALID_STATE si le
+ * device n'est membre d'aucune monnaie (pas de descripteur en storage).
+ * `out` doit pouvoir contenir MESHPAY_CURRENCY_INVITE_CODE_BUF octets.
+ */
+esp_err_t meshpay_app_runtime_invite_code(meshpay_app_runtime_t *runtime,
+                                          char *out,
+                                          size_t out_size);
+
 #ifdef __cplusplus
 }
 #endif

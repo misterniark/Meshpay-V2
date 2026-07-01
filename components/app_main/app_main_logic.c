@@ -729,6 +729,36 @@ meshpay_app_join_state_t meshpay_app_runtime_join_state(
     return runtime->join_armed ? MESHPAY_APP_JOIN_ARMED : MESHPAY_APP_JOIN_IDLE;
 }
 
+esp_err_t meshpay_app_runtime_invite_code(meshpay_app_runtime_t *runtime,
+                                          char *out,
+                                          size_t out_size)
+{
+    if (runtime == NULL || runtime->app == NULL || runtime->lock == NULL ||
+        out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(runtime->lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err;
+    /* Le code dérive du descripteur détenu : aucune monnaie -> aucun code. */
+    if (!runtime->has_storage ||
+        !runtime->storage_record.has_currency_descriptor) {
+        err = ESP_ERR_INVALID_STATE;
+    } else {
+        meshpay_currency_descriptor_signed_t signed_desc;
+        err = meshpay_currency_descriptor_decode(
+            runtime->storage_record.currency_descriptor,
+            runtime->storage_record.currency_descriptor_len, &signed_desc);
+        if (err == ESP_OK) {
+            /* NB : encode ne prend pas le lock -> pas de re-entrée. */
+            err = meshpay_currency_invite_encode(&signed_desc, out, out_size);
+        }
+    }
+    xSemaphoreGive(runtime->lock);
+    return err;
+}
+
 esp_err_t meshpay_app_runtime_post(meshpay_app_runtime_t *runtime,
                                    meshpay_app_queue_id_t queue_id,
                                    const meshpay_app_event_t *event,
@@ -1191,10 +1221,9 @@ static bool runtime_packet_has_reject_status(const rns_packet_t *packet)
 }
 
 /* Filtre de FORME : vrai pour tout paquet DATA diffusé en clair (broadcast). Le
- * TYPE de message est porté par data[0] et discriminé par l'appelant. NB : seuls
- * 0x31/0x32 (dag_sync) et 0x34 (OFFER de rejointe) sont effectivement dispatchés
- * ici ; répondre à un 0x33 (REQUEST de rejointe reçu) relève du rôle FONDATEUR,
- * câblé dans main/ (hors B4) — un 0x33 entrant est ignoré à ce stade. */
+ * TYPE de message est porté par data[0] et discriminé par l'appelant : 0x31/0x32
+ * (dag_sync summary/request), 0x33 (REQUEST de rejointe -> on sert l'OFFER si
+ * membre, B5) et 0x34 (OFFER de rejointe -> import, B4). */
 static bool runtime_packet_is_plain_broadcast(const rns_packet_t *packet)
 {
     return packet != NULL &&
@@ -1261,6 +1290,53 @@ static esp_err_t runtime_import_currency_descriptor(
     /* Applique la config EN PLACE : l'engine de paiement tient &app->currency,
      * la mutation est donc vue immédiatement sans ré-init. */
     runtime->app->currency = derived;
+    return ESP_OK;
+}
+
+/*
+ * Palier B5 — répond à une REQUEST de descripteur reçue (data[0] == 0x33). Tout
+ * MEMBRE d'une monnaie peut servir son descripteur (pas seulement le fondateur) :
+ * on décode le blob stocké et on le rediffuse en OFFER (PLAIN broadcast). Ne sert
+ * QUE si l'on détient la monnaie demandée (currency_id). Non-bloquant, ESP_OK sur
+ * tous les cas gérés. Exécuté sous le lock du runtime (déjà tenu).
+ */
+static esp_err_t runtime_handle_join_request(meshpay_app_runtime_t *runtime,
+                                             const rns_packet_t *packet)
+{
+    /* Je ne peux servir un descripteur que si j'en détiens un, persisté. */
+    if (!runtime->app->currency.has_descriptor || !runtime->has_storage ||
+        !runtime->storage_record.has_currency_descriptor) {
+        return ESP_OK;
+    }
+    uint32_t wanted = 0;
+    if (meshpay_descriptor_sync_parse_request(packet, &wanted, NULL) != ESP_OK) {
+        return ESP_OK; /* requête illisible ignorée */
+    }
+    /* Pas ma monnaie -> je ne réponds pas (un autre membre le fera). */
+    if (wanted != runtime->app->currency.currency_id) {
+        return ESP_OK;
+    }
+    if (runtime->packet_tx == NULL) {
+        return ESP_OK; /* pas d'émetteur radio câblé */
+    }
+
+    /* Décode MON descripteur stocké et le ressert tel quel en OFFER broadcast. */
+    meshpay_currency_descriptor_signed_t signed_desc;
+    if (meshpay_currency_descriptor_decode(
+            runtime->storage_record.currency_descriptor,
+            runtime->storage_record.currency_descriptor_len,
+            &signed_desc) != ESP_OK) {
+        ESP_LOGW("app_runtime", "descripteur stocké illisible -> pas d'OFFER");
+        return ESP_OK;
+    }
+    rns_packet_t offer;
+    if (meshpay_descriptor_sync_build_offer(
+            &signed_desc, runtime->app->local_destination, &offer) != ESP_OK) {
+        return ESP_OK;
+    }
+    (void)runtime->packet_tx(&offer, runtime->packet_tx_ctx);
+    ESP_LOGI("app_runtime", "OFFER descripteur servi pour currency_id=%08x",
+             (unsigned)wanted);
     return ESP_OK;
 }
 
@@ -1447,6 +1523,9 @@ static esp_err_t runtime_process_reticulum(meshpay_app_runtime_t *runtime,
                 err == ESP_ERR_NOT_FOUND) {
                 err = ESP_OK;
             }
+        } else if (event->packet.data[0] == MESHPAY_DESCRIPTOR_SYNC_MSG_REQUEST) {
+            /* Palier B5 — REQUEST de descripteur : servir l'OFFER si membre. */
+            err = runtime_handle_join_request(runtime, &event->packet);
         } else if (event->packet.data[0] == MESHPAY_DESCRIPTOR_SYNC_MSG_OFFER) {
             /* Palier B4 — OFFER de descripteur de monnaie (rejointe). Le handler
              * neutralise déjà tous ses rejets (retourne ESP_OK). */
