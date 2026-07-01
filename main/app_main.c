@@ -72,6 +72,9 @@ static const char *s_radio_backend = "disabled";
 #define MESHPAY_ANNOUNCE_REPLY_COOLDOWN_MS 30000U
 #define MESHPAY_UI_REFRESH_INTERVAL_MS 1000U
 #define MESHPAY_DAG_SUMMARY_INTERVAL_MS 15000U
+/* Intervalle de ré-émission de la REQUEST de descripteur tant que le device est
+ * « armé » (rejointe en cours). Devient inerte une fois membre (Palier B5). */
+#define MESHPAY_JOIN_REQUEST_INTERVAL_MS 8000U
 #define MESHPAY_DAG_MONITOR_RENDER_POLL_MS 1000U
 #define MESHPAY_DAG_MONITOR_FULL_REFRESH_MS 300000U
 #define MESHPAY_DAG_MONITOR_RADIO_TASK_STACK_BYTES 8192
@@ -91,6 +94,7 @@ static meshpay_announce_reply_entry_t
 static size_t s_announce_replied_count;
 static TaskHandle_t s_boot_announce_task;
 static TaskHandle_t s_dag_summary_task;
+static TaskHandle_t s_join_request_task;
 #if CONFIG_MESHPAY_DAG_MONITOR_ONLY
 static meshpay_dag_monitor_t s_dag_monitor;
 static meshpay_ui_state_t s_dag_monitor_ui;
@@ -1740,6 +1744,31 @@ static void dag_summary_task(void *arg)
     }
 }
 
+/*
+ * Palier B5 — tant que le device est ARMÉ (code d'invitation saisi, pas encore
+ * membre), redemande périodiquement le descripteur par radio. emit_join_request
+ * renvoie ESP_ERR_INVALID_STATE quand il n'y a rien à demander (non armé, déjà
+ * membre, pas d'émetteur) : c'est le cas nominal au repos, pas un warning. La
+ * tâche devient donc inerte d'elle-même une fois la rejointe réussie.
+ */
+static void join_request_task(void *arg)
+{
+    (void)arg;
+    /* Décalage initial : laisser la découverte (announce) s'établir. */
+    vTaskDelay(pdMS_TO_TICKS(2000U + dag_summary_jitter_ms()));
+
+    while (true) {
+        if (meshpay_app_runtime_join_state(&s_runtime) == MESHPAY_APP_JOIN_ARMED) {
+            uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
+            esp_err_t err = meshpay_app_runtime_emit_join_request(&s_runtime, now_ms);
+            if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "join request emit failed: %s", esp_err_to_name(err));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(MESHPAY_JOIN_REQUEST_INTERVAL_MS));
+    }
+}
+
 #if MESHPAY_RADIO_ENABLED
 static meshpay_board_t configured_board(void)
 {
@@ -2807,6 +2836,15 @@ void app_main(void)
                     MESHPAY_APP_TASK_PRIORITY,
                     &s_dag_summary_task) != pdPASS) {
         ESP_LOGW(TAG, "DAG summary task start failed");
+    }
+    if (radio_ready &&
+        xTaskCreate(join_request_task,
+                    "join_request_task",
+                    MESHPAY_APP_TASK_STACK_WORDS,
+                    NULL,
+                    MESHPAY_APP_TASK_PRIORITY,
+                    &s_join_request_task) != pdPASS) {
+        ESP_LOGW(TAG, "join request task start failed");
     }
 
     const rns_node_stats_t *stats = rns_node_stats(&s_node);
