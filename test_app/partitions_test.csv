@@ -1,0 +1,22 @@
+# Table de partitions dédiée au banc de test Unity (test_app).
+#
+# Pourquoi une table dédiée : le banc linke TOUTES les suites Unity dans UN
+# SEUL binaire mono-tâche. Il grossit donc à chaque palier (nouveaux TEST_CASE).
+# Avec la table par défaut d'ESP-IDF (single-app, factory 1 Mo) le binaire
+# atteignait ~95 % => warning « The smallest app partition is nearly full ».
+#
+# Choix de dimensionnement : la flash du T-Deck (N16R8) fait 16 Mo et le banc
+# n'a besoin ni d'OTA, ni des partitions applicatives de prod :
+#  - pas de `dagstore` : en test, dag_store tourne sur son backend MOCK
+#    (dag_store_mock.c) et n'appelle jamais esp_partition_* ;
+#  - pas de `nvs_key` : aucune NVS chiffrée au banc (flash clair).
+# On donne donc une `factory` LARGE (4 Mo, ~4x le binaire actuel) pour absorber
+# la croissance des prochains paliers sans avoir à retoucher ce fichier.
+#
+# Cette table est propre au banc : les profils firmware (build-s3, tdeck,
+# secure...) ne l'utilisent pas et ne sont pas affectés.
+#
+# Name,     Type, SubType, Offset,  Size
+nvs,        data, nvs,     ,        0x6000,
+phy_init,   data, phy,     ,        0x1000,
+factory,    app,  factory, ,        4M,

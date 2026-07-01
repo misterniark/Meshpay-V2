@@ -1,3 +1,9 @@
+# Cible matérielle du banc : T-Deck Plus = ESP32-S3. Fixée ici pour que
+# `./scripts/idf.sh -B build-test build` sélectionne esp32s3 sur un build dir
+# NEUF ; sans elle, ESP-IDF retombe sur la cible par défaut esp32 (PSRAM octale
+# invalide -> échec de config). Doit rester en tête des réglages liés à la cible.
+CONFIG_IDF_TARGET="esp32s3"
+
 # Defaults du banc de test Unity (test_app).
 #
 # La tâche `main` exécute les TEST_CASE Unity, dont des tests qui déclarent SUR
@@ -39,3 +45,12 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # Flash 16 Mo (module N16R8 du T-Deck), comme la prod : évite le mismatch
 # 2 Mo et aligne le banc sur la configuration matérielle réelle.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Table de partitions dédiée au banc (voir test_app/partitions_test.csv). Le
+# binaire mono-tâche linke toutes les suites Unity et grossit à chaque palier :
+# la table par défaut (single-app, factory 1 Mo) était à ~95 % => warning
+# « smallest app partition is nearly full ». On passe à une factory de 4 Mo,
+# sans toucher aux tables des profils firmware.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_test.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_test.csv"
