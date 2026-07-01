@@ -20,6 +20,7 @@ extern "C" {
 typedef enum {
     MESHPAY_TX_TYPE_TRANSFER = 1,
     MESHPAY_TX_TYPE_MINT = 2,
+    MESHPAY_TX_TYPE_CLAIM = 3,
 } meshpay_tx_type_t;
 
 typedef struct {
@@ -60,6 +61,19 @@ esp_err_t meshpay_tx_create_mint(meshpay_tx_t *tx,
                                  const uint8_t parents[][MESHPAY_TX_PARENT_ID_SIZE],
                                  uint8_t parent_count,
                                  uint64_t timestamp_ms);
+
+/* Crée une CLAIM (crédit initial réflexif) : from == to == member, fee == 0 et
+ * seq == 0 (réservé) sont imposés par le constructeur — le membre s'auto-crédite
+ * `amount` (== initial_credit, vérifié à la couche currency). Les parents sont les
+ * tips courants du DAG (parent_count == 0 ⇒ genesis local d'un membre frais). */
+esp_err_t meshpay_tx_create_claim(meshpay_tx_t *tx,
+                                  const rns_identity_t *signer,
+                                  const uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE],
+                                  uint32_t amount,
+                                  uint32_t currency_id,
+                                  const uint8_t parents[][MESHPAY_TX_PARENT_ID_SIZE],
+                                  uint8_t parent_count,
+                                  uint64_t timestamp_ms);
 
 esp_err_t meshpay_tx_encode_signable(const meshpay_tx_t *tx,
                                      uint8_t *out,

@@ -178,7 +178,8 @@ static esp_err_t validate_common(const meshpay_tx_t *tx, bool require_signature)
     if (tx == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (tx->type != MESHPAY_TX_TYPE_TRANSFER && tx->type != MESHPAY_TX_TYPE_MINT) {
+    if (tx->type != MESHPAY_TX_TYPE_TRANSFER && tx->type != MESHPAY_TX_TYPE_MINT &&
+        tx->type != MESHPAY_TX_TYPE_CLAIM) {
         return ESP_ERR_INVALID_ARG;
     }
     if (hash_is_zero(tx->from, sizeof(tx->from)) ||
@@ -193,6 +194,20 @@ static esp_err_t validate_common(const meshpay_tx_t *tx, bool require_signature)
     }
     if (tx->type == MESHPAY_TX_TYPE_MINT && tx->fee != 0) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (tx->type == MESHPAY_TX_TYPE_CLAIM) {
+        /* CLAIM réflexive : from == to == membre, pas de frais. */
+        if (tx->fee != 0 ||
+            memcmp(tx->from, tx->to, sizeof(tx->from)) != 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        /* seq == 0 est RÉSERVÉ à la CLAIM : c'est le pivot de l'unicité
+         * (from, seq==0) dans le DAG. Un seq != 0 permettrait un double crédit
+         * (deux CLAIM non conflictuelles) — refus catégorique, y compris au
+         * décodage d'un paquet reçu. */
+        if (tx->seq != 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
     }
     if (require_signature &&
         (hash_is_zero(tx->id, sizeof(tx->id)) ||
@@ -353,6 +368,37 @@ esp_err_t meshpay_tx_create_mint(meshpay_tx_t *tx,
     return meshpay_tx_sign(tx, signer);
 }
 
+esp_err_t meshpay_tx_create_claim(meshpay_tx_t *tx,
+                                  const rns_identity_t *signer,
+                                  const uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE],
+                                  uint32_t amount,
+                                  uint32_t currency_id,
+                                  const uint8_t parents[][MESHPAY_TX_PARENT_ID_SIZE],
+                                  uint8_t parent_count,
+                                  uint64_t timestamp_ms)
+{
+    if (tx == NULL || signer == NULL || member == NULL ||
+        (parent_count > 0 && parents == NULL)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    meshpay_tx_clear(tx);
+    tx->type = MESHPAY_TX_TYPE_CLAIM;
+    /* Réflexivité imposée : from == to == membre. */
+    memcpy(tx->from, member, sizeof(tx->from));
+    memcpy(tx->to, member, sizeof(tx->to));
+    tx->amount = amount;
+    tx->seq = 0; /* réservé : pivot de l'unicité (from, 0) */
+    tx->fee = 0; /* aucun frais sur un crédit */
+    tx->currency_id = currency_id;
+    tx->timestamp_ms = timestamp_ms;
+    tx->parent_count = parent_count;
+    for (uint8_t i = 0; i < parent_count && i < MESHPAY_TX_MAX_PARENTS; ++i) {
+        memcpy(tx->parents[i], parents[i], MESHPAY_TX_PARENT_ID_SIZE);
+    }
+    ESP_RETURN_ON_ERROR(validate_common(tx, false), TAG, "");
+    return meshpay_tx_sign(tx, signer);
+}
+
 static esp_err_t reader_get(cbor_reader_t *reader, uint8_t *out)
 {
     if (reader == NULL || out == NULL || reader->pos >= reader->len) {
@@ -471,7 +517,8 @@ esp_err_t meshpay_tx_decode(const uint8_t *data,
         switch (key) {
         case CBOR_KEY_TYPE:
             ESP_RETURN_ON_ERROR(cbor_read_uint(&reader, &value), TAG, "");
-            if (value != MESHPAY_TX_TYPE_TRANSFER && value != MESHPAY_TX_TYPE_MINT) {
+            if (value != MESHPAY_TX_TYPE_TRANSFER && value != MESHPAY_TX_TYPE_MINT &&
+                value != MESHPAY_TX_TYPE_CLAIM) {
                 return ESP_ERR_INVALID_ARG;
             }
             tx->type = (meshpay_tx_type_t)value;

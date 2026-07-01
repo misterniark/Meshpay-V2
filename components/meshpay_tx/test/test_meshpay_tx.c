@@ -36,6 +36,16 @@ static void fill_transfer_inputs(uint8_t from[MESHPAY_TX_DESTINATION_HASH_SIZE],
     fill_sequence(parents[1], MESHPAY_TX_PARENT_ID_SIZE, 0xa0);
 }
 
+/* Prépare l'unique hash de membre (la CLAIM est réflexive : from == to == membre)
+ * et un jeu de parents (tips du DAG). */
+static void fill_claim_inputs(uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE],
+                              uint8_t parents[MESHPAY_TX_MAX_PARENTS][MESHPAY_TX_PARENT_ID_SIZE])
+{
+    fill_sequence(member, MESHPAY_TX_DESTINATION_HASH_SIZE, 0x30);
+    fill_sequence(parents[0], MESHPAY_TX_PARENT_ID_SIZE, 0x80);
+    fill_sequence(parents[1], MESHPAY_TX_PARENT_ID_SIZE, 0xb0);
+}
+
 TEST_CASE("meshpay tx encodes decodes and verifies signed transfer", "[meshpay_tx]")
 {
     rns_identity_t signer;
@@ -161,4 +171,148 @@ TEST_CASE("meshpay tx rejects degenerate transfer fee", "[meshpay_tx]")
                                                  from, to,
                                                  50, 1, 50, 1,
                                                  parents, 1, 1));
+}
+
+/* --- Palier C1 : type CLAIM (crédit initial réflexif) --- */
+
+/* Nominal : le constructeur impose from==to==membre, fee==0, seq==0 (réservé),
+ * signe avec l'identité du membre, et la TX se re-vérifie. */
+TEST_CASE("meshpay tx creates signs and verifies claim", "[meshpay_tx][c1]")
+{
+    rns_identity_t signer;
+    rns_identity_t signer_public;
+    load_identity(&signer, 0x81);
+    load_public_identity(&signer, &signer_public);
+
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t parents[MESHPAY_TX_MAX_PARENTS][MESHPAY_TX_PARENT_ID_SIZE];
+    fill_claim_inputs(member, parents);
+
+    meshpay_tx_t tx;
+    /* amount = crédit initial ; 1 tip parent ; currency_id ; timestamp. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_create_claim(&tx, &signer,
+                                                      member,
+                                                      1000,
+                                                      0x4d505632,
+                                                      parents, 1,
+                                                      1716200000999ULL));
+    TEST_ASSERT_EQUAL(MESHPAY_TX_TYPE_CLAIM, tx.type);
+    TEST_ASSERT_EQUAL_UINT32(1000, tx.amount);
+    TEST_ASSERT_EQUAL_UINT32(0, tx.seq);   /* seq réservé */
+    TEST_ASSERT_EQUAL_UINT32(0, tx.fee);   /* pas de frais sur un crédit */
+    TEST_ASSERT_EQUAL_UINT8(1, tx.parent_count);
+    /* Réflexivité : from == to == membre. */
+    TEST_ASSERT_EQUAL_MEMORY(member, tx.from, sizeof(tx.from));
+    TEST_ASSERT_EQUAL_MEMORY(tx.from, tx.to, sizeof(tx.from));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_verify(&tx, &signer_public));
+}
+
+/* from != to doit être rejeté : validate_common tourne avant la vérif de signature,
+ * donc l'altération est attrapée en INVALID_ARG. */
+TEST_CASE("meshpay tx rejects claim whose from differs from to", "[meshpay_tx][c1]")
+{
+    rns_identity_t signer;
+    rns_identity_t signer_public;
+    load_identity(&signer, 0x83);
+    load_public_identity(&signer, &signer_public);
+
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t parents[MESHPAY_TX_MAX_PARENTS][MESHPAY_TX_PARENT_ID_SIZE];
+    fill_claim_inputs(member, parents);
+
+    meshpay_tx_t tx;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_create_claim(&tx, &signer, member,
+                                                      1000, 7, parents, 1, 5));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_verify(&tx, &signer_public));
+
+    tx.to[0] ^= 0x55; /* rompt la réflexivité */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_tx_verify(&tx, &signer_public));
+}
+
+/* fee != 0 sur une CLAIM doit être rejeté (comme un MINT). */
+TEST_CASE("meshpay tx rejects claim with non zero fee", "[meshpay_tx][c1]")
+{
+    rns_identity_t signer;
+    rns_identity_t signer_public;
+    load_identity(&signer, 0x85);
+    load_public_identity(&signer, &signer_public);
+
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t parents[MESHPAY_TX_MAX_PARENTS][MESHPAY_TX_PARENT_ID_SIZE];
+    fill_claim_inputs(member, parents);
+
+    meshpay_tx_t tx;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_create_claim(&tx, &signer, member,
+                                                      1000, 7, parents, 1, 5));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_verify(&tx, &signer_public));
+
+    tx.fee = 1;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_tx_verify(&tx, &signer_public));
+}
+
+/* seq == 0 est RÉSERVÉ : l'unicité (from, seq==0) casserait si un membre pouvait
+ * forger une CLAIM à seq != 0 (double crédit). validate_common doit donc rejeter. */
+TEST_CASE("meshpay tx rejects claim with reserved seq altered", "[meshpay_tx][c1]")
+{
+    rns_identity_t signer;
+    rns_identity_t signer_public;
+    load_identity(&signer, 0x87);
+    load_public_identity(&signer, &signer_public);
+
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t parents[MESHPAY_TX_MAX_PARENTS][MESHPAY_TX_PARENT_ID_SIZE];
+    fill_claim_inputs(member, parents);
+
+    meshpay_tx_t tx;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_create_claim(&tx, &signer, member,
+                                                      1000, 7, parents, 1, 5));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_verify(&tx, &signer_public));
+
+    tx.seq = 1;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_tx_verify(&tx, &signer_public));
+}
+
+/* Round-trip wire, cas genesis local (0 parent) : encode borné, decode fidèle,
+ * signature re-vérifiée. */
+TEST_CASE("meshpay tx encodes and decodes claim round trip", "[meshpay_tx][c1]")
+{
+    rns_identity_t signer;
+    rns_identity_t signer_public;
+    load_identity(&signer, 0x89);
+    load_public_identity(&signer, &signer_public);
+
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t parents[MESHPAY_TX_MAX_PARENTS][MESHPAY_TX_PARENT_ID_SIZE];
+    fill_claim_inputs(member, parents);
+
+    meshpay_tx_t tx;
+    /* 0 parent : la CLAIM est le genesis local d'un membre frais. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_create_claim(&tx, &signer, member,
+                                                      2500, 0x4d505632,
+                                                      NULL, 0, 42));
+    TEST_ASSERT_EQUAL_UINT8(0, tx.parent_count);
+
+    uint8_t wire[MESHPAY_TX_CBOR_MAX_SIZE];
+    size_t wire_len = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_encode(&tx, wire, sizeof(wire),
+                                                &wire_len));
+    TEST_ASSERT_TRUE(wire_len < MESHPAY_TX_CBOR_MAX_SIZE);
+
+    meshpay_tx_t decoded;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_decode(wire, wire_len, &decoded));
+    TEST_ASSERT_EQUAL(MESHPAY_TX_TYPE_CLAIM, decoded.type);
+    TEST_ASSERT_EQUAL_UINT32(tx.amount, decoded.amount);
+    TEST_ASSERT_EQUAL_UINT32(0, decoded.seq);
+    TEST_ASSERT_EQUAL_UINT32(0, decoded.fee);
+    TEST_ASSERT_EQUAL_UINT32(tx.currency_id, decoded.currency_id);
+    TEST_ASSERT_EQUAL_UINT8(0, decoded.parent_count);
+    TEST_ASSERT_EQUAL_MEMORY(tx.from, decoded.from, sizeof(tx.from));
+    TEST_ASSERT_EQUAL_MEMORY(decoded.from, decoded.to, sizeof(decoded.from));
+    TEST_ASSERT_EQUAL_MEMORY(tx.id, decoded.id, sizeof(tx.id));
+    TEST_ASSERT_EQUAL_MEMORY(tx.signature, decoded.signature,
+                             sizeof(tx.signature));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_verify(&decoded, &signer_public));
 }
