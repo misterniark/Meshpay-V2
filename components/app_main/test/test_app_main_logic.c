@@ -1,8 +1,12 @@
 #include "meshpay/app_main_logic.h"
+#include "meshpay/currency_descriptor.h"
+#include "meshpay/descriptor_sync.h"
 #include "meshpay/rns/rns_announce.h"
 #include "meshpay/rns/rns_crypto.h"
+#include "meshpay/rns/rns_identity.h"
 #include "meshpay/rns/rns_node.h"
 #include "meshpay/rns/rns_packet_crypto.h"
+#include "meshpay/wallet.h"
 #include "test_pool.h"
 #include "unity.h"
 #include <stdlib.h>
@@ -1629,4 +1633,538 @@ TEST_CASE("app currency_from_record rejects NULL", "[app_main][a5]")
         meshpay_app_currency_from_record(&record, NULL, &cfg, NULL));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
         meshpay_app_currency_from_record(&record, &cfg, NULL, NULL));
+}
+
+/* ======================================================================== */
+/* Palier B4 — machine à états de rejointe de monnaie                        */
+/* ======================================================================== */
+
+/* Signe un descripteur « Minimistan » par le fondateur de graine donnée. */
+static void sign_min_descriptor(rns_identity_t *founder, uint8_t founder_seed,
+                                meshpay_currency_descriptor_signed_t *out)
+{
+    load_identity(founder, founder_seed);
+    meshpay_currency_descriptor_t body;
+    meshpay_currency_descriptor_init(&body);
+    strncpy(body.name, "Minimistan", sizeof(body.name) - 1);
+    strncpy(body.symbol, "MIN", sizeof(body.symbol) - 1);
+    body.max_supply = 12345;
+    body.transfer_fee = 2;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_sign(out, &body, founder));
+}
+
+/* Construit un paquet OFFER (PLAIN broadcast) portant le descripteur. */
+static void build_join_offer(const meshpay_currency_descriptor_signed_t *signed_desc,
+                             rns_packet_t *offer)
+{
+    uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(source, sizeof(source), 0xF0); /* provenance (fondateur) */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_descriptor_sync_build_offer(signed_desc, source, offer));
+}
+
+/* Injecte un paquet radio dans la file RETICULUM puis le traite (chemin réel). */
+static void inject_reticulum_packet(meshpay_app_runtime_t *runtime,
+                                    const rns_packet_t *packet, uint64_t now_ms)
+{
+    meshpay_app_event_t ev = {
+        .type = MESHPAY_APP_EVENT_RETICULUM_RX,
+        .now_ms = now_ms,
+    };
+    ev.packet = *packet;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_post(
+                                  runtime, MESHPAY_APP_QUEUE_RETICULUM, &ev, 0));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
+                                  runtime, MESHPAY_APP_QUEUE_RETICULUM, 0));
+}
+
+/*
+ * Monte un runtime « membre » vierge (config repli id=1, sans descripteur) avec
+ * un backend storage mock. `mock` appartient à l'appelant (le backend copié dans
+ * le runtime pointe dessus). identité et record sont locaux (copiés à l'init).
+ */
+static void member_runtime_init(meshpay_app_runtime_t *runtime,
+                                meshpay_app_t *app,
+                                meshpay_storage_mock_t *mock)
+{
+    uint8_t me[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(me, sizeof(me), 0x50);
+    rns_identity_t self;
+    load_identity(&self, 0x50);
+    meshpay_currency_config_t config;
+    meshpay_currency_config_init(&config, 1); /* repli : pas de descripteur */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app, me, &self, &config, 1, true));
+
+    meshpay_storage_mock_init(mock);
+    meshpay_storage_backend_t backend = meshpay_storage_mock_backend(mock);
+    meshpay_storage_record_t record;
+    meshpay_storage_record_init(&record);
+    uint8_t priv[RNS_IDENTITY_PRIVATE_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_get_private_key(&self, priv));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_storage_record_set_identity(&record, priv));
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(runtime, app, NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_storage(runtime, &backend,
+                                                              &record));
+}
+
+/* Fait rejoindre le runtime à une monnaie (arme l'ancre + importe l'OFFER). */
+static void join_a_currency(meshpay_app_runtime_t *runtime, meshpay_app_t *app,
+                            meshpay_storage_mock_t *mock, rns_identity_t *founder,
+                            meshpay_currency_descriptor_signed_t *signed_out)
+{
+    member_runtime_init(runtime, app, mock);
+    sign_min_descriptor(founder, 0x30, signed_out);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_arm_join_anchor(
+                                  runtime, signed_out->genesis_hash,
+                                  MESHPAY_CURRENCY_INVITE_ANCHOR_LEN, 1000));
+    rns_packet_t offer;
+    build_join_offer(signed_out, &offer);
+    inject_reticulum_packet(runtime, &offer, 1000);
+    TEST_ASSERT_TRUE(app->currency.has_descriptor); /* pré-condition membre */
+}
+
+TEST_CASE("join nominal via invite code imports descriptor", "[app_main][b4]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock);
+
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_min_descriptor(&founder, 0x30, &signed_desc);
+
+    /* Le fondateur affiche un CODE d'invitation ; le membre le saisit -> arme. */
+    char code[MESHPAY_CURRENCY_INVITE_CODE_BUF];
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_invite_encode(&signed_desc, code, sizeof(code)));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_arm_join(&runtime, code, 1000));
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_ARMED,
+                      meshpay_app_runtime_join_state(&runtime));
+
+    uint32_t writes_before = mock.write_count;
+    rns_packet_t offer;
+    build_join_offer(&signed_desc, &offer);
+    inject_reticulum_packet(&runtime, &offer, 1500);
+
+    /* Devenu membre : config dérivée du descripteur, autorité MINT = fondateur. */
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_MEMBER,
+                      meshpay_app_runtime_join_state(&runtime));
+    TEST_ASSERT_TRUE(app->currency.has_descriptor);
+    TEST_ASSERT_EQUAL_UINT32(signed_desc.currency_id, app->currency.currency_id);
+    uint8_t founder_hash[RNS_IDENTITY_HASH_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_get_hash(&founder, founder_hash));
+    TEST_ASSERT_EQUAL_UINT8(1, app->currency.mint_authority_count);
+    TEST_ASSERT_TRUE(meshpay_currency_is_mint_authority(&app->currency, founder_hash));
+    TEST_ASSERT_FALSE(runtime.join_armed);
+    /* Persisté sur le record DU RUNTIME (celui que persist_wallet_state réécrit). */
+    TEST_ASSERT_TRUE(runtime.storage_record.has_currency_descriptor);
+    TEST_ASSERT_TRUE(mock.write_count > writes_before);
+    /* Et durablement écrit : rechargé depuis le backend, le blob doit se
+     * RE-DÉCODER en la MÊME config (survie au reboot vérifiée de bout en bout,
+     * pas seulement le drapeau). Un slice/offset erroné donnerait un blob
+     * corrompu -> repli silencieux au boot ; ce contrôle l'attraperait. */
+    meshpay_storage_backend_t backend = meshpay_storage_mock_backend(&mock);
+    meshpay_storage_record_t loaded;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_storage_load(&backend, &loaded));
+    TEST_ASSERT_TRUE(loaded.has_currency_descriptor);
+    meshpay_currency_config_t fallback_cfg;
+    meshpay_currency_config_init(&fallback_cfg, 1);
+    meshpay_currency_config_t reloaded_cfg;
+    bool reloaded_from_desc = false;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_currency_from_record(
+                                  &loaded, &fallback_cfg, &reloaded_cfg,
+                                  &reloaded_from_desc));
+    TEST_ASSERT_TRUE(reloaded_from_desc);
+    TEST_ASSERT_EQUAL_UINT32(signed_desc.currency_id, reloaded_cfg.currency_id);
+    TEST_ASSERT_EQUAL_UINT64(12345, reloaded_cfg.max_supply);
+    TEST_ASSERT_TRUE(meshpay_currency_is_mint_authority(&reloaded_cfg, founder_hash));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+TEST_CASE("join offer with non-matching anchor rejected", "[app_main][b4]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock);
+
+    /* Armé sur la monnaie A, on reçoit un OFFER de la monnaie B (autre fondateur
+     * -> autre genèse -> autre ancre). */
+    rns_identity_t founder_a, founder_b;
+    meshpay_currency_descriptor_signed_t desc_a, desc_b;
+    sign_min_descriptor(&founder_a, 0x30, &desc_a);
+    sign_min_descriptor(&founder_b, 0x31, &desc_b);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_arm_join_anchor(
+                                  &runtime, desc_a.genesis_hash,
+                                  MESHPAY_CURRENCY_INVITE_ANCHOR_LEN, 1000));
+
+    uint32_t writes_before = mock.write_count;
+    rns_packet_t offer_b;
+    build_join_offer(&desc_b, &offer_b);
+    inject_reticulum_packet(&runtime, &offer_b, 1000);
+
+    /* Rejeté sans mutation ni persistance ; reste armé. */
+    TEST_ASSERT_FALSE(app->currency.has_descriptor);
+    TEST_ASSERT_EQUAL_UINT32(writes_before, mock.write_count);
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_ARMED,
+                      meshpay_app_runtime_join_state(&runtime));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+TEST_CASE("join offer with bad signature rejected", "[app_main][b4]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock);
+
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_min_descriptor(&founder, 0x30, &signed_desc);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_arm_join_anchor(
+                                  &runtime, signed_desc.genesis_hash,
+                                  MESHPAY_CURRENCY_INVITE_ANCHOR_LEN, 1000));
+
+    /* Corrompre la SIGNATURE (pas le corps) : l'ancre matche toujours (genèse
+     * inchangée), mais verify doit échouer -> prouve que matches_anchor seul ne
+     * suffit pas. */
+    signed_desc.founder_signature[0] ^= 0x55;
+    uint32_t writes_before = mock.write_count;
+    rns_packet_t offer;
+    build_join_offer(&signed_desc, &offer);
+    inject_reticulum_packet(&runtime, &offer, 1000);
+
+    TEST_ASSERT_FALSE(app->currency.has_descriptor);
+    TEST_ASSERT_EQUAL_UINT32(writes_before, mock.write_count);
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_ARMED,
+                      meshpay_app_runtime_join_state(&runtime));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+TEST_CASE("join idempotent when already member", "[app_main][b4]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    join_a_currency(&runtime, app, &mock, &founder, &signed_desc);
+
+    /* Déjà membre : un nouvel OFFER (même monnaie) est ignoré, aucun re-save. */
+    uint32_t writes_after_join = mock.write_count;
+    rns_packet_t offer;
+    build_join_offer(&signed_desc, &offer);
+    inject_reticulum_packet(&runtime, &offer, 2000);
+
+    TEST_ASSERT_EQUAL_UINT32(writes_after_join, mock.write_count);
+    TEST_ASSERT_TRUE(app->currency.has_descriptor);
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_MEMBER,
+                      meshpay_app_runtime_join_state(&runtime));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+TEST_CASE("arm join rejected when already member", "[app_main][b4]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    join_a_currency(&runtime, app, &mock, &founder, &signed_desc);
+
+    /* Mono-monnaie strict : on ne ré-arme pas alors qu'on est déjà membre. */
+    uint8_t other_anchor[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN];
+    fill_sequence(other_anchor, sizeof(other_anchor), 0x99);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_app_runtime_arm_join_anchor(
+                          &runtime, other_anchor, sizeof(other_anchor), 3000));
+    TEST_ASSERT_FALSE(runtime.join_armed);
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_MEMBER,
+                      meshpay_app_runtime_join_state(&runtime));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+TEST_CASE("join does not pollute mint authority after import", "[app_main][b4]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    join_a_currency(&runtime, app, &mock, &founder, &signed_desc);
+
+    /* Autorité unique (fondateur) après import. */
+    TEST_ASSERT_EQUAL_UINT8(1, app->currency.mint_authority_count);
+
+    /* Un announce de pair arrive : sous config à descripteur, le pair NE DOIT
+     * PAS être ajouté comme autorité MINT (durcissement single-authority). */
+    rns_identity_t peer;
+    load_identity(&peer, 0x88);
+    rns_packet_t announce;
+    build_wallet_announce_packet(&peer, 0x88, &announce);
+    inject_reticulum_packet(&runtime, &announce, 4000);
+
+    TEST_ASSERT_EQUAL_UINT8(1, app->currency.mint_authority_count);
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+TEST_CASE("join offer ignored when not armed", "[app_main][b4]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock);
+
+    /* Pas d'ancre armée : un OFFER valide ne doit rien importer. */
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_min_descriptor(&founder, 0x30, &signed_desc);
+    uint32_t writes_before = mock.write_count;
+    rns_packet_t offer;
+    build_join_offer(&signed_desc, &offer);
+    inject_reticulum_packet(&runtime, &offer, 1000);
+
+    TEST_ASSERT_FALSE(app->currency.has_descriptor);
+    TEST_ASSERT_EQUAL_UINT32(writes_before, mock.write_count);
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_IDLE,
+                      meshpay_app_runtime_join_state(&runtime));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+TEST_CASE("emit join request broadcasts request for armed currency", "[app_main][b4]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock);
+
+    packet_tx_probe_t probe = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
+                                  &runtime, packet_tx_probe_cb, &probe));
+
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_min_descriptor(&founder, 0x30, &signed_desc);
+
+    /* Non armé -> refus. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_app_runtime_emit_join_request(&runtime, 1000));
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_arm_join_anchor(
+                                  &runtime, signed_desc.genesis_hash,
+                                  MESHPAY_CURRENCY_INVITE_ANCHOR_LEN, 1000));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_emit_join_request(&runtime, 1500));
+
+    /* Une REQUEST 0x33 a été émise, avec le currency_id dérivé de l'ancre. */
+    TEST_ASSERT_EQUAL_HEX8(MESHPAY_DESCRIPTOR_SYNC_MSG_REQUEST,
+                           probe.last_packet.data[0]);
+    uint32_t cid = 0;
+    uint8_t src[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_descriptor_sync_parse_request(
+                                  &probe.last_packet, &cid, src));
+    TEST_ASSERT_EQUAL_UINT32(signed_desc.currency_id, cid);
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+TEST_CASE("arm join rejects invalid invite code", "[app_main][b4]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock);
+
+    /* Code mal formé (longueur/alphabet/checksum) -> pas d'armement. */
+    TEST_ASSERT_NOT_EQUAL(ESP_OK,
+                          meshpay_app_runtime_arm_join(&runtime, "PAS-UN-CODE", 1000));
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_IDLE,
+                      meshpay_app_runtime_join_state(&runtime));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+TEST_CASE("join import rolls back and stays armed when save fails", "[app_main][b4]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock);
+
+    /* Substitue l'écriture par une qui ÉCHOUE toujours : l'import doit rollback
+     * le record ET ne pas appliquer la config (atomicité). */
+    runtime.storage_backend.write_blob = failing_storage_write;
+
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_min_descriptor(&founder, 0x30, &signed_desc);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_arm_join_anchor(
+                                  &runtime, signed_desc.genesis_hash,
+                                  MESHPAY_CURRENCY_INVITE_ANCHOR_LEN, 1000));
+
+    rns_packet_t offer;
+    build_join_offer(&signed_desc, &offer);
+    inject_reticulum_packet(&runtime, &offer, 1000);
+
+    /* Save KO -> pas membre, record revenu à l'état antérieur, toujours armé. */
+    TEST_ASSERT_FALSE(app->currency.has_descriptor);
+    TEST_ASSERT_FALSE(runtime.storage_record.has_currency_descriptor);
+    TEST_ASSERT_EQUAL_size_t(0, runtime.storage_record.currency_descriptor_len);
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_ARMED,
+                      meshpay_app_runtime_join_state(&runtime));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+TEST_CASE("join offer refused without a storage backend", "[app_main][b4]")
+{
+    uint8_t me[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(me, sizeof(me), 0x50);
+    rns_identity_t self;
+    load_identity(&self, 0x50);
+    meshpay_currency_config_t config;
+    meshpay_currency_config_init(&config, 1);
+
+    meshpay_app_t *app = test_pool_app(0);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app, me, &self, &config, 1, true));
+
+    /* Runtime SANS set_storage -> has_storage=false : une rejointe ne pourrait
+     * pas survivre au reboot, l'import doit donc refuser. */
+    meshpay_app_runtime_t runtime;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, app, NULL));
+
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_min_descriptor(&founder, 0x30, &signed_desc);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_arm_join_anchor(
+                                  &runtime, signed_desc.genesis_hash,
+                                  MESHPAY_CURRENCY_INVITE_ANCHOR_LEN, 1000));
+
+    rns_packet_t offer;
+    build_join_offer(&signed_desc, &offer);
+    inject_reticulum_packet(&runtime, &offer, 1000);
+
+    TEST_ASSERT_FALSE(app->currency.has_descriptor);
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_ARMED,
+                      meshpay_app_runtime_join_state(&runtime));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+TEST_CASE("emit join request rejected when no packet_tx is set", "[app_main][b4]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock); /* n'attache PAS de packet_tx */
+
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_min_descriptor(&founder, 0x30, &signed_desc);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_arm_join_anchor(
+                                  &runtime, signed_desc.genesis_hash,
+                                  MESHPAY_CURRENCY_INVITE_ANCHOR_LEN, 1000));
+
+    /* Armé mais aucun émetteur radio câblé -> refus explicite. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_app_runtime_emit_join_request(&runtime, 1000));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+TEST_CASE("open mesh adds announced peer as mint authority without descriptor", "[app_main][b4]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock); /* config repli id=1, 0 autorité */
+
+    TEST_ASSERT_FALSE(app->currency.has_descriptor);
+    TEST_ASSERT_EQUAL_UINT8(0, app->currency.mint_authority_count);
+
+    /* Sans descripteur (maillage ouvert), un pair annoncé DEVIENT autorité MINT
+     * — c'est l'ancien comportement, préservé par le gate !has_descriptor. */
+    rns_identity_t peer;
+    load_identity(&peer, 0x88);
+    rns_packet_t announce;
+    build_wallet_announce_packet(&peer, 0x88, &announce);
+    inject_reticulum_packet(&runtime, &announce, 1000);
+
+    TEST_ASSERT_EQUAL_UINT8(1, app->currency.mint_authority_count);
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+TEST_CASE("join recomputes balance under the joined currency", "[app_main][b4]")
+{
+    uint8_t me[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t master[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(me, sizeof(me), 0x50);
+    fill_sequence(master, sizeof(master), 0x20);
+    rns_identity_t self;
+    load_identity(&self, 0x50);
+
+    /* Config de repli id=1 AVEC une autorité, pour créditer un solde initial. */
+    meshpay_currency_config_t config;
+    meshpay_currency_config_init(&config, 1);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_add_mint_authority(&config, master));
+
+    meshpay_app_t *app = test_pool_app(0);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app, me, &self, &config, 1, true));
+    /* MINT vers le membre sous l'ANCIEN currency_id=1 -> solde non nul. */
+    meshpay_tx_t mint;
+    make_mint(&mint, master, me, 500, 1);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app, &mint));
+
+    uint32_t balance = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_wallet_get_available_balance(
+                                  &app->wallet, &app->currency, &app->dag, 1000,
+                                  &balance));
+    TEST_ASSERT_TRUE(balance > 0); /* solde sous id=1 avant rejointe */
+
+    meshpay_storage_mock_t mock;
+    meshpay_storage_mock_init(&mock);
+    meshpay_storage_backend_t backend = meshpay_storage_mock_backend(&mock);
+    meshpay_storage_record_t record;
+    meshpay_storage_record_init(&record);
+    uint8_t priv[RNS_IDENTITY_PRIVATE_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_get_private_key(&self, priv));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_storage_record_set_identity(&record, priv));
+    meshpay_app_runtime_t runtime;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, app, NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_storage(&runtime, &backend,
+                                                              &record));
+
+    /* Rejoint une monnaie au currency_id DIFFÉRENT (via le descripteur). */
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_min_descriptor(&founder, 0x30, &signed_desc);
+    TEST_ASSERT_NOT_EQUAL(1u, signed_desc.currency_id);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_arm_join_anchor(
+                                  &runtime, signed_desc.genesis_hash,
+                                  MESHPAY_CURRENCY_INVITE_ANCHOR_LEN, 1000));
+    rns_packet_t offer;
+    build_join_offer(&signed_desc, &offer);
+    inject_reticulum_packet(&runtime, &offer, 2000);
+    TEST_ASSERT_TRUE(app->currency.has_descriptor);
+
+    /* Les TX de l'ancienne monnaie sont filtrées par currency_id : solde = 0,
+     * et refresh_balance (appelé à l'import) a bien poussé 0 dans l'UI. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_wallet_get_available_balance(
+                                  &app->wallet, &app->currency, &app->dag, 2000,
+                                  &balance));
+    TEST_ASSERT_EQUAL_UINT32(0, balance);
+    TEST_ASSERT_EQUAL_UINT32(0, app->ui.balance);
+
+    meshpay_app_runtime_destroy(&runtime);
 }

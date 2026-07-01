@@ -27,6 +27,7 @@ Le projet reste toutefois en phase de durcissement préproduction. Le prochain t
 - ESP-NOW : ajouter métriques, retry/backoff plus propres, gestion overflow queue, perte ACK et bruit radio.
 - LoRa : mener une vraie campagne hardware. Le chemin production validé aujourd'hui est surtout Waveshare + ESP-NOW.
 - Interop Reticulum : tester contre un noeud Reticulum Python réel sur announce, data chiffrée et resource.
+- Rejointe monnaie (Palier B) : pendant qu'un device est « armé » (ancre posée), chaque OFFER `0x34` PLAIN broadcast déclenche un décodage CBOR + genèse (SHA-256) et, si l'ancre matche, une vérification Ed25519. Un pair à portée connaissant l'ancre (code d'invitation public) mais forgeant la signature peut donc flooder des OFFER non-matchants et forcer des vérifs asymétriques + un log par paquet. Impact borné (fenêtre courte, import réussi la referme, `matches_anchor` filtre avant l'Ed25519), mais à durcir au banc si observé : throttle (n OFFER traités / fenêtre) et/ou compteur de rejets. `matches_anchor` reste évalué AVANT `verify` (bon ordre : filtre bon marché avant la vérif coûteuse).
 
 ## Produit
 

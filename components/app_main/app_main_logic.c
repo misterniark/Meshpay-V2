@@ -3,6 +3,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "meshpay/currency_descriptor.h"
+#include "meshpay/descriptor_sync.h"
 #include "meshpay/rns/rns_announce.h"
 #include "meshpay/rns/rns_crypto.h"
 #include <stdio.h>
@@ -206,9 +207,16 @@ static void runtime_refresh_known_peers(meshpay_app_runtime_t *runtime)
             !rns_destination_hash_equal(known->destination_hash,
                                         runtime->app->local_destination)) {
             peers++;
-            (void)meshpay_currency_add_mint_authority(
-                &runtime->app->currency,
-                known->destination_hash);
+            /* Sous une config à DESCRIPTEUR, l'autorité MINT est figée (fondateur
+             * unique) : ne JAMAIS ajouter un pair annoncé comme autorité, sinon
+             * le durcissement single-authority serait annulé au 1er announce
+             * (Palier B4). Sans descripteur (config de repli), on garde l'ancien
+             * comportement « maillage ouvert ». */
+            if (!runtime->app->currency.has_descriptor) {
+                (void)meshpay_currency_add_mint_authority(
+                    &runtime->app->currency,
+                    known->destination_hash);
+            }
         }
     }
     runtime->app->ui.network_peers =
@@ -623,6 +631,102 @@ esp_err_t meshpay_app_runtime_set_dag_store(
     runtime->dag_dirty = false;
     runtime->dag_saved_ms = 0;
     return ESP_OK;
+}
+
+/* ======================================================================== */
+/* Palier B4 — API publique de rejointe de monnaie                          */
+/* ======================================================================== */
+
+esp_err_t meshpay_app_runtime_arm_join_anchor(meshpay_app_runtime_t *runtime,
+                                              const uint8_t *anchor,
+                                              size_t anchor_len,
+                                              uint64_t now_ms)
+{
+    /* L'ancre EST par définition celle du code d'invitation : exactement
+     * ANCHOR_LEN octets. Refuser toute longueur partielle ferme d'emblée la
+     * dérivation du currency_id sur des octets non fournis et empêche un préfixe
+     * de correspondance trop court (matches_anchor). */
+    if (runtime == NULL || runtime->app == NULL || runtime->lock == NULL ||
+        anchor == NULL || anchor_len != MESHPAY_CURRENCY_INVITE_ANCHOR_LEN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(runtime->lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = ESP_OK;
+    /* Mono-monnaie STRICT : refuser d'armer une rejointe si déjà membre. */
+    if (runtime->app->currency.has_descriptor) {
+        err = ESP_ERR_INVALID_STATE;
+    } else {
+        memcpy(runtime->pending_anchor, anchor, anchor_len);
+        runtime->pending_anchor_len = anchor_len;
+        runtime->join_armed = true;
+        runtime->join_armed_until_ms = now_ms; /* fenêtre : désarmement différé */
+    }
+    xSemaphoreGive(runtime->lock);
+    return err;
+}
+
+esp_err_t meshpay_app_runtime_arm_join(meshpay_app_runtime_t *runtime,
+                                       const char *invite_code,
+                                       uint64_t now_ms)
+{
+    if (runtime == NULL || invite_code == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Décode le code hors verrou (logique pure), puis arme sous verrou. */
+    uint8_t anchor[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN];
+    size_t anchor_len = 0;
+    ESP_RETURN_ON_ERROR(meshpay_currency_invite_decode(invite_code, anchor,
+                                                       sizeof(anchor), &anchor_len),
+                        "app_runtime", "");
+    return meshpay_app_runtime_arm_join_anchor(runtime, anchor, anchor_len, now_ms);
+}
+
+esp_err_t meshpay_app_runtime_emit_join_request(meshpay_app_runtime_t *runtime,
+                                                uint64_t now_ms)
+{
+    (void)now_ms; /* réservé pour un futur backoff de retries */
+    if (runtime == NULL || runtime->app == NULL || runtime->lock == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(runtime->lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = ESP_OK;
+    if (!runtime->join_armed || runtime->app->currency.has_descriptor ||
+        runtime->packet_tx == NULL) {
+        /* Rien à demander : pas armé, déjà membre, ou pas d'émetteur. */
+        err = ESP_ERR_INVALID_STATE;
+    } else {
+        /* currency_id = 4 octets de tête de l'ancre (= genèse[0..3]). */
+        uint32_t currency_id =
+            ((uint32_t)runtime->pending_anchor[0] << 24) |
+            ((uint32_t)runtime->pending_anchor[1] << 16) |
+            ((uint32_t)runtime->pending_anchor[2] << 8) |
+            ((uint32_t)runtime->pending_anchor[3]);
+        rns_packet_t request;
+        err = meshpay_descriptor_sync_build_request(
+            currency_id, runtime->app->local_destination, &request);
+        if (err == ESP_OK) {
+            err = runtime->packet_tx(&request, runtime->packet_tx_ctx);
+        }
+    }
+    xSemaphoreGive(runtime->lock);
+    return err;
+}
+
+meshpay_app_join_state_t meshpay_app_runtime_join_state(
+    const meshpay_app_runtime_t *runtime)
+{
+    if (runtime == NULL || runtime->app == NULL) {
+        return MESHPAY_APP_JOIN_IDLE;
+    }
+    /* Vérité durable d'abord : membre si la config vient d'un descripteur. */
+    if (runtime->app->currency.has_descriptor) {
+        return MESHPAY_APP_JOIN_MEMBER;
+    }
+    return runtime->join_armed ? MESHPAY_APP_JOIN_ARMED : MESHPAY_APP_JOIN_IDLE;
 }
 
 esp_err_t meshpay_app_runtime_post(meshpay_app_runtime_t *runtime,
@@ -1086,12 +1190,133 @@ static bool runtime_packet_has_reject_status(const rns_packet_t *packet)
            packet->data[0] == MESHPAY_PAYMENT_MSG_REJECT;
 }
 
-static bool runtime_packet_is_plain_dag_sync(const rns_packet_t *packet)
+/* Filtre de FORME : vrai pour tout paquet DATA diffusé en clair (broadcast). Le
+ * TYPE de message est porté par data[0] et discriminé par l'appelant. NB : seuls
+ * 0x31/0x32 (dag_sync) et 0x34 (OFFER de rejointe) sont effectivement dispatchés
+ * ici ; répondre à un 0x33 (REQUEST de rejointe reçu) relève du rôle FONDATEUR,
+ * câblé dans main/ (hors B4) — un 0x33 entrant est ignoré à ce stade. */
+static bool runtime_packet_is_plain_broadcast(const rns_packet_t *packet)
 {
     return packet != NULL &&
            packet->packet_type == RNS_PACKET_TYPE_DATA &&
            packet->destination_type == RNS_DESTINATION_TYPE_PLAIN &&
            packet->data_len > 0;
+}
+
+/*
+ * Palier B4 — importe un descripteur DÉJÀ VÉRIFIÉ (signature + ancre contrôlées
+ * par l'appelant) : dérive la config, RÉ-ENCODE le descripteur sous sa forme
+ * CANONIQUE, la persiste sur le record DU RUNTIME puis applique la config EN
+ * PLACE dans app->currency. On persiste le ré-encodage canonique (et non le wire
+ * reçu tel quel) pour que deux pairs de la même monnaie détiennent des blobs
+ * identiques octet à octet, quel que soit l'ordre des clés CBOR reçu.
+ *
+ * Atomique vis-à-vis du storage : un INSTANTANÉ COMPLET du record est pris avant
+ * mutation et restauré INTÉGRALEMENT si le save échoue (le blob, la longueur ET
+ * le flag), de sorte qu'un échec ne laisse jamais un record incohérent ; la
+ * config n'est appliquée qu'après un save réussi. Exécuté sous le lock du runtime
+ * (déjà tenu par process_one). N'alloue rien de lourd sur la pile (record ~570 o
+ * + blob 384 o ; pas de meshpay_dag_t).
+ */
+static esp_err_t runtime_import_currency_descriptor(
+    meshpay_app_runtime_t *runtime,
+    const meshpay_currency_descriptor_signed_t *signed_desc)
+{
+    if (!runtime->has_storage) {
+        /* Sans persistance, une rejointe ne survivrait pas au reboot : refus. */
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Dérive la config depuis le descripteur (déjà vérifié par l'appelant). */
+    meshpay_currency_config_t derived;
+    ESP_RETURN_ON_ERROR(
+        meshpay_currency_config_from_descriptor(&derived, signed_desc),
+        "app_runtime", "");
+
+    /* Ré-encodage CANONIQUE : indépendant de l'ordre des clés du wire reçu. */
+    uint8_t blob[MESHPAY_CURRENCY_DESCRIPTOR_CBOR_MAX];
+    size_t blob_len = 0;
+    ESP_RETURN_ON_ERROR(
+        meshpay_currency_descriptor_encode(signed_desc, blob, sizeof(blob),
+                                           &blob_len),
+        "app_runtime", "");
+
+    /* Instantané COMPLET du record pour un rollback réellement atomique. */
+    meshpay_storage_record_t snapshot = runtime->storage_record;
+
+    ESP_RETURN_ON_ERROR(
+        meshpay_storage_record_set_currency_descriptor(&runtime->storage_record,
+                                                       blob, blob_len),
+        "app_runtime", "");
+
+    esp_err_t err = meshpay_storage_save(&runtime->storage_backend,
+                                         &runtime->storage_record);
+    if (err != ESP_OK) {
+        /* Rollback intégral : le flash n'a pas été écrit, le record RAM doit
+         * revenir EXACTEMENT à son état antérieur (aucun résidu de blob). */
+        runtime->storage_record = snapshot;
+        return err;
+    }
+
+    /* Applique la config EN PLACE : l'engine de paiement tient &app->currency,
+     * la mutation est donc vue immédiatement sans ré-init. */
+    runtime->app->currency = derived;
+    return ESP_OK;
+}
+
+/*
+ * Palier B4 — traite un OFFER de descripteur reçu (data[0] == 0x34). Séquence
+ * stricte : idempotence (déjà membre) -> armé ? -> parse -> matches_anchor ->
+ * verify -> import. Tout rejet est NON DESTRUCTIF et NON BLOQUANT (log + ESP_OK)
+ * pour ne pas figer la tâche reticulum ni désarmer sur un OFFER parasite.
+ */
+static esp_err_t runtime_handle_join_offer(meshpay_app_runtime_t *runtime,
+                                           const rns_packet_t *packet,
+                                           uint64_t now_ms)
+{
+    /* Idempotence : déjà membre d'une monnaie -> on ignore tout OFFER. */
+    if (runtime->app->currency.has_descriptor) {
+        return ESP_OK;
+    }
+    /* Aucune rejointe armée -> on n'importe pas une monnaie non demandée. */
+    if (!runtime->join_armed) {
+        return ESP_OK;
+    }
+    /* (Timeout de fenêtre : champ join_armed_until_ms posé, désarmement différé
+     * à un palier ultérieur — non évalué ici.) */
+
+    meshpay_currency_descriptor_signed_t signed_desc;
+    if (meshpay_descriptor_sync_parse_offer(packet, &signed_desc) != ESP_OK) {
+        ESP_LOGW("app_runtime", "OFFER descripteur illisible ignoré");
+        return ESP_OK;
+    }
+    /* L'ancre saisie hors-bande DOIT préfixer la genèse recalculée. */
+    if (meshpay_currency_descriptor_matches_anchor(
+            &signed_desc, runtime->pending_anchor,
+            runtime->pending_anchor_len) != ESP_OK) {
+        ESP_LOGW("app_runtime", "OFFER ancre non-matchante ignoré (autre monnaie)");
+        return ESP_OK; /* reste armé */
+    }
+    /* Ancre OK mais la signature du fondateur doit aussi vérifier. */
+    if (meshpay_currency_descriptor_verify(&signed_desc) != ESP_OK) {
+        ESP_LOGW("app_runtime", "OFFER signature fondateur invalide ignoré");
+        return ESP_OK; /* reste armé */
+    }
+
+    /* Descripteur décodé + ancre + signature validées : import (persistance du
+     * ré-encodage canonique + application de la config). */
+    esp_err_t err = runtime_import_currency_descriptor(runtime, &signed_desc);
+    if (err != ESP_OK) {
+        ESP_LOGE("app_runtime", "import descripteur échoué: %s -> reste armé",
+                 esp_err_to_name(err));
+        return ESP_OK; /* échec (p.ex. storage) : le membre réessaiera */
+    }
+
+    runtime->join_armed = false;
+    (void)runtime_refresh_balance(runtime, now_ms);
+    ESP_LOGI("app_runtime", "rejointe réussie: currency_id=%08x",
+             (unsigned)runtime->app->currency.currency_id);
+    return ESP_OK;
 }
 
 static esp_err_t runtime_process_reticulum(meshpay_app_runtime_t *runtime,
@@ -1208,7 +1433,7 @@ static esp_err_t runtime_process_reticulum(meshpay_app_runtime_t *runtime,
                                                  runtime->app->payments.feedback,
                                                  amount);
         }
-    } else if (runtime_packet_is_plain_dag_sync(&event->packet)) {
+    } else if (runtime_packet_is_plain_broadcast(&event->packet)) {
         if (event->packet.data[0] == MESHPAY_DAG_SYNC_MSG_SUMMARY) {
             err = runtime_handle_dag_summary(runtime,
                                              &event->packet,
@@ -1222,6 +1447,11 @@ static esp_err_t runtime_process_reticulum(meshpay_app_runtime_t *runtime,
                 err == ESP_ERR_NOT_FOUND) {
                 err = ESP_OK;
             }
+        } else if (event->packet.data[0] == MESHPAY_DESCRIPTOR_SYNC_MSG_OFFER) {
+            /* Palier B4 — OFFER de descripteur de monnaie (rejointe). Le handler
+             * neutralise déjà tous ses rejets (retourne ESP_OK). */
+            err = runtime_handle_join_offer(runtime, &event->packet,
+                                            event->now_ms);
         }
     }
     if (err == ESP_OK) {

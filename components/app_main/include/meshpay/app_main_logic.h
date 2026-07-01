@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include "meshpay/currency_descriptor.h"
 #include "meshpay/dag_store.h"
 #include "meshpay/dag_sync.h"
 #include "meshpay/payment_engine.h"
@@ -48,6 +49,17 @@ typedef struct {
     uint8_t destination[MESHPAY_TX_DESTINATION_HASH_SIZE];
     rns_packet_t packet;
 } meshpay_app_event_t;
+
+/*
+ * État de la machine à états de REJOINTE de monnaie (Palier B4). Dérivé (non
+ * stocké) depuis runtime->join_armed et app->currency.has_descriptor : la
+ * vérité durable reste has_descriptor (survit au reboot via le storage).
+ */
+typedef enum {
+    MESHPAY_APP_JOIN_IDLE = 0, /* ni armé ni membre : aucune rejointe en cours */
+    MESHPAY_APP_JOIN_ARMED,    /* ancre posée, en attente d'un OFFER matchant  */
+    MESHPAY_APP_JOIN_MEMBER,   /* membre actif d'une monnaie à descripteur     */
+} meshpay_app_join_state_t;
 
 typedef esp_err_t (*meshpay_app_runtime_packet_tx_cb_t)(
     const rns_packet_t *packet,
@@ -103,6 +115,13 @@ typedef struct {
     meshpay_app_runtime_packet_tx_cb_t packet_tx;
     void *packet_tx_ctx;
     uint64_t dag_sync_quiet_until_ms;
+    /* --- Rejointe de monnaie (Palier B4) : état d'orchestration RX transitoire.
+     * pending_anchor = préfixe de genèse saisi hors-bande (code d'invitation).
+     * join_armed_until_ms est posé mais le désarmement sur timeout est différé. */
+    bool join_armed;
+    uint8_t pending_anchor[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN];
+    size_t pending_anchor_len;
+    uint64_t join_armed_until_ms;
     uint32_t processed_ui;
     uint32_t processed_reticulum;
     uint32_t processed_core;
@@ -176,6 +195,46 @@ esp_err_t meshpay_app_runtime_process_one(meshpay_app_runtime_t *runtime,
                                           TickType_t timeout_ticks);
 UBaseType_t meshpay_app_runtime_queue_depth(const meshpay_app_runtime_t *runtime,
                                             meshpay_app_queue_id_t queue_id);
+
+/* ======================================================================== */
+/* Palier B4 — machine à états de rejointe de monnaie (headless)            */
+/* ======================================================================== */
+
+/*
+ * Arme la rejointe depuis une ANCRE brute, qui DOIT faire exactement
+ * MESHPAY_CURRENCY_INVITE_ANCHOR_LEN octets (l'ancre du code d'invitation) —
+ * toute autre longueur est rejetée (ESP_ERR_INVALID_ARG). Mono-monnaie STRICT :
+ * rejette avec ESP_ERR_INVALID_STATE si le device est déjà membre
+ * (has_descriptor). Sur succès, l'état passe à ARMED : le prochain OFFER matchant
+ * l'ancre sera importé. now_ms horodate la fenêtre (désarmement sur timeout
+ * différé).
+ */
+esp_err_t meshpay_app_runtime_arm_join_anchor(meshpay_app_runtime_t *runtime,
+                                              const uint8_t *anchor,
+                                              size_t anchor_len,
+                                              uint64_t now_ms);
+
+/*
+ * Arme la rejointe depuis un CODE d'invitation (base32 Crockford). Décode le
+ * code (meshpay_currency_invite_decode) puis délègue à _arm_join_anchor. Propage
+ * l'erreur de décodage (checksum/alphabet/longueur) et le rejet mono-monnaie.
+ */
+esp_err_t meshpay_app_runtime_arm_join(meshpay_app_runtime_t *runtime,
+                                       const char *invite_code,
+                                       uint64_t now_ms);
+
+/*
+ * Émet UNE requête de descripteur (REQUEST 0x33, broadcast) via le callback
+ * packet_tx : currency_id dérivé de l'ancre armée, source = adresse locale.
+ * Rejette (ESP_ERR_INVALID_STATE) si non armé, déjà membre, ou packet_tx absent.
+ * La cadence périodique (retries) est du ressort du câblage FreeRTOS (main/).
+ */
+esp_err_t meshpay_app_runtime_emit_join_request(meshpay_app_runtime_t *runtime,
+                                                uint64_t now_ms);
+
+/* État courant de la rejointe (dérivé de join_armed + has_descriptor). */
+meshpay_app_join_state_t meshpay_app_runtime_join_state(
+    const meshpay_app_runtime_t *runtime);
 
 #ifdef __cplusplus
 }
