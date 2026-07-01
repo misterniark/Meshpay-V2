@@ -132,6 +132,71 @@ esp_err_t meshpay_currency_descriptor_decode(const uint8_t *data,
 esp_err_t meshpay_currency_descriptor_founder_hash(const meshpay_currency_descriptor_signed_t *signed_desc,
                                                    uint8_t out_hash[RNS_IDENTITY_HASH_SIZE]);
 
+/* ======================================================================== */
+/* Palier B1 — code d'invitation (ancre)                                    */
+/*                                                                          */
+/* Le code d'invitation est l'ANCRE DE CONFIANCE hors-bande : le fondateur  */
+/* l'affiche, le membre le saisit. Il fige les N premiers octets de la      */
+/* genèse — donc un descripteur précis — sans transporter le descripteur    */
+/* lui-même (trop gros à taper). Le membre n'importera un descripteur reçu  */
+/* par radio QUE si sa genèse recommence par cette ancre (cf. B2).          */
+/*                                                                          */
+/* Format : ancre(10 o) ‖ checksum(1 o) = 11 o = 88 bits, encodés en base32 */
+/* Crockford (alphabet 0123456789ABCDEFGHJKMNPQRSTVWXYZ, sans I/L/O/U pour  */
+/* lever toute ambiguïté visuelle) → 18 symboles groupés 4-4-4-4-2 avec     */
+/* tirets. Le checksum = SHA-256(ancre)[0] détecte une faute de frappe.     */
+/* ======================================================================== */
+
+/* Nombre d'octets de tête de la genèse capturés par l'ancre (80 bits). */
+#define MESHPAY_CURRENCY_INVITE_ANCHOR_LEN 10
+/* Nombre de symboles base32 du code (hors tirets) : ceil((10+1)*8 / 5) = 18. */
+#define MESHPAY_CURRENCY_INVITE_CODE_SYMBOLS 18
+/* Taille du buffer du code formaté : 18 symboles + 4 tirets + '\0' = 23. */
+#define MESHPAY_CURRENCY_INVITE_CODE_BUF 23
+
+/*
+ * Génère le code d'invitation affichable depuis un descripteur signé : prend
+ * les MESHPAY_CURRENCY_INVITE_ANCHOR_LEN premiers octets de genesis_hash, y
+ * ajoute un octet de checksum, encode en base32 Crockford et groupe avec des
+ * tirets. `out` doit pouvoir contenir MESHPAY_CURRENCY_INVITE_CODE_BUF octets
+ * (sinon ESP_ERR_INVALID_SIZE). Toujours null-terminé en cas de succès.
+ */
+esp_err_t meshpay_currency_invite_encode(const meshpay_currency_descriptor_signed_t *signed_desc,
+                                         char *out,
+                                         size_t out_size);
+
+/*
+ * Décode/valide un code saisi par un humain → octets d'ancre. Tolérant :
+ * tirets et espaces ignorés, insensible à la casse, normalisation Crockford
+ * (O→0, I/L→1, U→V). Rejette (ESP_ERR_INVALID_*) si le nombre de symboles
+ * n'est pas 18, si un caractère est hors alphabet, si les bits de bourrage de
+ * fin ne sont pas nuls, ou si le checksum ne correspond pas. `anchor_cap` doit
+ * valoir au moins MESHPAY_CURRENCY_INVITE_ANCHOR_LEN. `anchor_len` (optionnel)
+ * reçoit le nombre d'octets écrits (toujours ANCHOR_LEN en cas de succès).
+ */
+esp_err_t meshpay_currency_invite_decode(const char *code,
+                                         uint8_t *anchor_out,
+                                         size_t anchor_cap,
+                                         size_t *anchor_len);
+
+/*
+ * Contrôle d'ancre (Palier B2). RECALCULE la genèse depuis signed_desc->body
+ * (comme verify — ne fait PAS confiance au champ genesis_hash stocké) puis
+ * compare ses `anchor_len` premiers octets à `anchor`, en TEMPS CONSTANT.
+ *
+ * C'est le garde-fou du membre : un descripteur reçu par radio n'est importé
+ * que s'il matche l'ancre saisie hors-bande. Ce contrôle porte sur l'IDENTITÉ
+ * de la monnaie (préfixe de genèse), pas sur l'authenticité de la signature —
+ * enchaîner avec meshpay_currency_descriptor_verify().
+ *
+ * Retour : ESP_OK si match ; ESP_ERR_INVALID_STATE si le préfixe diffère ;
+ * ESP_ERR_INVALID_ARG si signed_desc/anchor NULL, anchor_len == 0, ou
+ * anchor_len > MESHPAY_CURRENCY_GENESIS_SIZE.
+ */
+esp_err_t meshpay_currency_descriptor_matches_anchor(const meshpay_currency_descriptor_signed_t *signed_desc,
+                                                     const uint8_t *anchor,
+                                                     size_t anchor_len);
+
 #ifdef __cplusplus
 }
 #endif

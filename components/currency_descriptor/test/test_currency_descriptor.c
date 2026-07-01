@@ -419,3 +419,295 @@ TEST_CASE("currency descriptor rejette les arguments NULL", "[currency_descripto
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
                       meshpay_currency_descriptor_founder_hash(NULL, hash));
 }
+
+/* ======================================================================== */
+/* Palier B1 — code d'invitation (ancre base32 Crockford + checksum)        */
+/* ======================================================================== */
+
+/*
+ * Forge un descripteur signé « réaliste » et renvoie son ancre théorique
+ * (= les MESHPAY_CURRENCY_INVITE_ANCHOR_LEN premiers octets du genesis). Mutualisé
+ * par les tests d'invitation pour éviter la répétition de sign().
+ */
+static void make_signed(meshpay_currency_descriptor_signed_t *signed_desc)
+{
+    rns_identity_t founder;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(&founder));
+    meshpay_currency_descriptor_t body;
+    fill_body(&body);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_sign(signed_desc, &body, &founder));
+}
+
+/* Vrai ssi c est un symbole de l'alphabet Crockford (majuscule canonique). */
+static bool is_crockford_upper(char c)
+{
+    static const char *ALPHA = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    return strchr(ALPHA, c) != NULL && c != '\0';
+}
+
+TEST_CASE("currency invite encode produit le format attendu", "[currency_descriptor]")
+{
+    meshpay_currency_descriptor_signed_t signed_desc;
+    make_signed(&signed_desc);
+
+    char code[MESHPAY_CURRENCY_INVITE_CODE_BUF];
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_invite_encode(&signed_desc, code, sizeof(code)));
+
+    /* Format groupé 4-4-4-4-2 : 18 symboles + 4 tirets = 22 caractères. */
+    TEST_ASSERT_EQUAL_size_t(22, strlen(code));
+    TEST_ASSERT_EQUAL_CHAR('-', code[4]);
+    TEST_ASSERT_EQUAL_CHAR('-', code[9]);
+    TEST_ASSERT_EQUAL_CHAR('-', code[14]);
+    TEST_ASSERT_EQUAL_CHAR('-', code[19]);
+    /* Tout caractère non-tiret est un symbole Crockford majuscule. */
+    for (size_t i = 0; code[i] != '\0'; ++i) {
+        if (code[i] == '-') {
+            continue;
+        }
+        TEST_ASSERT_TRUE(is_crockford_upper(code[i]));
+    }
+}
+
+TEST_CASE("currency invite round-trip restitue l'ancre", "[currency_descriptor]")
+{
+    meshpay_currency_descriptor_signed_t signed_desc;
+    make_signed(&signed_desc);
+
+    char code[MESHPAY_CURRENCY_INVITE_CODE_BUF];
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_invite_encode(&signed_desc, code, sizeof(code)));
+
+    uint8_t anchor[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN];
+    size_t anchor_len = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_invite_decode(code, anchor, sizeof(anchor),
+                                                     &anchor_len));
+    /* L'ancre décodée = les 10 octets de tête du genesis. */
+    TEST_ASSERT_EQUAL_size_t(MESHPAY_CURRENCY_INVITE_ANCHOR_LEN, anchor_len);
+    TEST_ASSERT_EQUAL_MEMORY(signed_desc.genesis_hash, anchor,
+                             MESHPAY_CURRENCY_INVITE_ANCHOR_LEN);
+}
+
+TEST_CASE("currency invite checksum KO rejete", "[currency_descriptor]")
+{
+    meshpay_currency_descriptor_signed_t signed_desc;
+    make_signed(&signed_desc);
+
+    char code[MESHPAY_CURRENCY_INVITE_CODE_BUF];
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_invite_encode(&signed_desc, code, sizeof(code)));
+
+    /* Corrompre le symbole qui porte l'octet de CHECKSUM (et pas l'ancre) rend le
+     * rejet DÉTERMINISTE : l'ancre décodée reste identique, le checksum recalculé
+     * dessus reste donc le bon, mais le checksum stocké lu est faux → mismatch
+     * garanti (vs. flipper un symbole de données qui ne casse le checksum qu'à
+     * 255/256). Disposition : 18 symboles 5 bits ; l'ancre = bits 0..79 = symboles
+     * 0..15 ; l'octet de checksum = bits 80..87 = symbole 16 (+ une partie du 17).
+     * Le symbole 16 est le 1er du dernier groupe « -XX », soit l'index 20 de la
+     * chaîne formatée (après le 4e tiret en position 19). */
+    code[20] = (code[20] == 'A') ? 'B' : 'A';
+
+    uint8_t anchor[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN];
+    size_t anchor_len = 0;
+    TEST_ASSERT_NOT_EQUAL(ESP_OK,
+                          meshpay_currency_invite_decode(code, anchor, sizeof(anchor),
+                                                         &anchor_len));
+}
+
+TEST_CASE("currency invite caractere hors alphabet rejete", "[currency_descriptor]")
+{
+    meshpay_currency_descriptor_signed_t signed_desc;
+    make_signed(&signed_desc);
+
+    char code[MESHPAY_CURRENCY_INVITE_CODE_BUF];
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_invite_encode(&signed_desc, code, sizeof(code)));
+
+    /* Injecter un caractère hors alphabet (et non-tiret). */
+    code[0] = '@';
+
+    uint8_t anchor[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN];
+    size_t anchor_len = 0;
+    TEST_ASSERT_NOT_EQUAL(ESP_OK,
+                          meshpay_currency_invite_decode(code, anchor, sizeof(anchor),
+                                                         &anchor_len));
+}
+
+TEST_CASE("currency invite longueur invalide rejetee", "[currency_descriptor]")
+{
+    uint8_t anchor[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN];
+    size_t anchor_len = 0;
+
+    /* Trop court. */
+    TEST_ASSERT_NOT_EQUAL(ESP_OK,
+                          meshpay_currency_invite_decode("ABCD-EFGH",
+                                                         anchor, sizeof(anchor),
+                                                         &anchor_len));
+    /* Trop long (19 symboles utiles). */
+    TEST_ASSERT_NOT_EQUAL(ESP_OK,
+                          meshpay_currency_invite_decode(
+                              "ABCDEFGHJKMNPQRSTVW", anchor, sizeof(anchor),
+                              &anchor_len));
+    /* Chaîne vide. */
+    TEST_ASSERT_NOT_EQUAL(ESP_OK,
+                          meshpay_currency_invite_decode("", anchor, sizeof(anchor),
+                                                         &anchor_len));
+}
+
+TEST_CASE("currency invite normalisation Crockford et tirets optionnels", "[currency_descriptor]")
+{
+    meshpay_currency_descriptor_signed_t signed_desc;
+    make_signed(&signed_desc);
+
+    char code[MESHPAY_CURRENCY_INVITE_CODE_BUF];
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_invite_encode(&signed_desc, code, sizeof(code)));
+
+    /* Variante saisie « à la main » : minuscules, sans tirets, avec O/I/L à la
+     * place de 0/1 — Crockford doit normaliser et décoder à l'identique. */
+    char variant[MESHPAY_CURRENCY_INVITE_CODE_BUF];
+    size_t j = 0;
+    for (size_t i = 0; code[i] != '\0'; ++i) {
+        char c = code[i];
+        if (c == '-') {
+            continue; /* tirets retirés */
+        }
+        if (c >= 'A' && c <= 'Z') {
+            c = (char)(c - 'A' + 'a'); /* minuscule */
+        }
+        if (c == '0') {
+            c = 'O'; /* sosie : doit remapper vers 0 */
+        } else if (c == '1') {
+            c = 'l'; /* sosie : doit remapper vers 1 */
+        }
+        variant[j++] = c;
+    }
+    variant[j] = '\0';
+
+    uint8_t a_ref[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN];
+    uint8_t a_var[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN];
+    size_t l_ref = 0, l_var = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_invite_decode(code, a_ref, sizeof(a_ref), &l_ref));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_invite_decode(variant, a_var, sizeof(a_var), &l_var));
+    TEST_ASSERT_EQUAL_size_t(l_ref, l_var);
+    TEST_ASSERT_EQUAL_MEMORY(a_ref, a_var, l_ref);
+}
+
+TEST_CASE("currency invite NULL rejete", "[currency_descriptor]")
+{
+    meshpay_currency_descriptor_signed_t signed_desc;
+    make_signed(&signed_desc);
+    char code[MESHPAY_CURRENCY_INVITE_CODE_BUF];
+    uint8_t anchor[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN];
+    size_t anchor_len = 0;
+
+    /* Encode : descripteur ou sortie NULL, ou buffer trop petit. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_currency_invite_encode(NULL, code, sizeof(code)));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_currency_invite_encode(&signed_desc, NULL, sizeof(code)));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE,
+                      meshpay_currency_invite_encode(&signed_desc, code, 4));
+
+    /* Decode : code NULL, sortie NULL, ou capacité d'ancre insuffisante. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_currency_invite_decode(NULL, anchor, sizeof(anchor),
+                                                     &anchor_len));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_currency_invite_decode("ABCD", NULL, sizeof(anchor),
+                                                     &anchor_len));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE,
+                      meshpay_currency_invite_decode("ABCD", anchor, 2, &anchor_len));
+}
+
+/* ======================================================================== */
+/* Palier B2 — contrôle d'ancre (matches_anchor)                            */
+/* ======================================================================== */
+
+TEST_CASE("currency descriptor matches_anchor accepte le bon prefixe", "[currency_descriptor]")
+{
+    meshpay_currency_descriptor_signed_t signed_desc;
+    make_signed(&signed_desc);
+
+    /* L'ancre = les 10 octets de tête de la genèse. */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_matches_anchor(
+                          &signed_desc, signed_desc.genesis_hash,
+                          MESHPAY_CURRENCY_INVITE_ANCHOR_LEN));
+}
+
+TEST_CASE("currency descriptor matches_anchor rejette un bit different", "[currency_descriptor]")
+{
+    meshpay_currency_descriptor_signed_t signed_desc;
+    make_signed(&signed_desc);
+
+    /* Copier l'ancre puis flipper 1 bit : le préfixe ne correspond plus. */
+    uint8_t anchor[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN];
+    memcpy(anchor, signed_desc.genesis_hash, sizeof(anchor));
+    anchor[3] ^= 0x01;
+
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_currency_descriptor_matches_anchor(
+                          &signed_desc, anchor, sizeof(anchor)));
+}
+
+TEST_CASE("currency descriptor matches_anchor gere les longueurs partielles", "[currency_descriptor]")
+{
+    meshpay_currency_descriptor_signed_t signed_desc;
+    make_signed(&signed_desc);
+
+    /* len=4 : les octets du currency_id doivent matcher. */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_matches_anchor(
+                          &signed_desc, signed_desc.genesis_hash, 4));
+    /* len=32 : la genèse entière doit matcher. */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_matches_anchor(
+                          &signed_desc, signed_desc.genesis_hash,
+                          MESHPAY_CURRENCY_GENESIS_SIZE));
+}
+
+TEST_CASE("currency descriptor matches_anchor recalcule depuis le corps", "[currency_descriptor]")
+{
+    meshpay_currency_descriptor_signed_t signed_desc;
+    make_signed(&signed_desc);
+
+    /* Mémoriser l'ancre légitime AVANT trafic. */
+    uint8_t anchor[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN];
+    memcpy(anchor, signed_desc.genesis_hash, sizeof(anchor));
+
+    /* Trafiquer une règle du corps : la genèse recalculée change, donc l'ancre
+     * d'origine ne doit plus matcher — même si genesis_hash stocké est inchangé.
+     * (matches_anchor ne fait pas confiance au champ stocké.) */
+    signed_desc.body.max_supply += 1;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_currency_descriptor_matches_anchor(
+                          &signed_desc, anchor, sizeof(anchor)));
+}
+
+TEST_CASE("currency descriptor matches_anchor rejette les arguments invalides", "[currency_descriptor]")
+{
+    meshpay_currency_descriptor_signed_t signed_desc;
+    make_signed(&signed_desc);
+    uint8_t anchor[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN] = {0};
+
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_currency_descriptor_matches_anchor(
+                          NULL, anchor, sizeof(anchor)));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_currency_descriptor_matches_anchor(
+                          &signed_desc, NULL, sizeof(anchor)));
+    /* len == 0 : rien à comparer, argument invalide. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_currency_descriptor_matches_anchor(
+                          &signed_desc, anchor, 0));
+    /* len > taille de la genèse : impossible. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_currency_descriptor_matches_anchor(
+                          &signed_desc, anchor,
+                          MESHPAY_CURRENCY_GENESIS_SIZE + 1));
+}

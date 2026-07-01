@@ -574,3 +574,214 @@ esp_err_t meshpay_currency_descriptor_founder_hash(const meshpay_currency_descri
                         TAG, "");
     return rns_identity_get_hash(&founder, out_hash);
 }
+
+/* ======================================================================== */
+/* Palier B1 — code d'invitation (ancre base32 Crockford + checksum)        */
+/* ======================================================================== */
+
+/*
+ * Alphabet base32 Crockford : 32 symboles, sans I, L, O, U. On garde les
+ * chiffres 0 et 1, mais leurs sosies visuels (O, et I/L) sont absents → aucune
+ * paire ambiguë à l'écran. (Exclure réellement 0 et 1 EN PLUS aurait laissé 31
+ * symboles, insuffisant pour un base32 — choix verrouillé en session.)
+ */
+static const char INVITE_ALPHABET[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/* Longueur de la charge utile binaire avant base32 : ancre + 1 octet checksum. */
+#define INVITE_PAYLOAD_LEN (MESHPAY_CURRENCY_INVITE_ANCHOR_LEN + 1)
+/* Toutes les 4 symboles, on insère un tiret de lisibilité (groupes 4-4-4-4-2). */
+#define INVITE_GROUP_SIZE 4
+
+/*
+ * Octet de checksum = 1er octet de SHA-256(ancre). But : détecter une faute de
+ * frappe (probabilité de non-détection ~1/256), pas une attaque — l'intégrité
+ * cryptographique reste portée par la signature du fondateur (verify).
+ */
+static esp_err_t invite_checksum(const uint8_t *anchor, size_t anchor_len, uint8_t *out)
+{
+    uint8_t digest[RNS_CRYPTO_SHA256_SIZE];
+    ESP_RETURN_ON_ERROR(rns_crypto_sha256(anchor, anchor_len, digest), TAG, "");
+    *out = digest[0];
+    return ESP_OK;
+}
+
+/*
+ * Convertit un caractère saisi en valeur 0..31, ou -1 si hors alphabet. Applique
+ * la normalisation Crockford : passage en majuscule, puis O→0, I/L→1, U→V. Le
+ * '\0' est rejeté explicitement (sinon strchr le trouverait en fin de chaîne).
+ */
+static int invite_symbol_value(char c)
+{
+    if (c >= 'a' && c <= 'z') {
+        c = (char)(c - 'a' + 'A');
+    }
+    switch (c) {
+    case 'O': c = '0'; break;
+    case 'I':
+    case 'L': c = '1'; break;
+    case 'U': c = 'V'; break;
+    default: break;
+    }
+    if (c == '\0') {
+        return -1;
+    }
+    const char *p = strchr(INVITE_ALPHABET, c);
+    if (p == NULL) {
+        return -1;
+    }
+    return (int)(p - INVITE_ALPHABET);
+}
+
+esp_err_t meshpay_currency_invite_encode(const meshpay_currency_descriptor_signed_t *signed_desc,
+                                         char *out,
+                                         size_t out_size)
+{
+    if (signed_desc == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (out_size < MESHPAY_CURRENCY_INVITE_CODE_BUF) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    /* Charge utile = ancre (préfixe genèse) ‖ checksum. */
+    uint8_t payload[INVITE_PAYLOAD_LEN];
+    memcpy(payload, signed_desc->genesis_hash, MESHPAY_CURRENCY_INVITE_ANCHOR_LEN);
+    ESP_RETURN_ON_ERROR(invite_checksum(payload, MESHPAY_CURRENCY_INVITE_ANCHOR_LEN,
+                                        &payload[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN]),
+                        TAG, "");
+
+    /*
+     * Encodage base32 « big-endian » : on consomme les bits du MSB du 1er octet
+     * vers le LSB du dernier, par tranches de 5. 88 bits → 17 tranches pleines +
+     * 3 bits restants bourrés à droite de 2 zéros → 18 symboles. Les tirets sont
+     * insérés tous les INVITE_GROUP_SIZE symboles.
+     */
+    uint32_t buffer = 0;
+    int bits = 0;
+    size_t sym_count = 0;
+    size_t pos = 0;
+    for (size_t i = 0; i < INVITE_PAYLOAD_LEN; ++i) {
+        buffer = (buffer << 8) | payload[i];
+        bits += 8;
+        while (bits >= 5) {
+            bits -= 5;
+            uint8_t sym = (uint8_t)((buffer >> bits) & 0x1FU);
+            if (sym_count > 0 && (sym_count % INVITE_GROUP_SIZE) == 0) {
+                out[pos++] = '-';
+            }
+            out[pos++] = INVITE_ALPHABET[sym];
+            ++sym_count;
+        }
+    }
+    if (bits > 0) {
+        /* Bits restants bourrés à droite avec des zéros (bourrage déterministe). */
+        uint8_t sym = (uint8_t)((buffer << (5 - bits)) & 0x1FU);
+        if (sym_count > 0 && (sym_count % INVITE_GROUP_SIZE) == 0) {
+            out[pos++] = '-';
+        }
+        out[pos++] = INVITE_ALPHABET[sym];
+        ++sym_count;
+    }
+    out[pos] = '\0';
+    return ESP_OK;
+}
+
+esp_err_t meshpay_currency_invite_decode(const char *code,
+                                         uint8_t *anchor_out,
+                                         size_t anchor_cap,
+                                         size_t *anchor_len)
+{
+    if (code == NULL || anchor_out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Capacité vérifiée AVANT de parser : un appelant sous-dimensionné est une
+     * erreur de programmation distincte d'un code mal formé. */
+    if (anchor_cap < MESHPAY_CURRENCY_INVITE_ANCHOR_LEN) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    /*
+     * 1) Décodage base32 : on ignore tirets et espaces, on normalise chaque
+     *    symbole, on accumule les bits par tranches de 8 → INVITE_PAYLOAD_LEN
+     *    octets. On compte les symboles pour valider la longueur exacte.
+     */
+    uint8_t payload[INVITE_PAYLOAD_LEN];
+    uint32_t buffer = 0;
+    int bits = 0;
+    size_t byte_count = 0;
+    size_t sym_count = 0;
+    for (const char *p = code; *p != '\0'; ++p) {
+        if (*p == '-' || *p == ' ' || *p == '\t') {
+            continue; /* séparateurs de lisibilité ignorés */
+        }
+        int val = invite_symbol_value(*p);
+        if (val < 0) {
+            return ESP_ERR_INVALID_ARG; /* caractère hors alphabet */
+        }
+        ++sym_count;
+        if (sym_count > MESHPAY_CURRENCY_INVITE_CODE_SYMBOLS) {
+            return ESP_ERR_INVALID_SIZE; /* trop de symboles */
+        }
+        buffer = (buffer << 5) | (uint32_t)val;
+        bits += 5;
+        if (bits >= 8) {
+            bits -= 8;
+            if (byte_count >= INVITE_PAYLOAD_LEN) {
+                return ESP_ERR_INVALID_SIZE; /* garde-fou (ne devrait pas arriver) */
+            }
+            payload[byte_count++] = (uint8_t)((buffer >> bits) & 0xFFU);
+        }
+    }
+
+    /* Nombre exact de symboles requis (sinon code tronqué/rallongé). */
+    if (sym_count != MESHPAY_CURRENCY_INVITE_CODE_SYMBOLS ||
+        byte_count != INVITE_PAYLOAD_LEN) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    /* Les bits de bourrage de fin (ici 2) doivent être nuls : sinon le code ne
+     * provient pas d'un encodeur conforme. */
+    if (bits > 0 && (buffer & ((1U << bits) - 1U)) != 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* 2) Vérification du checksum sur l'ancre décodée. */
+    uint8_t expected = 0;
+    ESP_RETURN_ON_ERROR(invite_checksum(payload, MESHPAY_CURRENCY_INVITE_ANCHOR_LEN,
+                                        &expected),
+                        TAG, "");
+    if (payload[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN] != expected) {
+        return ESP_ERR_INVALID_CRC; /* faute de frappe détectée */
+    }
+
+    memcpy(anchor_out, payload, MESHPAY_CURRENCY_INVITE_ANCHOR_LEN);
+    if (anchor_len != NULL) {
+        *anchor_len = MESHPAY_CURRENCY_INVITE_ANCHOR_LEN;
+    }
+    return ESP_OK;
+}
+
+esp_err_t meshpay_currency_descriptor_matches_anchor(const meshpay_currency_descriptor_signed_t *signed_desc,
+                                                     const uint8_t *anchor,
+                                                     size_t anchor_len)
+{
+    if (signed_desc == NULL || anchor == NULL ||
+        anchor_len == 0 || anchor_len > MESHPAY_CURRENCY_GENESIS_SIZE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Recalcule la genèse depuis le CORPS (pas de confiance au champ stocké) :
+     * un descripteur dont le corps a été trafiqué produit une genèse différente
+     * et ne peut donc pas usurper l'ancre d'une autre monnaie. */
+    uint8_t computed_genesis[MESHPAY_CURRENCY_GENESIS_SIZE];
+    ESP_RETURN_ON_ERROR(meshpay_currency_descriptor_compute_genesis(&signed_desc->body,
+                                                                    computed_genesis,
+                                                                    NULL),
+                        TAG, "");
+
+    /* Comparaison temps constant du préfixe : évite une fuite par timing sur le
+     * nombre d'octets d'ancre concordants. */
+    if (!rns_crypto_constant_equal(computed_genesis, anchor, anchor_len)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_OK;
+}
