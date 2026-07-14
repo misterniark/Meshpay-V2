@@ -24,6 +24,7 @@ typedef enum {
     MESHPAY_UI_SCREEN_CURRENCY_MENU, /* sous-menu Creer / Rejoindre / Code */
     MESHPAY_UI_SCREEN_JOIN,          /* saisie du code d'invitation */
     MESHPAY_UI_SCREEN_FOUNDER_CODE,  /* affiche le code a dicter */
+    MESHPAY_UI_SCREEN_CREATE,        /* wizard de creation de monnaie (D3) */
 } meshpay_ui_screen_t;
 
 /* Palier D — appartenance à une monnaie, poussée depuis l'app (miroir headless
@@ -51,12 +52,32 @@ typedef enum {
  * currency_descriptor.h). Le code d'invitation formaté fait 22 car. + '\0'. */
 #define MESHPAY_UI_INVITE_CODE_MAX 24
 #define MESHPAY_UI_CURRENCY_NAME_MAX 24
+/* Wizard de création (D3) : symbole borné, 6 champs éditables. */
+#define MESHPAY_UI_WIZARD_SYMBOL_MAX 8
+#define MESHPAY_UI_WIZARD_FIELD_COUNT 6
 #define MESHPAY_UI_ACTION_LABEL_MAX 12
 #define MESHPAY_UI_PEER_LABEL_MAX 32
 #define MESHPAY_UI_ID_LABEL_MAX 16
 #define MESHPAY_UI_DETAIL_LINE_MAX 8
 #define MESHPAY_UI_DAG_MONITOR_PEER_LINE_MAX 4
 #define MESHPAY_UI_DAG_MONITOR_ALERT_LINE_MAX 4
+
+/* Palier D3 — état du wizard de création (écran unique + curseur de champ).
+ * Les 6 champs sont pré-remplis de défauts et édités un à un ; `field` est le
+ * curseur (0..MESHPAY_UI_WIZARD_FIELD_COUNT-1), `pristine` vaut vrai tant qu'on
+ * n'a pas encore frappé sur le champ courant (la 1re frappe sur un champ
+ * NUMÉRIQUE remplace alors le défaut au lieu de s'y concaténer). D6 lit ces
+ * champs pour bâtir meshpay_app_currency_params_t (demurrage_enabled = bps > 0). */
+typedef struct {
+    uint8_t field;
+    bool pristine;
+    char name[MESHPAY_UI_CURRENCY_NAME_MAX];
+    char symbol[MESHPAY_UI_WIZARD_SYMBOL_MAX];
+    uint32_t initial_credit;
+    uint64_t max_supply;
+    uint32_t transfer_fee;
+    uint16_t demurrage_bps;
+} meshpay_ui_wizard_t;
 
 typedef enum {
     MESHPAY_UI_DAG_MONITOR_PAGE_OVERVIEW = 0,
@@ -115,9 +136,11 @@ typedef enum {
     MESHPAY_UI_ACTION_MONITOR_RADIO,
     /* Palier D — monnaie. */
     MESHPAY_UI_ACTION_CURRENCY,  /* ouvre le sous-menu monnaie */
-    MESHPAY_UI_ACTION_CREATE,    /* démarre le wizard de création (D3) */
-    MESHPAY_UI_ACTION_JOIN,      /* va à la saisie du code d'invitation */
-    MESHPAY_UI_ACTION_SHOW_CODE, /* affiche le code d'invitation détenu */
+    MESHPAY_UI_ACTION_CREATE,     /* démarre le wizard de création (D3) */
+    MESHPAY_UI_ACTION_JOIN,       /* va à la saisie du code d'invitation */
+    MESHPAY_UI_ACTION_SHOW_CODE,  /* affiche le code d'invitation détenu */
+    MESHPAY_UI_ACTION_NEXT_FIELD, /* wizard : champ suivant */
+    MESHPAY_UI_ACTION_PREV_FIELD, /* wizard : champ précédent */
 } meshpay_ui_action_t;
 
 typedef struct {
@@ -146,6 +169,7 @@ typedef struct {
     char text_entry[MESHPAY_UI_TEXT_MAX];               /* saisie code (et nom en D3) */
     char invite_code[MESHPAY_UI_INVITE_CODE_MAX];       /* code à afficher (fondateur/membre) */
     char currency_name[MESHPAY_UI_CURRENCY_NAME_MAX];   /* nom de la monnaie détenue */
+    meshpay_ui_wizard_t wizard;                         /* wizard de création (D3) */
 } meshpay_ui_state_t;
 
 typedef struct {
@@ -199,6 +223,12 @@ esp_err_t meshpay_ui_set_currency(meshpay_ui_state_t *ui, const char *name);
 esp_err_t meshpay_ui_text_entry(const meshpay_ui_state_t *ui,
                                 char *out,
                                 size_t out_len);
+/* Palier D3 — wizard de création : (re)démarre avec les défauts sur le 1er champ
+ * et bascule sur SCREEN_CREATE ; navigue entre les champs. L'édition d'un champ
+ * passe par input_char/input_digit/backspace (routés vers le champ courant). */
+esp_err_t meshpay_ui_wizard_begin(meshpay_ui_state_t *ui);
+esp_err_t meshpay_ui_wizard_next_field(meshpay_ui_state_t *ui);
+esp_err_t meshpay_ui_wizard_prev_field(meshpay_ui_state_t *ui);
 esp_err_t meshpay_ui_backspace(meshpay_ui_state_t *ui);
 esp_err_t meshpay_ui_clear_entry(meshpay_ui_state_t *ui);
 bool meshpay_ui_confirm_enabled(const meshpay_ui_state_t *ui);

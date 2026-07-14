@@ -436,3 +436,104 @@ TEST_CASE("ui network screen exposes the currency entry", "[ui][d2]")
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
     TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_CURRENCY));
 }
+
+/* --- Palier D3 : wizard de création (écran unique + curseur de champ) --- */
+
+/* Le wizard démarre avec les défauts sur le premier champ (Nom). */
+TEST_CASE("ui wizard begins with defaults on the first field", "[ui][d3]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_wizard_begin(&ui));
+    TEST_ASSERT_EQUAL(MESHPAY_UI_SCREEN_CREATE, ui.screen);
+    TEST_ASSERT_EQUAL_UINT8(0, ui.wizard.field);
+    TEST_ASSERT_EQUAL_UINT32(100, ui.wizard.initial_credit); /* défaut */
+    TEST_ASSERT_EQUAL_UINT64(0, ui.wizard.max_supply);
+    TEST_ASSERT_EQUAL_STRING("", ui.wizard.name);
+
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_EQUAL_STRING("Creer monnaie", view.title);
+    TEST_ASSERT_EQUAL_STRING("Nom: (vide)", view.primary);
+    TEST_ASSERT_EQUAL_STRING("Champ 1/6", view.secondary);
+}
+
+/* Édition par curseur : texte sur Nom, et sur un champ numérique la 1re frappe
+ * remplace le défaut (pas de concaténation), backspace retire un chiffre. */
+TEST_CASE("ui wizard edits fields by cursor with pristine number replace", "[ui][d3]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_wizard_begin(&ui));
+
+    meshpay_ui_input_char(&ui, 'M');
+    meshpay_ui_input_char(&ui, 'i');
+    meshpay_ui_input_char(&ui, 'n');
+    TEST_ASSERT_EQUAL_STRING("Min", ui.wizard.name);
+
+    /* -> Champ 2 = Credit (défaut 100). */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_wizard_next_field(&ui)); /* Symbole */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_wizard_next_field(&ui)); /* Credit */
+    TEST_ASSERT_EQUAL_UINT8(2, ui.wizard.field);
+    TEST_ASSERT_EQUAL_UINT32(100, ui.wizard.initial_credit);
+
+    meshpay_ui_input_digit(&ui, 2);
+    TEST_ASSERT_EQUAL_UINT32(2, ui.wizard.initial_credit); /* remplacé, pas 1002 */
+    meshpay_ui_input_digit(&ui, 5);
+    meshpay_ui_input_digit(&ui, 0);
+    TEST_ASSERT_EQUAL_UINT32(250, ui.wizard.initial_credit);
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_backspace(&ui));
+    TEST_ASSERT_EQUAL_UINT32(25, ui.wizard.initial_credit);
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_wizard_prev_field(&ui));
+    TEST_ASSERT_EQUAL_UINT8(1, ui.wizard.field);
+}
+
+/* Le curseur de champ est clampé aux deux extrémités. */
+TEST_CASE("ui wizard clamps the field cursor at both ends", "[ui][d3]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_wizard_begin(&ui));
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_wizard_prev_field(&ui));
+    TEST_ASSERT_EQUAL_UINT8(0, ui.wizard.field); /* reste au premier */
+
+    for (int i = 0; i < 10; ++i) {
+        TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_wizard_next_field(&ui));
+    }
+    TEST_ASSERT_EQUAL_UINT8(MESHPAY_UI_WIZARD_FIELD_COUNT - 1, ui.wizard.field);
+}
+
+/* La confirmation exige un nom ; le wizard porte bien les valeurs des 6 champs. */
+TEST_CASE("ui wizard confirm requires a name and holds all values", "[ui][d3]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_wizard_begin(&ui));
+
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_FALSE(view.confirm_enabled); /* pas de nom -> pas de création */
+
+    const char *name = "Minimistan";
+    for (const char *p = name; *p != '\0'; ++p) {
+        TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_input_char(&ui, *p));
+    }
+    TEST_ASSERT_EQUAL_STRING("Minimistan", ui.wizard.name);
+
+    for (int i = 0; i < 5; ++i) { /* -> Champ 5 = Fonte bps */
+        TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_wizard_next_field(&ui));
+    }
+    TEST_ASSERT_EQUAL_UINT8(5, ui.wizard.field);
+    meshpay_ui_input_digit(&ui, 1);
+    meshpay_ui_input_digit(&ui, 5);
+    meshpay_ui_input_digit(&ui, 0);
+    TEST_ASSERT_EQUAL_UINT16(150, ui.wizard.demurrage_bps);
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_TRUE(view.confirm_enabled);
+    TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_CONFIRM));
+    TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_NEXT_FIELD));
+}

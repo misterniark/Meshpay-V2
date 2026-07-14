@@ -105,6 +105,88 @@ static esp_err_t append_text_char(meshpay_ui_state_t *ui, char c)
     return ESP_OK;
 }
 
+/* --- Palier D3 : wizard de création (helpers internes) --- */
+
+/* Ajoute un caractère imprimable à un buffer texte terminé nul (nom/symbole). */
+static esp_err_t wizard_append_str(char *buf, size_t cap, char c)
+{
+    if (c < 0x20 || c == 0x7f) {
+        return ESP_OK;
+    }
+    size_t len = strlen(buf);
+    if (len + 1U >= cap) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    buf[len] = c;
+    buf[len + 1U] = '\0';
+    return ESP_OK;
+}
+
+/* Les deux premiers champs (nom, symbole) sont texte ; les autres, numériques. */
+static bool wizard_field_is_text(uint8_t field)
+{
+    return field == 0U || field == 1U;
+}
+
+/* Applique un chiffre au champ NUMÉRIQUE courant. La 1re frappe sur un champ
+ * (pristine) REMPLACE le défaut ; les suivantes concatènent (garde
+ * anti-débordement propre à chaque type). */
+static void wizard_apply_digit(meshpay_ui_state_t *ui, uint8_t digit)
+{
+    meshpay_ui_wizard_t *w = &ui->wizard;
+    bool first = w->pristine;
+    w->pristine = false;
+    switch (w->field) {
+    case 2: /* initial_credit (uint32) */
+        if (first) {
+            w->initial_credit = digit;
+        } else if (w->initial_credit <= (UINT32_MAX - digit) / 10U) {
+            w->initial_credit = w->initial_credit * 10U + digit;
+        }
+        break;
+    case 3: /* max_supply (uint64) */
+        if (first) {
+            w->max_supply = digit;
+        } else if (w->max_supply <= (UINT64_MAX - digit) / 10U) {
+            w->max_supply = w->max_supply * 10U + digit;
+        }
+        break;
+    case 4: /* transfer_fee (uint32) */
+        if (first) {
+            w->transfer_fee = digit;
+        } else if (w->transfer_fee <= (UINT32_MAX - digit) / 10U) {
+            w->transfer_fee = w->transfer_fee * 10U + digit;
+        }
+        break;
+    case 5: /* demurrage_bps (uint16) */
+        if (first) {
+            w->demurrage_bps = digit;
+        } else if (w->demurrage_bps <= (uint16_t)((UINT16_MAX - digit) / 10U)) {
+            w->demurrage_bps = (uint16_t)(w->demurrage_bps * 10U + digit);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* Route une frappe vers le champ courant (texte -> append ; num -> chiffre). */
+static esp_err_t wizard_input(meshpay_ui_state_t *ui, char c)
+{
+    meshpay_ui_wizard_t *w = &ui->wizard;
+    if (wizard_field_is_text(w->field)) {
+        w->pristine = false;
+        if (w->field == 0U) {
+            return wizard_append_str(w->name, sizeof(w->name), c);
+        }
+        return wizard_append_str(w->symbol, sizeof(w->symbol), c);
+    }
+    if (c >= '0' && c <= '9') {
+        wizard_apply_digit(ui, (uint8_t)(c - '0'));
+    }
+    return ESP_OK;
+}
+
 void meshpay_ui_init(meshpay_ui_state_t *ui, bool has_pin)
 {
     if (ui == NULL) {
@@ -262,7 +344,7 @@ esp_err_t meshpay_ui_nav(meshpay_ui_state_t *ui, meshpay_ui_screen_t screen)
     if (!ui->has_pin && screen != MESHPAY_UI_SCREEN_SETUP_PIN) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (screen > MESHPAY_UI_SCREEN_FOUNDER_CODE) {
+    if (screen > MESHPAY_UI_SCREEN_CREATE) {
         return ESP_ERR_INVALID_ARG;
     }
     ui->screen = screen;
@@ -284,6 +366,8 @@ esp_err_t meshpay_ui_input_digit(meshpay_ui_state_t *ui, uint8_t digit)
         return append_pin_digit(ui, digit);
     case MESHPAY_UI_SCREEN_PAY:
         return append_amount_digit(ui, digit);
+    case MESHPAY_UI_SCREEN_CREATE:
+        return wizard_input(ui, (char)('0' + digit));
     default:
         return ESP_ERR_INVALID_STATE;
     }
@@ -300,6 +384,8 @@ esp_err_t meshpay_ui_input_char(meshpay_ui_state_t *ui, char c)
     switch (ui->screen) {
     case MESHPAY_UI_SCREEN_JOIN:
         return append_text_char(ui, c); /* saisie texte du code */
+    case MESHPAY_UI_SCREEN_CREATE:
+        return wizard_input(ui, c); /* routé vers le champ courant du wizard */
     case MESHPAY_UI_SCREEN_SETUP_PIN:
     case MESHPAY_UI_SCREEN_PAY:
         /* Écrans numériques : seuls les chiffres comptent, le reste est ignoré. */
@@ -356,6 +442,55 @@ esp_err_t meshpay_ui_text_entry(const meshpay_ui_state_t *ui,
     return ESP_OK;
 }
 
+esp_err_t meshpay_ui_wizard_begin(meshpay_ui_state_t *ui)
+{
+    if (ui == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (ui->pin_locked || !ui->has_pin) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* Défauts pré-remplis : crédit initial 100, le reste à 0 (offre illimitée,
+     * pas de frais, pas de fonte), nom/symbole vides. */
+    memset(&ui->wizard, 0, sizeof(ui->wizard));
+    ui->wizard.initial_credit = 100U;
+    ui->wizard.pristine = true;
+    ui->wizard.field = 0U;
+    ui->screen = MESHPAY_UI_SCREEN_CREATE;
+    ui->feedback = MESHPAY_UI_FEEDBACK_NONE;
+    return ESP_OK;
+}
+
+esp_err_t meshpay_ui_wizard_next_field(meshpay_ui_state_t *ui)
+{
+    if (ui == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (ui->screen != MESHPAY_UI_SCREEN_CREATE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (ui->wizard.field + 1U < MESHPAY_UI_WIZARD_FIELD_COUNT) {
+        ui->wizard.field++;
+    }
+    ui->wizard.pristine = true; /* la 1re frappe remplacera le défaut (num.) */
+    return ESP_OK;
+}
+
+esp_err_t meshpay_ui_wizard_prev_field(meshpay_ui_state_t *ui)
+{
+    if (ui == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (ui->screen != MESHPAY_UI_SCREEN_CREATE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (ui->wizard.field > 0U) {
+        ui->wizard.field--;
+    }
+    ui->wizard.pristine = true;
+    return ESP_OK;
+}
+
 esp_err_t meshpay_ui_backspace(meshpay_ui_state_t *ui)
 {
     if (ui == NULL) {
@@ -379,6 +514,30 @@ esp_err_t meshpay_ui_backspace(meshpay_ui_state_t *ui)
             ui->text_entry[--ui->text_entry_len] = '\0';
         }
         return ESP_OK;
+    case MESHPAY_UI_SCREEN_CREATE: {
+        meshpay_ui_wizard_t *w = &ui->wizard;
+        if (w->field == 0U) {
+            size_t l = strlen(w->name);
+            if (l > 0) {
+                w->name[l - 1] = '\0';
+            }
+        } else if (w->field == 1U) {
+            size_t l = strlen(w->symbol);
+            if (l > 0) {
+                w->symbol[l - 1] = '\0';
+            }
+        } else if (w->field == 2U) {
+            w->initial_credit /= 10U;
+        } else if (w->field == 3U) {
+            w->max_supply /= 10U;
+        } else if (w->field == 4U) {
+            w->transfer_fee /= 10U;
+        } else {
+            w->demurrage_bps = (uint16_t)(w->demurrage_bps / 10U);
+        }
+        w->pristine = false;
+        return ESP_OK;
+    }
     default:
         return ESP_ERR_INVALID_STATE;
     }
@@ -414,6 +573,12 @@ bool meshpay_ui_confirm_enabled(const meshpay_ui_state_t *ui)
     }
     if (ui->screen == MESHPAY_UI_SCREEN_JOIN) {
         return ui->text_entry_len > 0;
+    }
+    if (ui->screen == MESHPAY_UI_SCREEN_CREATE) {
+        /* Le nom est le seul champ obligatoire ; le reste a des défauts sains.
+         * La validation fine (initial_credit <= max_supply) est faite par
+         * create_currency (D1) qui remonte une erreur affichable. */
+        return ui->wizard.name[0] != '\0';
     }
     return false;
 }
@@ -804,6 +969,51 @@ esp_err_t meshpay_ui_build_view(const meshpay_ui_state_t *ui,
         view_text(view->secondary, "A dicter au nouveau membre");
         add_action(view, MESHPAY_UI_ACTION_HOME, "Accueil");
         break;
+    case MESHPAY_UI_SCREEN_CREATE: {
+        const meshpay_ui_wizard_t *w = &ui->wizard;
+        static const char *const labels[MESHPAY_UI_WIZARD_FIELD_COUNT] = {
+            "Nom", "Symbole", "Credit", "Offre max", "Frais", "Fonte bps"};
+        /* Borné à la valeur la plus longue possible : nom 23 car. ou uint64
+         * (20 chiffres). Laisse la place au préfixe "label: " dans primary (48). */
+        char value[MESHPAY_UI_CURRENCY_NAME_MAX];
+        switch (w->field) {
+        case 0:
+            (void)snprintf(value, sizeof(value), "%s",
+                           w->name[0] != '\0' ? w->name : "(vide)");
+            break;
+        case 1:
+            (void)snprintf(value, sizeof(value), "%s",
+                           w->symbol[0] != '\0' ? w->symbol : "(vide)");
+            break;
+        case 2:
+            (void)snprintf(value, sizeof(value), "%lu",
+                           (unsigned long)w->initial_credit);
+            break;
+        case 3:
+            (void)snprintf(value, sizeof(value), "%llu",
+                           (unsigned long long)w->max_supply);
+            break;
+        case 4:
+            (void)snprintf(value, sizeof(value), "%lu",
+                           (unsigned long)w->transfer_fee);
+            break;
+        default:
+            (void)snprintf(value, sizeof(value), "%u",
+                           (unsigned)w->demurrage_bps);
+            break;
+        }
+        view_text(view->title, "Creer monnaie");
+        (void)snprintf(view->primary, sizeof(view->primary), "%s: %s",
+                       labels[w->field], value);
+        (void)snprintf(view->secondary, sizeof(view->secondary), "Champ %u/%u",
+                       (unsigned)(w->field + 1U),
+                       (unsigned)MESHPAY_UI_WIZARD_FIELD_COUNT);
+        add_action(view, MESHPAY_UI_ACTION_PREV_FIELD, "Prec.");
+        add_action(view, MESHPAY_UI_ACTION_NEXT_FIELD, "Suiv.");
+        add_action(view, MESHPAY_UI_ACTION_CONFIRM, "Creer");
+        add_action(view, MESHPAY_UI_ACTION_HOME, "Annul.");
+        break;
+    }
     default:
         return ESP_ERR_INVALID_ARG;
     }
