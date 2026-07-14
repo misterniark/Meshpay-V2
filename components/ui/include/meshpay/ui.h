@@ -20,7 +20,19 @@ typedef enum {
     MESHPAY_UI_SCREEN_NETWORK,
     MESHPAY_UI_SCREEN_DAG_MONITOR,
     MESHPAY_UI_SCREEN_LOCKED,
+    /* Palier D — création/rejointe de monnaie. */
+    MESHPAY_UI_SCREEN_CURRENCY_MENU, /* sous-menu Creer / Rejoindre / Code */
+    MESHPAY_UI_SCREEN_JOIN,          /* saisie du code d'invitation */
+    MESHPAY_UI_SCREEN_FOUNDER_CODE,  /* affiche le code a dicter */
 } meshpay_ui_screen_t;
+
+/* Palier D — appartenance à une monnaie, poussée depuis l'app (miroir headless
+ * de meshpay_app_join_state_t ; l'UI ne dépend pas d'app_main). */
+typedef enum {
+    MESHPAY_UI_JOIN_IDLE = 0, /* ni membre ni en cours de rejointe */
+    MESHPAY_UI_JOIN_ARMED,    /* rejointe armée, en attente d'OFFER */
+    MESHPAY_UI_JOIN_MEMBER,   /* membre d'une monnaie */
+} meshpay_ui_join_state_t;
 
 typedef enum {
     MESHPAY_UI_FEEDBACK_NONE = 0,
@@ -35,6 +47,10 @@ typedef enum {
 #define MESHPAY_UI_PIN_ENTRY_MAX 16
 #define MESHPAY_UI_TEXT_MAX 48
 #define MESHPAY_UI_ACTION_MAX 4
+/* Palier D : buffers monnaie (UI-locaux, bornés — l'UI ne tire pas
+ * currency_descriptor.h). Le code d'invitation formaté fait 22 car. + '\0'. */
+#define MESHPAY_UI_INVITE_CODE_MAX 24
+#define MESHPAY_UI_CURRENCY_NAME_MAX 24
 #define MESHPAY_UI_ACTION_LABEL_MAX 12
 #define MESHPAY_UI_PEER_LABEL_MAX 32
 #define MESHPAY_UI_ID_LABEL_MAX 16
@@ -97,6 +113,11 @@ typedef enum {
     MESHPAY_UI_ACTION_MONITOR_PEERS,
     MESHPAY_UI_ACTION_MONITOR_ALERTS,
     MESHPAY_UI_ACTION_MONITOR_RADIO,
+    /* Palier D — monnaie. */
+    MESHPAY_UI_ACTION_CURRENCY,  /* ouvre le sous-menu monnaie */
+    MESHPAY_UI_ACTION_CREATE,    /* démarre le wizard de création (D3) */
+    MESHPAY_UI_ACTION_JOIN,      /* va à la saisie du code d'invitation */
+    MESHPAY_UI_ACTION_SHOW_CODE, /* affiche le code d'invitation détenu */
 } meshpay_ui_action_t;
 
 typedef struct {
@@ -119,6 +140,12 @@ typedef struct {
     meshpay_ui_dag_monitor_page_t dag_monitor_page;
     bool has_pin;
     bool pin_locked;
+    /* Palier D — monnaie (poussées par l'app). */
+    meshpay_ui_join_state_t join_state;
+    uint8_t text_entry_len;
+    char text_entry[MESHPAY_UI_TEXT_MAX];               /* saisie code (et nom en D3) */
+    char invite_code[MESHPAY_UI_INVITE_CODE_MAX];       /* code à afficher (fondateur/membre) */
+    char currency_name[MESHPAY_UI_CURRENCY_NAME_MAX];   /* nom de la monnaie détenue */
 } meshpay_ui_state_t;
 
 typedef struct {
@@ -158,6 +185,20 @@ esp_err_t meshpay_ui_set_history_peer(meshpay_ui_state_t *ui,
                                       const char *label);
 esp_err_t meshpay_ui_nav(meshpay_ui_state_t *ui, meshpay_ui_screen_t screen);
 esp_err_t meshpay_ui_input_digit(meshpay_ui_state_t *ui, uint8_t digit);
+/* Palier D — saisie générique d'un caractère (clavier T-Deck ou tactile) :
+ * sur un écran texte (JOIN, wizard) l'ajoute à text_entry ; sur un écran
+ * numérique (SETUP_PIN, PAY) route les chiffres vers input_digit, ignore le
+ * reste. Non bloquant (ESP_OK même si le caractère est ignoré). */
+esp_err_t meshpay_ui_input_char(meshpay_ui_state_t *ui, char c);
+/* Palier D — état d'appartenance monnaie / infos affichables (poussés par l'app). */
+esp_err_t meshpay_ui_set_join_state(meshpay_ui_state_t *ui,
+                                    meshpay_ui_join_state_t state);
+esp_err_t meshpay_ui_set_invite_code(meshpay_ui_state_t *ui, const char *code);
+esp_err_t meshpay_ui_set_currency(meshpay_ui_state_t *ui, const char *name);
+/* Palier D — lit la saisie texte courante (p.ex. le code à passer à arm_join). */
+esp_err_t meshpay_ui_text_entry(const meshpay_ui_state_t *ui,
+                                char *out,
+                                size_t out_len);
 esp_err_t meshpay_ui_backspace(meshpay_ui_state_t *ui);
 esp_err_t meshpay_ui_clear_entry(meshpay_ui_state_t *ui);
 bool meshpay_ui_confirm_enabled(const meshpay_ui_state_t *ui);

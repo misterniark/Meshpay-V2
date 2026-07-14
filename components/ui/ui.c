@@ -89,6 +89,22 @@ static esp_err_t append_amount_digit(meshpay_ui_state_t *ui, uint8_t digit)
     return ESP_OK;
 }
 
+/* Palier D : ajoute un caractère imprimable à la saisie texte (code/nom). Ignore
+ * les caractères de contrôle ; borne à la capacité du buffer. */
+static esp_err_t append_text_char(meshpay_ui_state_t *ui, char c)
+{
+    if (c < 0x20 || c == 0x7f) {
+        return ESP_OK; /* touche de contrôle -> ignorée sans erreur */
+    }
+    if (ui->text_entry_len >= MESHPAY_UI_TEXT_MAX - 1) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    ui->text_entry[ui->text_entry_len++] = c;
+    ui->text_entry[ui->text_entry_len] = '\0';
+    ui->feedback = MESHPAY_UI_FEEDBACK_NONE;
+    return ESP_OK;
+}
+
 void meshpay_ui_init(meshpay_ui_state_t *ui, bool has_pin)
 {
     if (ui == NULL) {
@@ -246,7 +262,7 @@ esp_err_t meshpay_ui_nav(meshpay_ui_state_t *ui, meshpay_ui_screen_t screen)
     if (!ui->has_pin && screen != MESHPAY_UI_SCREEN_SETUP_PIN) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (screen > MESHPAY_UI_SCREEN_LOCKED) {
+    if (screen > MESHPAY_UI_SCREEN_FOUNDER_CODE) {
         return ESP_ERR_INVALID_ARG;
     }
     ui->screen = screen;
@@ -273,6 +289,73 @@ esp_err_t meshpay_ui_input_digit(meshpay_ui_state_t *ui, uint8_t digit)
     }
 }
 
+esp_err_t meshpay_ui_input_char(meshpay_ui_state_t *ui, char c)
+{
+    if (ui == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (ui->pin_locked) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    switch (ui->screen) {
+    case MESHPAY_UI_SCREEN_JOIN:
+        return append_text_char(ui, c); /* saisie texte du code */
+    case MESHPAY_UI_SCREEN_SETUP_PIN:
+    case MESHPAY_UI_SCREEN_PAY:
+        /* Écrans numériques : seuls les chiffres comptent, le reste est ignoré. */
+        if (c >= '0' && c <= '9') {
+            return meshpay_ui_input_digit(ui, (uint8_t)(c - '0'));
+        }
+        return ESP_OK;
+    default:
+        return ESP_OK; /* aucun champ de saisie sur cet écran */
+    }
+}
+
+esp_err_t meshpay_ui_set_join_state(meshpay_ui_state_t *ui,
+                                    meshpay_ui_join_state_t state)
+{
+    if (ui == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ui->join_state = state;
+    return ESP_OK;
+}
+
+esp_err_t meshpay_ui_set_invite_code(meshpay_ui_state_t *ui, const char *code)
+{
+    if (ui == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    (void)snprintf(ui->invite_code, sizeof(ui->invite_code), "%s",
+                   code == NULL ? "" : code);
+    return ESP_OK;
+}
+
+esp_err_t meshpay_ui_set_currency(meshpay_ui_state_t *ui, const char *name)
+{
+    if (ui == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    (void)snprintf(ui->currency_name, sizeof(ui->currency_name), "%s",
+                   name == NULL ? "" : name);
+    return ESP_OK;
+}
+
+esp_err_t meshpay_ui_text_entry(const meshpay_ui_state_t *ui,
+                                char *out,
+                                size_t out_len)
+{
+    if (ui == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (out_len <= ui->text_entry_len) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(out, ui->text_entry, ui->text_entry_len + 1U);
+    return ESP_OK;
+}
+
 esp_err_t meshpay_ui_backspace(meshpay_ui_state_t *ui)
 {
     if (ui == NULL) {
@@ -291,6 +374,11 @@ esp_err_t meshpay_ui_backspace(meshpay_ui_state_t *ui)
     case MESHPAY_UI_SCREEN_PAY:
         ui->draft_amount /= 10U;
         return ESP_OK;
+    case MESHPAY_UI_SCREEN_JOIN:
+        if (ui->text_entry_len > 0) {
+            ui->text_entry[--ui->text_entry_len] = '\0';
+        }
+        return ESP_OK;
     default:
         return ESP_ERR_INVALID_STATE;
     }
@@ -304,6 +392,8 @@ esp_err_t meshpay_ui_clear_entry(meshpay_ui_state_t *ui)
     ui->draft_amount = 0;
     memset(ui->pin_entry, 0, sizeof(ui->pin_entry));
     ui->pin_entry_len = 0;
+    memset(ui->text_entry, 0, sizeof(ui->text_entry));
+    ui->text_entry_len = 0;
     return ESP_OK;
 }
 
@@ -321,6 +411,9 @@ bool meshpay_ui_confirm_enabled(const meshpay_ui_state_t *ui)
     }
     if (ui->screen == MESHPAY_UI_SCREEN_PAY) {
         return ui->draft_amount > 0 && ui->payment_peer_count > 0;
+    }
+    if (ui->screen == MESHPAY_UI_SCREEN_JOIN) {
+        return ui->text_entry_len > 0;
     }
     return false;
 }
@@ -489,6 +582,7 @@ esp_err_t meshpay_ui_build_view(const meshpay_ui_state_t *ui,
                                        ? "En attente"
                                        : "Reticulum actif");
         add_action(view, MESHPAY_UI_ACTION_HOME, "Accueil");
+        add_action(view, MESHPAY_UI_ACTION_CURRENCY, "Monnaie");
         break;
     case MESHPAY_UI_SCREEN_DAG_MONITOR: {
         const meshpay_ui_dag_monitor_status_t *m = &ui->dag_monitor;
@@ -670,6 +764,45 @@ esp_err_t meshpay_ui_build_view(const meshpay_ui_state_t *ui,
         view_text(view->title, "Verrouille");
         view_text(view->primary, "PIN verrouille");
         view_text(view->secondary, "Reinitialisation requise");
+        break;
+    case MESHPAY_UI_SCREEN_CURRENCY_MENU:
+        view_text(view->title, "Monnaie");
+        if (ui->join_state == MESHPAY_UI_JOIN_MEMBER) {
+            view_text(view->primary,
+                      ui->currency_name[0] != '\0' ? ui->currency_name
+                                                   : "Monnaie active");
+            (void)snprintf(view->secondary, sizeof(view->secondary),
+                           "Solde %lu", (unsigned long)ui->balance);
+            add_action(view, MESHPAY_UI_ACTION_SHOW_CODE, "Code");
+            add_action(view, MESHPAY_UI_ACTION_HOME, "Accueil");
+        } else if (ui->join_state == MESHPAY_UI_JOIN_ARMED) {
+            view_text(view->primary, "Rejointe en cours");
+            view_text(view->secondary, "Approcher un pair");
+            add_action(view, MESHPAY_UI_ACTION_HOME, "Accueil");
+        } else {
+            view_text(view->primary, "Creer ou rejoindre");
+            view_text(view->secondary, "Choisir une action");
+            add_action(view, MESHPAY_UI_ACTION_CREATE, "Creer");
+            add_action(view, MESHPAY_UI_ACTION_JOIN, "Rejoindre");
+            add_action(view, MESHPAY_UI_ACTION_HOME, "Accueil");
+        }
+        break;
+    case MESHPAY_UI_SCREEN_JOIN:
+        view_text(view->title, "Rejoindre");
+        view_text(view->primary, "Code d'invitation");
+        view_text(view->secondary,
+                  ui->text_entry_len > 0 ? ui->text_entry : "Saisir le code");
+        add_action(view, MESHPAY_UI_ACTION_CONFIRM, "OK");
+        add_action(view, MESHPAY_UI_ACTION_BACKSPACE, "Effacer");
+        add_action(view, MESHPAY_UI_ACTION_CLEAR, "Vider");
+        add_action(view, MESHPAY_UI_ACTION_HOME, "Accueil");
+        break;
+    case MESHPAY_UI_SCREEN_FOUNDER_CODE:
+        view_text(view->title, "Code monnaie");
+        view_text(view->primary,
+                  ui->invite_code[0] != '\0' ? ui->invite_code : "Indisponible");
+        view_text(view->secondary, "A dicter au nouveau membre");
+        add_action(view, MESHPAY_UI_ACTION_HOME, "Accueil");
         break;
     default:
         return ESP_ERR_INVALID_ARG;

@@ -310,3 +310,129 @@ TEST_CASE("ui locked state rejects user entry", "[ui]")
     TEST_ASSERT_EQUAL_STRING("PIN verrouille", view.primary);
     TEST_ASSERT_EQUAL_UINT8(0, view.action_count);
 }
+
+/* --- Palier D2 : écrans portables création/rejointe/code --- */
+
+static bool view_has_action(const meshpay_ui_view_t *view,
+                            meshpay_ui_action_t action)
+{
+    for (uint8_t i = 0; i < view->action_count; ++i) {
+        if (view->actions[i] == action) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* L'écran JOIN accumule un code texte (input_char), gère backspace/clear et
+ * n'active la confirmation que si la saisie est non vide. */
+TEST_CASE("ui join screen accumulates invite code text", "[ui][d2]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_JOIN));
+    TEST_ASSERT_FALSE(meshpay_ui_confirm_enabled(&ui));
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_input_char(&ui, 'A'));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_input_char(&ui, 'B'));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_input_char(&ui, '7'));
+
+    char out[MESHPAY_UI_TEXT_MAX];
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_text_entry(&ui, out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("AB7", out);
+    TEST_ASSERT_TRUE(meshpay_ui_confirm_enabled(&ui));
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_backspace(&ui));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_text_entry(&ui, out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("AB", out);
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_clear_entry(&ui));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_text_entry(&ui, out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("", out);
+    TEST_ASSERT_FALSE(meshpay_ui_confirm_enabled(&ui));
+
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_EQUAL_STRING("Rejoindre", view.title);
+    TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_CONFIRM));
+}
+
+/* input_char route les chiffres vers la saisie numérique (PIN) et ignore le
+ * reste : un seul chemin clavier pour tous les écrans. */
+TEST_CASE("ui input_char routes digits on numeric screens", "[ui][d2]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, false); /* SETUP_PIN */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_input_char(&ui, '1'));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_input_char(&ui, '2'));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_input_char(&ui, 'x')); /* ignoré */
+
+    char pin[MESHPAY_UI_PIN_ENTRY_MAX + 1];
+    size_t len = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_pin_entry(&ui, pin, sizeof(pin), &len));
+    TEST_ASSERT_EQUAL_STRING("12", pin);
+    TEST_ASSERT_EQUAL_UINT(2, len);
+}
+
+/* Le sous-menu monnaie propose Créer/Rejoindre quand on n'est pas membre. */
+TEST_CASE("ui currency menu offers create or join when idle", "[ui][d2]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_set_join_state(&ui, MESHPAY_UI_JOIN_IDLE));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_CURRENCY_MENU));
+
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_EQUAL_STRING("Monnaie", view.title);
+    TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_CREATE));
+    TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_JOIN));
+    TEST_ASSERT_FALSE(view_has_action(&view, MESHPAY_UI_ACTION_SHOW_CODE));
+}
+
+/* Une fois membre, le sous-menu montre le nom de la monnaie, le solde et l'accès
+ * au code (plus de Créer/Rejoindre). */
+TEST_CASE("ui currency menu shows code and balance when member", "[ui][d2]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_set_join_state(&ui, MESHPAY_UI_JOIN_MEMBER));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_set_currency(&ui, "Minimistan"));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_set_balance(&ui, 250));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_CURRENCY_MENU));
+
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_EQUAL_STRING("Minimistan", view.primary);
+    TEST_ASSERT_EQUAL_STRING("Solde 250", view.secondary);
+    TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_SHOW_CODE));
+    TEST_ASSERT_FALSE(view_has_action(&view, MESHPAY_UI_ACTION_CREATE));
+    TEST_ASSERT_FALSE(view_has_action(&view, MESHPAY_UI_ACTION_JOIN));
+}
+
+/* L'écran code fondateur affiche le code d'invitation détenu. */
+TEST_CASE("ui founder code screen displays the invite code", "[ui][d2]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_ui_set_invite_code(&ui, "ABCD-EFGH-JKMN-PQRS-TV"));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_FOUNDER_CODE));
+
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_EQUAL_STRING("Code monnaie", view.title);
+    TEST_ASSERT_EQUAL_STRING("ABCD-EFGH-JKMN-PQRS-TV", view.primary);
+}
+
+/* L'écran Réseau expose l'entrée vers le sous-menu monnaie. */
+TEST_CASE("ui network screen exposes the currency entry", "[ui][d2]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_NETWORK));
+
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_CURRENCY));
+}
