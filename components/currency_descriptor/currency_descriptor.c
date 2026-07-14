@@ -1,6 +1,7 @@
 #include "meshpay/currency_descriptor.h"
 
 #include "esp_check.h"
+#include "meshpay/rns/rns_destination.h"
 #include <stdbool.h>
 #include <string.h>
 
@@ -567,12 +568,23 @@ esp_err_t meshpay_currency_descriptor_founder_hash(const meshpay_currency_descri
     if (signed_desc == NULL || out_hash == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    /* Recharge l'identité publique du fondateur puis retourne son hash 16 o. */
+    /* L'autorité MINT / le destinataire des frais est le COMPTE WALLET du
+     * fondateur = son hash de destination meshpay.wallet (== son local_destination
+     * runtime), PAS son hash d'identité. Sinon les frais de transfert et une
+     * frappe fondateur future atterrissent sur un compte que le wallet n'interroge
+     * jamais et depuis lequel il ne peut pas dépenser (constat HIGH revue Palier D).
+     * Le hash de destination reste dérivable de founder_public SEUL (nom bien connu
+     * meshpay.wallet) : la propriété « autorité vérifiable à distance » est
+     * préservée, et le currency_id (SHA-256 du corps) est inchangé. */
     rns_identity_t founder;
     ESP_RETURN_ON_ERROR(rns_identity_load_public(&founder,
                                                  signed_desc->body.founder_public),
                         TAG, "");
-    return rns_identity_get_hash(&founder, out_hash);
+    rns_destination_t wallet;
+    ESP_RETURN_ON_ERROR(rns_destination_create_meshpay_wallet(&founder, &wallet),
+                        TAG, "");
+    memcpy(out_hash, wallet.hash, RNS_DESTINATION_HASH_SIZE);
+    return ESP_OK;
 }
 
 /* ======================================================================== */

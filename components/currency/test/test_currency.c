@@ -1,6 +1,7 @@
 #include "meshpay/currency.h"
 #include "meshpay/currency_descriptor.h"
 #include "meshpay/meshpay_tx.h"
+#include "meshpay/rns/rns_destination.h"
 #include "meshpay/rns/rns_identity.h"
 #include "test_pool.h"
 #include "unity.h"
@@ -234,11 +235,14 @@ TEST_CASE("currency derives config from signed descriptor", "[currency]")
     TEST_ASSERT_EQUAL_UINT16(150, config.demurrage_bps);
     TEST_ASSERT_TRUE(config.has_descriptor);
 
-    /* Autorité MINT UNIQUE = hash d'identité du fondateur. */
+    /* Autorité MINT UNIQUE = hash de DESTINATION wallet du fondateur (son compte),
+     * pas son hash d'identité (fix HIGH revue Palier D). */
     TEST_ASSERT_EQUAL_UINT8(1, config.mint_authority_count);
-    uint8_t founder_hash[RNS_IDENTITY_HASH_SIZE];
-    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_get_hash(&founder, founder_hash));
-    TEST_ASSERT_TRUE(meshpay_currency_is_mint_authority(&config, founder_hash));
+    rns_destination_t founder_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&founder, &founder_wallet));
+    TEST_ASSERT_TRUE(meshpay_currency_is_mint_authority(&config,
+                                                        founder_wallet.hash));
 
     /* Clés publiques du fondateur copiées (servent à vérifier les MINT). */
     uint8_t founder_pub[RNS_IDENTITY_PUBLIC_SIZE];
@@ -295,8 +299,11 @@ TEST_CASE("currency accepts founder-signed mint under descriptor", "[currency]")
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_currency_config_from_descriptor(&config, &desc));
 
-    uint8_t founder_hash[MESHPAY_TX_DESTINATION_HASH_SIZE];
-    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_get_hash(&founder, founder_hash));
+    /* Le fondateur frappe depuis SON compte = hash de destination wallet (=
+     * l'autorité MINT), pas depuis son hash d'identité (fix HIGH revue Palier D). */
+    rns_destination_t founder_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&founder, &founder_wallet));
     uint8_t alice[MESHPAY_TX_DESTINATION_HASH_SIZE];
     fill_sequence(alice, sizeof(alice), 0x40);
 
@@ -305,7 +312,7 @@ TEST_CASE("currency accepts founder-signed mint under descriptor", "[currency]")
     /* MINT réellement signé par le fondateur -> accepté. */
     meshpay_tx_t mint;
     TEST_ASSERT_EQUAL(ESP_OK,
-        meshpay_tx_create_mint(&mint, &founder, founder_hash, alice, 1000, 0,
+        meshpay_tx_create_mint(&mint, &founder, founder_wallet.hash, alice, 1000, 0,
                                config.currency_id, NULL, 0, 1000));
     TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
                       meshpay_currency_validate_tx(&config, dag, &mint));
@@ -329,19 +336,21 @@ TEST_CASE("currency rejects mint forged with founder hash but wrong signature", 
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_currency_config_from_descriptor(&config, &desc));
 
-    uint8_t founder_hash[MESHPAY_TX_DESTINATION_HASH_SIZE];
-    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_get_hash(&founder, founder_hash));
+    /* from = compte du fondateur (hash de destination wallet = l'autorité). */
+    rns_destination_t founder_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&founder, &founder_wallet));
     uint8_t alice[MESHPAY_TX_DESTINATION_HASH_SIZE];
     fill_sequence(alice, sizeof(alice), 0x41);
 
     meshpay_dag_t *dag = test_pool_dag(0); /* DAG du pool partagé (slot 0) */
 
-    /* L'attaquant forge un MINT avec from = hash fondateur (public) mais le
+    /* L'attaquant forge un MINT avec from = compte fondateur (public) mais le
      * signe avec SA clé : from passe is_mint_authority, mais la signature ne
      * vérifie pas contre la clé du fondateur -> rejet (la faille est fermée). */
     meshpay_tx_t forged;
     TEST_ASSERT_EQUAL(ESP_OK,
-        meshpay_tx_create_mint(&forged, &attacker, founder_hash, alice, 1000, 0,
+        meshpay_tx_create_mint(&forged, &attacker, founder_wallet.hash, alice, 1000, 0,
                                config.currency_id, NULL, 0, 1000));
     TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_BAD_SIGNATURE,
                       meshpay_currency_validate_tx(&config, dag, &forged));

@@ -126,8 +126,11 @@ esp_err_t meshpay_currency_descriptor_decode(const uint8_t *data,
                                              meshpay_currency_descriptor_signed_t *out_signed);
 
 /*
- * Hash d'identité (16 o) du fondateur = l'AUTORITÉ MINT. Recharge l'identité
- * publique depuis founder_public puis retourne son hash.
+ * Hash de DESTINATION meshpay.wallet (16 o) du fondateur = l'AUTORITÉ MINT ET le
+ * COMPTE WALLET du fondateur (== son local_destination runtime). Recharge
+ * l'identité publique depuis founder_public puis dérive sa destination wallet.
+ * (Ce n'est PAS le hash d'identité : les frais/frappes doivent atterrir sur le
+ * compte que le wallet interroge et depuis lequel il dépense.)
  */
 esp_err_t meshpay_currency_descriptor_founder_hash(const meshpay_currency_descriptor_signed_t *signed_desc,
                                                    uint8_t out_hash[RNS_IDENTITY_HASH_SIZE]);

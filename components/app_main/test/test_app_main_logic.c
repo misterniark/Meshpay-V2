@@ -3,6 +3,7 @@
 #include "meshpay/descriptor_sync.h"
 #include "meshpay/rns/rns_announce.h"
 #include "meshpay/rns/rns_crypto.h"
+#include "meshpay/rns/rns_destination.h"
 #include "meshpay/rns/rns_identity.h"
 #include "meshpay/rns/rns_node.h"
 #include "meshpay/rns/rns_packet_crypto.h"
@@ -1568,11 +1569,12 @@ TEST_CASE("app currency_from_record derives from valid descriptor", "[app_main][
     TEST_ASSERT_TRUE(from_desc);
     TEST_ASSERT_TRUE(out.has_descriptor);
     TEST_ASSERT_EQUAL_UINT64(12345, out.max_supply); /* dérivé, != repli (0) */
-    /* Autorité MINT unique = hash du fondateur. */
-    uint8_t founder_hash[RNS_IDENTITY_HASH_SIZE];
-    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_get_hash(&founder, founder_hash));
+    /* Autorité MINT unique = hash de destination wallet du fondateur. */
+    rns_destination_t founder_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&founder, &founder_wallet));
     TEST_ASSERT_EQUAL_UINT8(1, out.mint_authority_count);
-    TEST_ASSERT_TRUE(meshpay_currency_is_mint_authority(&out, founder_hash));
+    TEST_ASSERT_TRUE(meshpay_currency_is_mint_authority(&out, founder_wallet.hash));
 }
 
 TEST_CASE("app currency_from_record falls back without descriptor", "[app_main][a5]")
@@ -1754,10 +1756,12 @@ TEST_CASE("join nominal via invite code imports descriptor", "[app_main][b4]")
                       meshpay_app_runtime_join_state(&runtime));
     TEST_ASSERT_TRUE(app->currency.has_descriptor);
     TEST_ASSERT_EQUAL_UINT32(signed_desc.currency_id, app->currency.currency_id);
-    uint8_t founder_hash[RNS_IDENTITY_HASH_SIZE];
-    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_get_hash(&founder, founder_hash));
+    rns_destination_t founder_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&founder, &founder_wallet));
     TEST_ASSERT_EQUAL_UINT8(1, app->currency.mint_authority_count);
-    TEST_ASSERT_TRUE(meshpay_currency_is_mint_authority(&app->currency, founder_hash));
+    TEST_ASSERT_TRUE(meshpay_currency_is_mint_authority(&app->currency,
+                                                        founder_wallet.hash));
     TEST_ASSERT_FALSE(runtime.join_armed);
     /* Persisté sur le record DU RUNTIME (celui que persist_wallet_state réécrit). */
     TEST_ASSERT_TRUE(runtime.storage_record.has_currency_descriptor);
@@ -1780,7 +1784,8 @@ TEST_CASE("join nominal via invite code imports descriptor", "[app_main][b4]")
     TEST_ASSERT_TRUE(reloaded_from_desc);
     TEST_ASSERT_EQUAL_UINT32(signed_desc.currency_id, reloaded_cfg.currency_id);
     TEST_ASSERT_EQUAL_UINT64(12345, reloaded_cfg.max_supply);
-    TEST_ASSERT_TRUE(meshpay_currency_is_mint_authority(&reloaded_cfg, founder_hash));
+    TEST_ASSERT_TRUE(meshpay_currency_is_mint_authority(&reloaded_cfg,
+                                                        founder_wallet.hash));
 
     meshpay_app_runtime_destroy(&runtime);
 }
@@ -2639,13 +2644,15 @@ TEST_CASE("create currency makes local device the founder member", "[app_main][d
     TEST_ASSERT_EQUAL_UINT32(2, app->currency.transfer_fee);
     TEST_ASSERT_EQUAL_UINT32(250, app->currency.initial_credit);
 
-    /* Autorité MINT unique = hash de l'identité du fondateur (0x50). */
+    /* Autorité MINT unique = hash de destination wallet du fondateur (identité
+     * 0x50) — son compte, pas son hash d'identité (fix HIGH revue Palier D). */
     rns_identity_t self;
     load_identity(&self, 0x50);
-    uint8_t founder_hash[MESHPAY_TX_DESTINATION_HASH_SIZE];
-    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_get_hash(&self, founder_hash));
+    rns_destination_t founder_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&self, &founder_wallet));
     TEST_ASSERT_TRUE(meshpay_currency_is_mint_authority(&app->currency,
-                                                        founder_hash));
+                                                        founder_wallet.hash));
 
     /* Auto-crédité de initial_credit (une CLAIM réflexive dans le DAG). */
     uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
@@ -2724,6 +2731,32 @@ TEST_CASE("create currency with zero initial credit skips the claim", "[app_main
                       meshpay_app_runtime_create_currency(&runtime, &params, 1000));
     TEST_ASSERT_TRUE(app->currency.has_descriptor); /* fondateur quand même */
     TEST_ASSERT_EQUAL_UINT32(0, meshpay_dag_count(&app->dag)); /* aucune CLAIM */
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* Les params sont validés AVANT la signature irréversible : crédit > plafond ou
+ * nom vide -> rejet, aucun descripteur créé (constat MEDIUM revue Palier D). */
+TEST_CASE("create currency rejects invalid params before signing", "[app_main][d1]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock);
+
+    meshpay_app_currency_params_t params;
+    default_currency_params(&params);
+    params.max_supply = 100;
+    params.initial_credit = 250; /* > plafond */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_app_runtime_create_currency(&runtime, &params, 1000));
+    TEST_ASSERT_FALSE(app->currency.has_descriptor);
+
+    default_currency_params(&params);
+    params.name[0] = '\0'; /* nom vide */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_app_runtime_create_currency(&runtime, &params, 1000));
+    TEST_ASSERT_FALSE(app->currency.has_descriptor);
 
     meshpay_app_runtime_destroy(&runtime);
 }

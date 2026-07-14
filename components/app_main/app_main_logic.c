@@ -1467,6 +1467,17 @@ static esp_err_t create_currency_locked(meshpay_app_runtime_t *runtime,
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Validation des params AVANT la signature IRRÉVERSIBLE (le descripteur signé
+     * fige les règles) : un nom vide n'a pas de sens, et un crédit initial
+     * supérieur au plafond produirait une CLAIM systématiquement refusée
+     * (fondateur créé sans crédit, silencieusement). Rejet explicite. */
+    if (params->name[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (params->max_supply > 0 && params->initial_credit > params->max_supply) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     /* Corps du descripteur depuis les params fondateur. founder_public et le
      * genesis/currency_id sont renseignés par sign() ; name/symbol sont bornés et
      * null-terminés (le corps est remis à zéro par init). */
