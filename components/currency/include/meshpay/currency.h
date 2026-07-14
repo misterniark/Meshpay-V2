@@ -23,12 +23,14 @@ typedef enum {
     MESHPAY_CURRENCY_ERR_BAD_FEE,
     MESHPAY_CURRENCY_ERR_INSUFFICIENT,
     MESHPAY_CURRENCY_ERR_BAD_SIGNATURE,
+    MESHPAY_CURRENCY_ERR_BAD_AMOUNT, /* CLAIM dont amount != initial_credit */
 } meshpay_currency_result_t;
 
 typedef struct {
     uint32_t currency_id;
     uint64_t max_supply;
     uint32_t transfer_fee;
+    uint32_t initial_credit; /* Palier C — crédit auto-frappé une fois par un nouveau membre (CLAIM) */
     uint8_t mint_authorities[MESHPAY_CURRENCY_MAX_MINT_AUTHORITIES]
                             [MESHPAY_TX_DESTINATION_HASH_SIZE];
     uint8_t mint_authority_count;

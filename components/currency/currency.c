@@ -87,6 +87,7 @@ esp_err_t meshpay_currency_config_from_descriptor(
     meshpay_currency_config_init(config, descriptor->currency_id);
     config->max_supply = descriptor->body.max_supply;
     config->transfer_fee = descriptor->body.transfer_fee;
+    config->initial_credit = descriptor->body.initial_credit;
     config->demurrage_enabled = descriptor->body.demurrage_enabled;
     config->demurrage_bps = descriptor->body.demurrage_bps;
 
@@ -116,12 +117,24 @@ esp_err_t meshpay_currency_total_minted(
     uint64_t total = 0;
     for (size_t i = 0; i < meshpay_dag_count(dag); ++i) {
         const meshpay_tx_t *tx = meshpay_dag_at(dag, i);
-        if (tx == NULL || tx->currency_id != config->currency_id ||
-            tx->type != MESHPAY_TX_TYPE_MINT ||
-            !meshpay_currency_is_mint_authority(config, tx->from)) {
+        if (tx == NULL || tx->currency_id != config->currency_id) {
             continue;
         }
-        total += tx->amount;
+        /* Offre créée = MINT frappé par une autorité + CLAIM (crédit initial
+         * auto-frappé par un membre, réflexif from==to). Les deux comptent dans
+         * total_minted, donc dans le plafond max_supply. */
+        if (tx->type == MESHPAY_TX_TYPE_MINT &&
+            meshpay_currency_is_mint_authority(config, tx->from)) {
+            total += tx->amount;
+        } else if (tx->type == MESHPAY_TX_TYPE_CLAIM &&
+                   account_equal(tx->from, tx->to) &&
+                   tx->amount == config->initial_credit) {
+            /* Défense en profondeur : ne compter une CLAIM que si son montant est
+             * EXACTEMENT le crédit initial (analogue au gate is_mint_authority du
+             * MINT). Une CLAIM forgée à montant arbitraire, injectée via la sync
+             * sans passer par validate_tx, est ainsi neutralisée comptablement. */
+            total += tx->amount;
+        }
     }
     *total_minted = total;
     return ESP_OK;
@@ -151,6 +164,20 @@ esp_err_t meshpay_currency_get_balance(
         if (tx->type == MESHPAY_TX_TYPE_MINT) {
             if (meshpay_currency_is_mint_authority(config, tx->from) &&
                 account_equal(tx->to, account)) {
+                acc += tx->amount;
+            }
+            continue;
+        }
+
+        if (tx->type == MESHPAY_TX_TYPE_CLAIM) {
+            /* Crédit initial réflexif (from == to == membre) : pur crédit du
+             * membre, comme un MINT, sans débit. DÉFENSE EN PROFONDEUR : on ne
+             * crédite QUE si le montant vaut EXACTEMENT initial_credit — une CLAIM
+             * forgée à montant arbitraire (chemin de sync non validé) crédite 0,
+             * exactement comme un MINT forgé d'un non-autorité (gate ci-dessus). */
+            if (account_equal(tx->from, tx->to) &&
+                account_equal(tx->to, account) &&
+                tx->amount == config->initial_credit) {
                 acc += tx->amount;
             }
             continue;
@@ -214,6 +241,34 @@ meshpay_currency_result_t meshpay_currency_validate_tx(
             }
         }
 
+        if (config->max_supply > 0) {
+            uint64_t total = 0;
+            if (meshpay_currency_total_minted(config, dag, &total) != ESP_OK) {
+                return MESHPAY_CURRENCY_ERR_INVALID;
+            }
+            if (total + tx->amount > config->max_supply) {
+                return MESHPAY_CURRENCY_ERR_SUPPLY_EXCEEDED;
+            }
+        }
+        return MESHPAY_CURRENCY_OK;
+    }
+
+    if (tx->type == MESHPAY_TX_TYPE_CLAIM) {
+        /* CLAIM = crédit initial réflexif auto-frappé par un membre.
+         * from == to == membre : invariant garanti par meshpay_tx, revérifié
+         * ici en défense en profondeur. */
+        if (!account_equal(tx->from, tx->to)) {
+            return MESHPAY_CURRENCY_ERR_INVALID;
+        }
+        /* Montant EXACT = crédit initial figé dans le corps signé du descripteur.
+         * Autorisation UNIVERSELLE : tout membre détenant le descripteur peut
+         * réclamer une fois. Contrairement au MINT, PAS de vérif de la clé
+         * fondateur — la signature du membre est vérifiée à l'ingestion (comme
+         * un TRANSFER), pas ici. L'anti-inflation repose entièrement sur le
+         * plafond max_supply + l'unicité (from, seq==0) du DAG. */
+        if (tx->amount != config->initial_credit) {
+            return MESHPAY_CURRENCY_ERR_BAD_AMOUNT;
+        }
         if (config->max_supply > 0) {
             uint64_t total = 0;
             if (meshpay_currency_total_minted(config, dag, &total) != ESP_OK) {

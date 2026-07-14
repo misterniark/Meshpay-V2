@@ -371,3 +371,179 @@ TEST_CASE("currency without descriptor does not require mint signature", "[curre
     TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
                       meshpay_currency_validate_tx(&config, dag, &mint));
 }
+
+/* --- Palier C2 : validation & solde du crédit initial (CLAIM) --- */
+
+/* Une CLAIM réflexive au montant EXACT du crédit initial est acceptée, crédite
+ * le membre et est comptée dans l'offre. Couvre « CLAIM crédite » + « solde
+ * reflète le crédit » + « comptée dans total_minted ». */
+TEST_CASE("currency accepts reflexive claim and credits initial credit", "[currency][c2]")
+{
+    rns_identity_t founder;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(&founder));
+
+    meshpay_currency_descriptor_t body;
+    fill_descriptor_body(&body); /* initial_credit = 100, max_supply = 50000 */
+    meshpay_currency_descriptor_signed_t desc;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_sign(&desc, &body, &founder));
+
+    meshpay_currency_config_t config;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_config_from_descriptor(&config, &desc));
+    TEST_ASSERT_EQUAL_UINT32(100, config.initial_credit);
+
+    /* Membre M (≠ fondateur), signature factice : validate_tx ne vérifie pas la
+     * signature membre (comme un TRANSFER). */
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(member, sizeof(member), 0x40);
+
+    meshpay_dag_t *dag = test_pool_dag(0);
+
+    meshpay_tx_t claim;
+    make_tx(&claim, MESHPAY_TX_TYPE_CLAIM, 0x60,
+            member, member, 100, 0, 0, config.currency_id, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
+                      meshpay_currency_validate_tx(&config, dag, &claim));
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &claim));
+
+    uint32_t balance = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&config, dag,
+                                                           member, &balance));
+    TEST_ASSERT_EQUAL_UINT32(100, balance);
+
+    uint64_t total = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_total_minted(&config, dag, &total));
+    TEST_ASSERT_EQUAL_UINT64(100, total);
+}
+
+/* Le montant doit être EXACTEMENT initial_credit : un montant arbitraire est
+ * rejeté (BAD_AMOUNT). */
+TEST_CASE("currency rejects claim with wrong amount", "[currency][c2]")
+{
+    rns_identity_t founder;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(&founder));
+    meshpay_currency_descriptor_t body;
+    fill_descriptor_body(&body); /* initial_credit = 100 */
+    meshpay_currency_descriptor_signed_t desc;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_sign(&desc, &body, &founder));
+    meshpay_currency_config_t config;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_config_from_descriptor(&config, &desc));
+
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(member, sizeof(member), 0x41);
+    meshpay_dag_t *dag = test_pool_dag(0);
+
+    meshpay_tx_t claim; /* 101 != initial_credit 100 */
+    make_tx(&claim, MESHPAY_TX_TYPE_CLAIM, 0x61,
+            member, member, 101, 0, 0, config.currency_id, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_BAD_AMOUNT,
+                      meshpay_currency_validate_tx(&config, dag, &claim));
+}
+
+/* La CLAIM est bornée par max_supply : si l'offre déjà frappée + le crédit
+ * dépasse le plafond, elle est rejetée (SUPPLY_EXCEEDED). */
+TEST_CASE("currency rejects claim exceeding max supply", "[currency][c2]")
+{
+    uint8_t founder_hash[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(founder_hash, sizeof(founder_hash), 0x10);
+    fill_sequence(member, sizeof(member), 0x42);
+
+    meshpay_currency_config_t config;
+    meshpay_currency_config_init(&config, 0x4d505632);
+    config.max_supply = 150;
+    config.initial_credit = 100;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_add_mint_authority(&config, founder_hash));
+
+    meshpay_dag_t *dag = test_pool_dag(0);
+
+    /* MINT initial de 100 (fondateur) -> total_minted = 100. */
+    meshpay_tx_t mint;
+    make_tx(&mint, MESHPAY_TX_TYPE_MINT, 0x20,
+            founder_hash, member, 100, 0, 0, config.currency_id, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
+                      meshpay_currency_validate_tx(&config, dag, &mint));
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &mint));
+
+    /* CLAIM 100 (montant correct) mais 100 + 100 = 200 > 150 -> rejet. */
+    meshpay_tx_t claim;
+    make_tx(&claim, MESHPAY_TX_TYPE_CLAIM, 0x62,
+            member, member, 100, 0, 0, config.currency_id, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_SUPPLY_EXCEEDED,
+                      meshpay_currency_validate_tx(&config, dag, &claim));
+}
+
+/* Défense en profondeur (constat #1/#3 de la revue) : une CLAIM au montant FORGÉ
+ * (!= initial_credit) mergée dans le DAG SANS passer par validate_tx — comme le
+ * ferait le chemin de sync (apply_batch) — doit être IGNORÉE par la comptabilité
+ * (solde ET total_minted), sinon inflation arbitraire à l'ingestion. */
+TEST_CASE("currency balance ignores a forged claim amount", "[currency][c2]")
+{
+    rns_identity_t founder;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(&founder));
+    meshpay_currency_descriptor_t body;
+    fill_descriptor_body(&body); /* initial_credit = 100 */
+    meshpay_currency_descriptor_signed_t desc;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_sign(&desc, &body, &founder));
+    meshpay_currency_config_t config;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_config_from_descriptor(&config, &desc));
+
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(member, sizeof(member), 0x44);
+    meshpay_dag_t *dag = test_pool_dag(0);
+
+    /* CLAIM forgée à 999 (!= 100), mergée directement (bypass validate_tx). */
+    meshpay_tx_t forged;
+    make_tx(&forged, MESHPAY_TX_TYPE_CLAIM, 0x64,
+            member, member, 999, 0, 0, config.currency_id, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &forged));
+
+    uint32_t balance = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&config, dag,
+                                                           member, &balance));
+    TEST_ASSERT_EQUAL_UINT32(0, balance); /* montant forgé ignoré */
+
+    uint64_t total = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_total_minted(&config, dag, &total));
+    TEST_ASSERT_EQUAL_UINT64(0, total); /* pas d'inflation comptable */
+}
+
+/* Autorisation UNIVERSELLE : une CLAIM d'un membre qui n'est PAS le fondateur
+ * est acceptée, même sous descripteur (has_descriptor=true). Prouve que la CLAIM
+ * ne passe PAS par la vérif de clé fondateur (inconditionnelle pour un MINT). */
+TEST_CASE("currency accepts claim from non founder without founder check", "[currency][c2]")
+{
+    rns_identity_t founder;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(&founder));
+    meshpay_currency_descriptor_t body;
+    fill_descriptor_body(&body); /* initial_credit = 100 */
+    meshpay_currency_descriptor_signed_t desc;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_sign(&desc, &body, &founder));
+    meshpay_currency_config_t config;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_config_from_descriptor(&config, &desc));
+    TEST_ASSERT_TRUE(config.has_descriptor);
+
+    /* Membre quelconque, distinct de l'autorité MINT, signature factice. */
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(member, sizeof(member), 0x43);
+    TEST_ASSERT_FALSE(meshpay_currency_is_mint_authority(&config, member));
+
+    meshpay_dag_t *dag = test_pool_dag(0);
+
+    meshpay_tx_t claim;
+    make_tx(&claim, MESHPAY_TX_TYPE_CLAIM, 0x63,
+            member, member, 100, 0, 0, config.currency_id, NULL, 0);
+    /* Un MINT ainsi forgé (from non-autorité) serait NOT_AUTHORITY ; une CLAIM
+     * signée par un non-fondateur est OK (pas de vérif fondateur, signature
+     * membre vérifiée à l'ingestion). */
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
+                      meshpay_currency_validate_tx(&config, dag, &claim));
+}
