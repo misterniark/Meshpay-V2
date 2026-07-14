@@ -34,7 +34,8 @@ static bool tx_shape_valid(const meshpay_tx_t *tx)
         return false;
     }
     if (tx->type != MESHPAY_TX_TYPE_TRANSFER &&
-        tx->type != MESHPAY_TX_TYPE_MINT) {
+        tx->type != MESHPAY_TX_TYPE_MINT &&
+        tx->type != MESHPAY_TX_TYPE_CLAIM) {
         return false;
     }
     if (bytes_zero(tx->id, sizeof(tx->id)) ||
@@ -50,6 +51,19 @@ static bool tx_shape_valid(const meshpay_tx_t *tx)
     }
     if (tx->type == MESHPAY_TX_TYPE_MINT && tx->fee != 0) {
         return false;
+    }
+    if (tx->type == MESHPAY_TX_TYPE_CLAIM) {
+        /* CLAIM = crédit initial réflexif : from == to == membre, pas de frais,
+         * et seq == 0 RÉSERVÉ (pivot de l'unicité (from, 0) exploitée plus bas
+         * par le conflit de merge). Ce contrôle est une défense en profondeur au
+         * niveau DAG, indépendante de la validation meshpay_tx : le DAG garantit
+         * lui-même que toute CLAIM acceptée porte seq==0, sinon un membre pourrait
+         * forger deux CLAIM non conflictuelles et se créditer deux fois. */
+        if (tx->fee != 0 ||
+            !account_equal(tx->from, tx->to) ||
+            tx->seq != 0) {
+            return false;
+        }
     }
     return true;
 }
@@ -132,7 +146,15 @@ meshpay_dag_merge_result_t meshpay_dag_validate_merge(const meshpay_dag_t *dag,
 
     for (size_t i = 0; i < dag->count; ++i) {
         const meshpay_tx_t *candidate = &dag->transactions[i];
+        /* Conflit d'unicité (double-dépense / réclamation) SCOPÉ PAR MONNAIE : le
+         * seq est un compteur PAR REGISTRE (currency_id), pas global. Sans ce
+         * scope, le boot-credit MINT réflexif legacy (from==moi, seq==0,
+         * currency_id de repli) entrerait en conflit avec la CLAIM de crédit
+         * initial (from==moi, seq==0, currency_id de la monnaie rejointe) et le
+         * membre ne recevrait jamais son crédit. Deux registres distincts peuvent
+         * légitimement réutiliser un même (from, seq). */
         if (candidate->seq == tx->seq &&
+            candidate->currency_id == tx->currency_id &&
             account_equal(candidate->from, tx->from) &&
             !id_equal(candidate->id, tx->id)) {
             if (existing != NULL) {

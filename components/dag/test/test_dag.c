@@ -207,3 +207,130 @@ TEST_CASE("dag digest of empty dag is deterministic", "[dag]")
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(a, d2));
     TEST_ASSERT_EQUAL_MEMORY(d1, d2, RNS_CRYPTO_SHA256_SIZE);
 }
+
+/* --- Palier C3 : la CLAIM (crédit initial réflexif) dans le DAG --- */
+
+/* Le DAG accepte une CLAIM bien formée (from==to, fee==0, seq==0, 0 parent =
+ * genesis local) ET rejette une 2e CLAIM du MÊME membre : même (from, seq==0),
+ * id différent -> CONFLICT. C'est le pivot « une réclamation par membre ». */
+TEST_CASE("dag accepts claim and rejects second claim from same member", "[dag][c3]")
+{
+    meshpay_dag_t *dag = test_pool_dag(0);
+
+    meshpay_tx_t claim1;
+    make_tx(&claim1, MESHPAY_TX_TYPE_CLAIM, 0x60, 0x30, 0x30,
+            0, 100, 500, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &claim1));
+    TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(dag));
+
+    /* 2e CLAIM du même membre (même from=0x30, seq=0) mais id différent. */
+    meshpay_tx_t claim2;
+    make_tx(&claim2, MESHPAY_TX_TYPE_CLAIM, 0x90, 0x30, 0x30,
+            0, 100, 501, NULL, 0);
+    const meshpay_tx_t *existing = NULL;
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_CONFLICT,
+                      meshpay_dag_validate_merge(dag, &claim2, &existing));
+    TEST_ASSERT_NOT_NULL(existing);
+    TEST_ASSERT_EQUAL_MEMORY(claim1.id, existing->id, MESHPAY_TX_ID_SIZE);
+    /* Le merge effectif renvoie aussi CONFLICT et laisse le compte inchangé. */
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_CONFLICT,
+                      meshpay_dag_merge_tx(dag, &claim2));
+    TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(dag));
+}
+
+/* Les CLAIM de membres DIFFÉRENTS coexistent : même seq==0 mais from distincts
+ * -> pas de conflit. */
+TEST_CASE("dag lets claims from different members coexist", "[dag][c3]")
+{
+    meshpay_dag_t *dag = test_pool_dag(0);
+
+    meshpay_tx_t claim_b;
+    meshpay_tx_t claim_c;
+    make_tx(&claim_b, MESHPAY_TX_TYPE_CLAIM, 0x61, 0x30, 0x30, 0, 100, 500, NULL, 0);
+    make_tx(&claim_c, MESHPAY_TX_TYPE_CLAIM, 0x91, 0x50, 0x50, 0, 100, 501, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &claim_b));
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &claim_c));
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(dag));
+}
+
+/* Convergence : deux CLAIM de membres différents mergées dans des ORDRES opposés
+ * donnent le même digest (elles commutent). */
+TEST_CASE("dag digest converges regardless of claim merge order", "[dag][c3]")
+{
+    meshpay_dag_t *a = test_pool_dag(0);
+    meshpay_dag_t *b = test_pool_dag(1);
+
+    meshpay_tx_t claim_b;
+    meshpay_tx_t claim_c;
+    make_tx(&claim_b, MESHPAY_TX_TYPE_CLAIM, 0x62, 0x30, 0x30, 0, 100, 500, NULL, 0);
+    make_tx(&claim_c, MESHPAY_TX_TYPE_CLAIM, 0x92, 0x50, 0x50, 0, 100, 501, NULL, 0);
+
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(a, &claim_b));
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(a, &claim_c));
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(b, &claim_c));
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(b, &claim_b));
+
+    uint8_t da[RNS_CRYPTO_SHA256_SIZE];
+    uint8_t db[RNS_CRYPTO_SHA256_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(a, da));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(b, db));
+    TEST_ASSERT_EQUAL_MEMORY(da, db, RNS_CRYPTO_SHA256_SIZE);
+}
+
+/* Le conflit (from, seq) est SCOPÉ PAR currency_id : le boot-credit MINT legacy
+ * (from=X, seq=0, cur=1) et la CLAIM de crédit initial (from=X, seq=0, cur=2)
+ * coexistent — sinon le membre ne recevrait jamais son crédit (constat critique
+ * #2 de la revue). Deux registres distincts réutilisent (from, seq==0). */
+TEST_CASE("dag scopes the from/seq conflict by currency", "[dag][c3]")
+{
+    meshpay_dag_t *dag = test_pool_dag(0);
+
+    /* MINT réflexif legacy dans la monnaie de repli (cur=1). */
+    meshpay_tx_t legacy_mint;
+    make_tx(&legacy_mint, MESHPAY_TX_TYPE_MINT, 0x66, 0x30, 0x30, 0, 500, 100, NULL, 0);
+    legacy_mint.currency_id = 1;
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &legacy_mint));
+
+    /* CLAIM du même membre, même seq==0, mais AUTRE monnaie (cur=2) -> pas de
+     * conflit grâce au scope par currency_id. */
+    meshpay_tx_t claim;
+    make_tx(&claim, MESHPAY_TX_TYPE_CLAIM, 0x96, 0x30, 0x30, 0, 250, 101, NULL, 0);
+    claim.currency_id = 2;
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &claim));
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(dag));
+
+    /* Contrôle : une 2e CLAIM même membre / MÊME monnaie (cur=2) conflit bien. */
+    meshpay_tx_t claim_dup;
+    make_tx(&claim_dup, MESHPAY_TX_TYPE_CLAIM, 0xA6, 0x30, 0x30, 0, 250, 102, NULL, 0);
+    claim_dup.currency_id = 2;
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_CONFLICT, meshpay_dag_merge_tx(dag, &claim_dup));
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(dag));
+}
+
+/* Le DAG rejette une CLAIM MAL FORMÉE (défense en profondeur, indépendante de
+ * meshpay_tx) : from!=to, seq!=0 (réservé), ou fee!=0 -> INVALID. */
+TEST_CASE("dag rejects malformed claim shape", "[dag][c3]")
+{
+    meshpay_dag_t *dag = test_pool_dag(0);
+
+    /* from != to : viole la réflexivité. */
+    meshpay_tx_t bad_reflexive;
+    make_tx(&bad_reflexive, MESHPAY_TX_TYPE_CLAIM, 0x63, 0x30, 0x50, 0, 100, 500, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_INVALID,
+                      meshpay_dag_merge_tx(dag, &bad_reflexive));
+
+    /* seq != 0 : casserait l'unicité (from, 0). */
+    meshpay_tx_t bad_seq;
+    make_tx(&bad_seq, MESHPAY_TX_TYPE_CLAIM, 0x64, 0x30, 0x30, 1, 100, 500, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_INVALID,
+                      meshpay_dag_merge_tx(dag, &bad_seq));
+
+    /* fee != 0 : une CLAIM ne porte pas de frais. */
+    meshpay_tx_t bad_fee;
+    make_tx(&bad_fee, MESHPAY_TX_TYPE_CLAIM, 0x65, 0x30, 0x30, 0, 100, 500, NULL, 0);
+    bad_fee.fee = 5;
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_INVALID,
+                      meshpay_dag_merge_tx(dag, &bad_fee));
+
+    TEST_ASSERT_EQUAL_UINT32(0, meshpay_dag_count(dag));
+}
