@@ -1446,6 +1446,83 @@ esp_err_t meshpay_app_runtime_claim_initial_credit(meshpay_app_runtime_t *runtim
 }
 
 /*
+ * Palier D1 — création de monnaie côté fondateur. PRÉ-REQUIS : lock déjà tenu.
+ * Réutilise le chemin d'import (persistance canonique + rollback atomique) et le
+ * chemin de crédit initial (CLAIM déterministe), pour ne pas dupliquer ces
+ * invariants sensibles.
+ */
+static esp_err_t create_currency_locked(meshpay_app_runtime_t *runtime,
+                                        const meshpay_app_currency_params_t *params,
+                                        uint64_t now_ms)
+{
+    meshpay_app_t *app = runtime->app;
+
+    /* Mono-monnaie STRICT : on ne crée pas si l'on est déjà membre d'une monnaie. */
+    if (app->currency.has_descriptor) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* Sans storage, la monnaie créée ne survivrait pas au reboot -> refus (comme
+     * l'import d'une rejointe). */
+    if (!runtime->has_storage) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Corps du descripteur depuis les params fondateur. founder_public et le
+     * genesis/currency_id sont renseignés par sign() ; name/symbol sont bornés et
+     * null-terminés (le corps est remis à zéro par init). */
+    meshpay_currency_descriptor_t body;
+    meshpay_currency_descriptor_init(&body);
+    strncpy(body.name, params->name, sizeof(body.name) - 1);
+    strncpy(body.symbol, params->symbol, sizeof(body.symbol) - 1);
+    body.max_supply = params->max_supply;
+    body.transfer_fee = params->transfer_fee;
+    body.initial_credit = params->initial_credit;
+    body.demurrage_enabled = params->demurrage_enabled;
+    body.demurrage_bps = params->demurrage_bps;
+    body.created_at_ms = now_ms;
+
+    /* Signe avec l'identité locale : cette identité DEVIENT le fondateur. */
+    meshpay_currency_descriptor_signed_t signed_desc;
+    ESP_RETURN_ON_ERROR(
+        meshpay_currency_descriptor_sign(&signed_desc, &body, &app->identity),
+        APP_RUNTIME_TAG, "");
+
+    /* Persiste le blob + applique la config EN PLACE (devient fondateur-membre).
+     * Même chemin atomique que l'import d'une rejointe. */
+    ESP_RETURN_ON_ERROR(
+        runtime_import_currency_descriptor(runtime, &signed_desc),
+        APP_RUNTIME_TAG, "");
+
+    /* Le fondateur est aussi un membre : il s'auto-crédite le crédit initial
+     * (best-effort, comme à la rejointe ; un plafond trop petit ne fait pas
+     * échouer la création). */
+    (void)runtime_claim_initial_credit_locked(runtime, now_ms);
+    (void)runtime_refresh_balance(runtime, now_ms);
+    ESP_LOGI(APP_RUNTIME_TAG,
+             "monnaie creee currency_id=%08x initial_credit=%u",
+             (unsigned)app->currency.currency_id,
+             (unsigned)app->currency.initial_credit);
+    return ESP_OK;
+}
+
+esp_err_t meshpay_app_runtime_create_currency(
+    meshpay_app_runtime_t *runtime,
+    const meshpay_app_currency_params_t *params,
+    uint64_t now_ms)
+{
+    if (runtime == NULL || runtime->app == NULL || runtime->lock == NULL ||
+        params == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(runtime->lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = create_currency_locked(runtime, params, now_ms);
+    xSemaphoreGive(runtime->lock);
+    return err;
+}
+
+/*
  * Palier B4 — traite un OFFER de descripteur reçu (data[0] == 0x34). Séquence
  * stricte : idempotence (déjà membre) -> armé ? -> parse -> matches_anchor ->
  * verify -> import. Tout rejet est NON DESTRUCTIF et NON BLOQUANT (log + ESP_OK)

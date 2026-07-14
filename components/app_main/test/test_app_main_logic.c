@@ -2598,3 +2598,132 @@ TEST_CASE("initial credit claim id is deterministic regardless of now_ms",
     meshpay_app_runtime_destroy(&runtime_a);
     meshpay_app_runtime_destroy(&runtime_b);
 }
+
+/* --- Palier D1 : création de monnaie côté fondateur (API runtime) --- */
+
+/* Paramètres fondateur par défaut (le wizard UI pré-remplira ce genre de valeurs). */
+static void default_currency_params(meshpay_app_currency_params_t *p)
+{
+    memset(p, 0, sizeof(*p));
+    strncpy(p->name, "Testcoin", sizeof(p->name) - 1);
+    strncpy(p->symbol, "TST", sizeof(p->symbol) - 1);
+    p->max_supply = 10000;
+    p->transfer_fee = 2;
+    p->initial_credit = 250;
+    p->demurrage_enabled = false;
+    p->demurrage_bps = 0;
+}
+
+/* Nominal : un device non-membre crée une monnaie -> devient fondateur-membre
+ * (config dérivée du descripteur signé, autorité MINT = son identité), s'auto-
+ * crédite le crédit initial (CLAIM), et peut afficher un code d'invitation. */
+TEST_CASE("create currency makes local device the founder member", "[app_main][d1]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock); /* non-membre (repli) */
+    TEST_ASSERT_FALSE(app->currency.has_descriptor);
+
+    meshpay_app_currency_params_t params;
+    default_currency_params(&params);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_create_currency(&runtime, &params, 1000));
+
+    /* Fondateur-membre : config dérivée du descripteur. */
+    TEST_ASSERT_TRUE(app->currency.has_descriptor);
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_MEMBER,
+                      meshpay_app_runtime_join_state(&runtime));
+    TEST_ASSERT_NOT_EQUAL(0, app->currency.currency_id);
+    TEST_ASSERT_EQUAL_UINT64(10000, app->currency.max_supply);
+    TEST_ASSERT_EQUAL_UINT32(2, app->currency.transfer_fee);
+    TEST_ASSERT_EQUAL_UINT32(250, app->currency.initial_credit);
+
+    /* Autorité MINT unique = hash de l'identité du fondateur (0x50). */
+    rns_identity_t self;
+    load_identity(&self, 0x50);
+    uint8_t founder_hash[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_get_hash(&self, founder_hash));
+    TEST_ASSERT_TRUE(meshpay_currency_is_mint_authority(&app->currency,
+                                                        founder_hash));
+
+    /* Auto-crédité de initial_credit (une CLAIM réflexive dans le DAG). */
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(member, sizeof(member), 0x50); /* local_destination */
+    uint32_t balance = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&app->currency,
+                                                           &app->dag, member,
+                                                           &balance));
+    TEST_ASSERT_EQUAL_UINT32(250, balance);
+    TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(&app->dag));
+
+    /* Le fondateur peut exposer son code d'invitation (descripteur persisté). */
+    char code[MESHPAY_CURRENCY_INVITE_CODE_BUF];
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_invite_code(&runtime, code,
+                                                              sizeof(code)));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* Mono-monnaie STRICT : une 2e création est refusée une fois membre. */
+TEST_CASE("create currency refuses when already a member", "[app_main][d1]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock);
+
+    meshpay_app_currency_params_t params;
+    default_currency_params(&params);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_create_currency(&runtime, &params, 1000));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_app_runtime_create_currency(&runtime, &params, 2000));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* Sans storage, une monnaie créée ne survivrait pas au reboot -> refus, sans
+ * altérer l'état (reste non-membre). */
+TEST_CASE("create currency refuses without a storage backend", "[app_main][d1]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    uint8_t me[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(me, sizeof(me), 0x50);
+    rns_identity_t self;
+    load_identity(&self, 0x50);
+    meshpay_currency_config_t config;
+    meshpay_currency_config_init(&config, 1);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app, me, &self, &config, 1, true));
+
+    meshpay_app_runtime_t runtime;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(&runtime, app, NULL));
+    /* pas de set_storage -> has_storage == false */
+
+    meshpay_app_currency_params_t params;
+    default_currency_params(&params);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_app_runtime_create_currency(&runtime, &params, 1000));
+    TEST_ASSERT_FALSE(app->currency.has_descriptor);
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* Crédit initial nul : le fondateur est bien créé mais ne s'auto-crédite rien. */
+TEST_CASE("create currency with zero initial credit skips the claim", "[app_main][d1]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock);
+
+    meshpay_app_currency_params_t params;
+    default_currency_params(&params);
+    params.initial_credit = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_create_currency(&runtime, &params, 1000));
+    TEST_ASSERT_TRUE(app->currency.has_descriptor); /* fondateur quand même */
+    TEST_ASSERT_EQUAL_UINT32(0, meshpay_dag_count(&app->dag)); /* aucune CLAIM */
+
+    meshpay_app_runtime_destroy(&runtime);
+}

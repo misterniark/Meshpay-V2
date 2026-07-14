@@ -251,18 +251,48 @@ esp_err_t meshpay_app_runtime_invite_code(meshpay_app_runtime_t *runtime,
  * Palier C4 — auto-crédit initial (CLAIM). Si le device est membre d'une monnaie
  * à descripteur dont initial_credit > 0 et que sa DAG ne contient AUCUNE CLAIM
  * `from == moi` (la garde « déjà réclamé » est le DAG lui-même, persisté via
- * dag_store), construit la CLAIM réflexive (montant = initial_credit, seq = 0,
- * parents = tips courants), la valide (plafond max_supply), la committe
+ * dag_store), construit la CLAIM réflexive DÉTERMINISTE (montant = initial_credit,
+ * seq = 0, timestamp = 0, 0 parent), la valide (plafond max_supply), la committe
  * localement (commit-on-send) et force la persistance. La propagation vers les
  * pairs passe par la sync DAG (SUMMARY/REQUEST/BATCH), pas par un envoi direct.
  *
  * Idempotent : ESP_OK sans effet si non-membre, crédit nul, ou CLAIM déjà
  * présente. ESP_ERR_INVALID_STATE si la validation refuse (plafond épuisé).
  * À appeler au boot (main/) après la restauration de la DAG ; appelée aussi
- * automatiquement à la rejointe (import réussi du descripteur).
+ * automatiquement à la rejointe (import réussi du descripteur) et à la création.
  */
 esp_err_t meshpay_app_runtime_claim_initial_credit(meshpay_app_runtime_t *runtime,
                                                    uint64_t now_ms);
+
+/*
+ * Palier D1 — paramètres fondateur pour créer une monnaie. Reprennent les champs
+ * RÈGLES du corps du descripteur (le wizard UI les pré-remplit de défauts) ;
+ * founder_public et created_at_ms sont dérivés à la création (identité locale +
+ * now_ms), pas fournis ici.
+ */
+typedef struct {
+    char name[MESHPAY_CURRENCY_NAME_MAX];     /* nom lisible, null-terminé */
+    char symbol[MESHPAY_CURRENCY_SYMBOL_MAX]; /* ticker, null-terminé */
+    uint64_t max_supply;                      /* offre maximale (0 = illimité) */
+    uint32_t transfer_fee;                    /* frais de transfert */
+    uint32_t initial_credit;                  /* crédit initial d'un nouveau membre */
+    bool demurrage_enabled;                   /* fonte active ? */
+    uint16_t demurrage_bps;                   /* taux de fonte (points de base) */
+} meshpay_app_currency_params_t;
+
+/*
+ * Palier D1 — CRÉE une monnaie côté fondateur : construit le corps du descripteur
+ * depuis `params`, le SIGNE avec l'identité locale, dérive genesis/currency_id,
+ * PERSISTE le blob (storage) et applique la config EN PLACE (le device devient
+ * fondateur-membre : has_descriptor=true, autorité MINT = son identité), puis
+ * s'AUTO-CRÉDITE le crédit initial (CLAIM, best-effort). Mono-monnaie STRICT :
+ * refuse (ESP_ERR_INVALID_STATE) si déjà membre. Refuse aussi sans storage
+ * (une monnaie non persistée ne survivrait pas au reboot). Exécuté sous le lock.
+ */
+esp_err_t meshpay_app_runtime_create_currency(
+    meshpay_app_runtime_t *runtime,
+    const meshpay_app_currency_params_t *params,
+    uint64_t now_ms);
 
 #ifdef __cplusplus
 }
