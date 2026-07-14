@@ -1341,6 +1341,111 @@ static esp_err_t runtime_handle_join_request(meshpay_app_runtime_t *runtime,
 }
 
 /*
+ * Palier C4 — auto-crédit initial (CLAIM réflexive). PRÉ-REQUIS : le lock du
+ * runtime est DÉJÀ détenu par l'appelant (process_one ou le wrapper public).
+ *
+ * Garde « déjà réclamé » = le DAG lui-même : s'il contient une CLAIM
+ * `from == moi`, on ne ré-émet pas (le DAG est persisté via dag_store, donc la
+ * garde survit au reboot ; et même en cas de course, l'unicité (from, seq==0)
+ * du merge rejette toute 2e CLAIM en CONFLICT). Aucun flag storage séparé.
+ */
+static esp_err_t runtime_claim_initial_credit_locked(
+    meshpay_app_runtime_t *runtime, uint64_t now_ms)
+{
+    meshpay_app_t *app = runtime->app;
+
+    /* Pas membre d'une monnaie à descripteur -> le crédit initial n'existe pas
+     * (le repli legacy garde son boot-credit MINT, géré côté main/). */
+    if (!app->currency.has_descriptor) {
+        return ESP_OK;
+    }
+    /* Monnaie sans crédit initial : rien à réclamer. */
+    if (app->currency.initial_credit == 0) {
+        return ESP_OK;
+    }
+    /* Déjà réclamé ? (une CLAIM from==moi dans la fenêtre DAG persistée) */
+    for (size_t i = 0; i < meshpay_dag_count(&app->dag); ++i) {
+        const meshpay_tx_t *tx = meshpay_dag_at(&app->dag, i);
+        if (tx != NULL && tx->type == MESHPAY_TX_TYPE_CLAIM &&
+            rns_crypto_constant_equal(tx->from, app->local_destination,
+                                      MESHPAY_TX_DESTINATION_HASH_SIZE)) {
+            return ESP_OK; /* idempotent : la garde EST le DAG */
+        }
+    }
+
+    /* CLAIM DÉTERMINISTE : timestamp figé à 0 et AUCUN parent (genesis pur). Son
+     * id ne dépend donc que de (from, to, amount, currency_id) — invariants du
+     * membre. Une ré-émission après un reboot où la CLAIM n'a pas été persistée
+     * (mais a déjà été tirée par des pairs) produit alors le MÊME id -> merge
+     * DUPLICATE (vraie idempotence), et jamais un id différent qui, faute de
+     * tie-break sur (from, seq==0), forkerait le réseau de façon permanente
+     * (constat #4 de la revue). now_ms ne sert qu'au flush/refresh plus bas, pas
+     * d'horodatage de la CLAIM. */
+    meshpay_tx_t claim;
+    ESP_RETURN_ON_ERROR(
+        meshpay_tx_create_claim(&claim, &app->identity, app->local_destination,
+                                app->currency.initial_credit,
+                                app->currency.currency_id,
+                                NULL, 0, 0 /* timestamp déterministe */),
+        APP_RUNTIME_TAG, "");
+
+    /* Validation économique (montant exact + plafond max_supply). */
+    meshpay_currency_result_t verdict =
+        meshpay_currency_validate_tx(&app->currency, &app->dag, &claim);
+    if (verdict != MESHPAY_CURRENCY_OK) {
+        ESP_LOGW(APP_RUNTIME_TAG,
+                 "credit initial refuse (verdict=%d, plafond atteint ?)",
+                 (int)verdict);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    meshpay_dag_merge_result_t merge = meshpay_dag_merge_tx(&app->dag, &claim);
+    if (merge == MESHPAY_DAG_MERGE_DUPLICATE) {
+        /* Même id déjà présent : ré-émission déterministe -> vraie idempotence. */
+        return ESP_OK;
+    }
+    if (merge == MESHPAY_DAG_MERGE_CONFLICT) {
+        /* ANOMALIE (pas une perte silencieuse) : un AUTRE tx occupe déjà
+         * (moi, seq==0) dans CETTE monnaie. Avec la CLAIM déterministe + le
+         * conflit scopé par currency_id, ça ne devrait pas se produire pour un
+         * membre honnête ; on le signale et on ne crédite pas (le solde reste 0,
+         * diagnostiquable — pas d'échec masqué). */
+        ESP_LOGW(APP_RUNTIME_TAG,
+                 "CLAIM en conflit sur (moi, seq=0) cur=%08x -> credit non applique",
+                 (unsigned)app->currency.currency_id);
+        return ESP_OK;
+    }
+    if (merge != MESHPAY_DAG_MERGE_OK) {
+        ESP_LOGW(APP_RUNTIME_TAG, "merge CLAIM inattendu (%d)", (int)merge);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Commit-on-send : la CLAIM est committée localement -> persistance FORCÉE
+     * (comme un paiement local, le cas critique à ne pas perdre). Les pairs la
+     * tireront via la sync DAG (SUMMARY/REQUEST/BATCH). */
+    runtime_dag_mark_dirty(runtime);
+    runtime_dag_flush(runtime, now_ms, true, "claim");
+    (void)runtime_refresh_balance(runtime, now_ms);
+    ESP_LOGI(APP_RUNTIME_TAG, "credit initial reclame amount=%u",
+             (unsigned)app->currency.initial_credit);
+    return ESP_OK;
+}
+
+esp_err_t meshpay_app_runtime_claim_initial_credit(meshpay_app_runtime_t *runtime,
+                                                   uint64_t now_ms)
+{
+    if (runtime == NULL || runtime->app == NULL || runtime->lock == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(runtime->lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = runtime_claim_initial_credit_locked(runtime, now_ms);
+    xSemaphoreGive(runtime->lock);
+    return err;
+}
+
+/*
  * Palier B4 — traite un OFFER de descripteur reçu (data[0] == 0x34). Séquence
  * stricte : idempotence (déjà membre) -> armé ? -> parse -> matches_anchor ->
  * verify -> import. Tout rejet est NON DESTRUCTIF et NON BLOQUANT (log + ESP_OK)
@@ -1389,6 +1494,10 @@ static esp_err_t runtime_handle_join_offer(meshpay_app_runtime_t *runtime,
     }
 
     runtime->join_armed = false;
+    /* Palier C4 : nouveau membre -> auto-réclame le crédit initial (CLAIM).
+     * Non bloquant : un refus (p.ex. plafond épuisé) n'invalide pas la rejointe,
+     * le boot retentera (idempotent, la garde est le DAG). Lock déjà détenu. */
+    (void)runtime_claim_initial_credit_locked(runtime, now_ms);
     (void)runtime_refresh_balance(runtime, now_ms);
     ESP_LOGI("app_runtime", "rejointe réussie: currency_id=%08x",
              (unsigned)runtime->app->currency.currency_id);

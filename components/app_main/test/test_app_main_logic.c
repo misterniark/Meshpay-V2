@@ -2381,3 +2381,220 @@ TEST_CASE("bridged join: member requests, founder serves, member imports", "[app
     meshpay_app_runtime_destroy(&runtime_a);
     meshpay_app_runtime_destroy(&runtime_b);
 }
+
+/* --- Palier C4 : auto-émission du crédit initial (CLAIM) --- */
+
+/* Variante de sign_min_descriptor qui paramètre le crédit initial et le plafond
+ * (sign_min_descriptor fige initial_credit = 0, inutilisable pour C4). */
+static void sign_credit_descriptor(rns_identity_t *founder, uint8_t founder_seed,
+                                   uint32_t initial_credit, uint64_t max_supply,
+                                   meshpay_currency_descriptor_signed_t *out)
+{
+    load_identity(founder, founder_seed);
+    meshpay_currency_descriptor_t body;
+    meshpay_currency_descriptor_init(&body);
+    strncpy(body.name, "Minimistan", sizeof(body.name) - 1);
+    strncpy(body.symbol, "MIN", sizeof(body.symbol) - 1);
+    body.max_supply = max_supply;
+    body.transfer_fee = 2;
+    body.initial_credit = initial_credit;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_sign(out, &body, founder));
+}
+
+/* Pompe les files RETICULUM des deux runtimes pontés jusqu'à épuisement : chaque
+ * traitement peut re-remplir la file de l'autre (REQUEST->OFFER, SUMMARY->
+ * REQUEST->BATCH), on alterne donc jusqu'à ce que les DEUX soient vides. */
+static void pump_bridged_until_idle(meshpay_app_runtime_t *a,
+                                    meshpay_app_runtime_t *b)
+{
+    while (meshpay_app_runtime_queue_depth(a, MESHPAY_APP_QUEUE_RETICULUM) > 0 ||
+           meshpay_app_runtime_queue_depth(b, MESHPAY_APP_QUEUE_RETICULUM) > 0) {
+        process_reticulum_until_idle(a);
+        process_reticulum_until_idle(b);
+    }
+}
+
+/* Test couronne C4 : B rejoint A (bridged) -> B s'auto-crédite la CLAIM dès
+ * l'import -> son solde vaut initial_credit ; puis B diffuse son SUMMARY et la
+ * sync DAG livre la CLAIM à A, qui voit le même solde pour B. */
+TEST_CASE("bridged join: member auto-claims initial credit and peer syncs it",
+          "[app_main][c4]")
+{
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_credit_descriptor(&founder, 0x30, 250, 12345, &signed_desc);
+
+    meshpay_app_t *app_a = test_pool_app(0);
+    meshpay_app_t *app_b = test_pool_app(1);
+    meshpay_storage_mock_t mock_a, mock_b;
+    meshpay_app_runtime_t runtime_a, runtime_b;
+    founder_runtime_init(&runtime_a, app_a, &mock_a, &signed_desc, 0x30);
+    member_runtime_init(&runtime_b, app_b, &mock_b);
+
+    direct_bridge_t a_to_b = { .dst = &runtime_b };
+    direct_bridge_t b_to_a = { .dst = &runtime_a };
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
+                                  &runtime_a, direct_bridge_tx, &a_to_b));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
+                                  &runtime_b, direct_bridge_tx, &b_to_a));
+
+    /* Rejointe pontée complète (comme le test B5). */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_arm_join_anchor(
+                                  &runtime_b, signed_desc.genesis_hash,
+                                  MESHPAY_CURRENCY_INVITE_ANCHOR_LEN, 1000));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_emit_join_request(&runtime_b, 1000));
+    pump_bridged_until_idle(&runtime_a, &runtime_b);
+
+    /* B est membre ET s'est auto-crédité : une CLAIM dans sa DAG, solde OK. */
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_MEMBER,
+                      meshpay_app_runtime_join_state(&runtime_b));
+    TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(&app_b->dag));
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(member, sizeof(member), 0x50); /* adresse de B (member_runtime_init) */
+    uint32_t balance = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(
+                                  &app_b->currency, &app_b->dag, member, &balance));
+    TEST_ASSERT_EQUAL_UINT32(250, balance);
+    TEST_ASSERT_EQUAL_UINT32(250, app_b->ui.balance); /* refresh_balance passé */
+
+    /* Propagation : B diffuse son SUMMARY périodique -> A détecte la divergence,
+     * REQUEST -> BATCH -> A merge la CLAIM (chemin de sync réel, ponté). */
+    const meshpay_app_event_t summary_ev = {
+        .type = MESHPAY_APP_EVENT_CORE_DAG_SUMMARY,
+        .now_ms = 2000,
+    };
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_post(
+                                  &runtime_b, MESHPAY_APP_QUEUE_CORE,
+                                  &summary_ev, 0));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_process_one(
+                                  &runtime_b, MESHPAY_APP_QUEUE_CORE, 0));
+    pump_bridged_until_idle(&runtime_a, &runtime_b);
+
+    TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(&app_a->dag));
+    balance = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(
+                                  &app_a->currency, &app_a->dag, member, &balance));
+    TEST_ASSERT_EQUAL_UINT32(250, balance); /* A voit le crédit de B */
+
+    meshpay_app_runtime_destroy(&runtime_a);
+    meshpay_app_runtime_destroy(&runtime_b);
+}
+
+/* Idempotence au boot : un membre déjà établi (config descripteur persistée)
+ * réclame au premier appel, puis les appels suivants (reboots simulés) ne
+ * créent PAS de 2e CLAIM — la garde est le DAG lui-même. */
+TEST_CASE("initial credit claim is idempotent across reboots", "[app_main][c4]")
+{
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_credit_descriptor(&founder, 0x30, 250, 12345, &signed_desc);
+
+    /* « Membre au boot » : runtime monté directement sur la config dérivée du
+     * descripteur (founder_runtime_init avec l'adresse du MEMBRE 0x50). */
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    founder_runtime_init(&runtime, app, &mock, &signed_desc, 0x50);
+
+    /* 1er boot : la CLAIM est émise. */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_claim_initial_credit(&runtime, 1000));
+    TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(&app->dag));
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(member, sizeof(member), 0x50);
+    uint32_t balance = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(
+                                  &app->currency, &app->dag, member, &balance));
+    TEST_ASSERT_EQUAL_UINT32(250, balance);
+
+    /* Reboots suivants : aucune 2e CLAIM (le DAG contient déjà from==moi). */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_claim_initial_credit(&runtime, 2000));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_claim_initial_credit(&runtime, 3000));
+    TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(&app->dag));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* initial_credit == 0 (descripteur sans crédit) : on ne réclame rien. */
+TEST_CASE("initial credit claim is skipped when credit is zero", "[app_main][c4]")
+{
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_min_descriptor(&founder, 0x30, &signed_desc); /* initial_credit = 0 */
+
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    founder_runtime_init(&runtime, app, &mock, &signed_desc, 0x50);
+
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_claim_initial_credit(&runtime, 1000));
+    TEST_ASSERT_EQUAL_UINT32(0, meshpay_dag_count(&app->dag)); /* rien émis */
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* Plafond épuisé : la CLAIM est refusée par la validation currency (SUPPLY) et
+ * rien n'est committé — refus NON destructif (le runtime reste sain). */
+TEST_CASE("initial credit claim is rejected when max supply is exhausted",
+          "[app_main][c4]")
+{
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    /* crédit 100 > plafond 50 : toute CLAIM dépasserait l'offre max. */
+    sign_credit_descriptor(&founder, 0x30, 100, 50, &signed_desc);
+
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    founder_runtime_init(&runtime, app, &mock, &signed_desc, 0x50);
+
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_app_runtime_claim_initial_credit(&runtime, 1000));
+    TEST_ASSERT_EQUAL_UINT32(0, meshpay_dag_count(&app->dag));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* Déterminisme (constat #4) : deux runtimes du MÊME membre, avec des DAG vierges
+ * et des now_ms DIFFÉRENTS, produisent une CLAIM au MÊME id (timestamp figé à 0,
+ * 0 parent). C'est ce qui garantit qu'une ré-émission après reboot = DUPLICATE,
+ * jamais un fork. */
+TEST_CASE("initial credit claim id is deterministic regardless of now_ms",
+          "[app_main][c4]")
+{
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_credit_descriptor(&founder, 0x30, 250, 12345, &signed_desc);
+
+    /* Deux "vies" du même membre (même seed d'adresse 0x50) sur des DAG vierges. */
+    meshpay_app_t *app_a = test_pool_app(0);
+    meshpay_app_t *app_b = test_pool_app(1);
+    meshpay_storage_mock_t mock_a, mock_b;
+    meshpay_app_runtime_t runtime_a, runtime_b;
+    founder_runtime_init(&runtime_a, app_a, &mock_a, &signed_desc, 0x50);
+    founder_runtime_init(&runtime_b, app_b, &mock_b, &signed_desc, 0x50);
+
+    /* now_ms volontairement différents. */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_claim_initial_credit(&runtime_a, 1000));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_claim_initial_credit(&runtime_b, 987654));
+    TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(&app_a->dag));
+    TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(&app_b->dag));
+
+    const meshpay_tx_t *claim_a = meshpay_dag_at(&app_a->dag, 0);
+    const meshpay_tx_t *claim_b = meshpay_dag_at(&app_b->dag, 0);
+    TEST_ASSERT_NOT_NULL(claim_a);
+    TEST_ASSERT_NOT_NULL(claim_b);
+    TEST_ASSERT_EQUAL_UINT8(0, claim_a->parent_count); /* genesis pur */
+    TEST_ASSERT_EQUAL_UINT64(0, claim_a->timestamp_ms);
+    /* Id identique -> une ré-émission serait un DUPLICATE, pas un fork. */
+    TEST_ASSERT_EQUAL_MEMORY(claim_a->id, claim_b->id, MESHPAY_TX_ID_SIZE);
+
+    meshpay_app_runtime_destroy(&runtime_a);
+    meshpay_app_runtime_destroy(&runtime_b);
+}

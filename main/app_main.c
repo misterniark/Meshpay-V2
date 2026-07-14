@@ -2676,7 +2676,13 @@ void app_main(void)
             return;
         }
     }
-    if (storage_ready) {
+    /* Palier C4 : le boot-credit MINT (self-mint legacy) n'existe QUE pour la
+     * config de repli codee en dur. Sous une monnaie a descripteur, le credit
+     * initial passe par la CLAIM (voir plus bas, apres la restauration DAG) ;
+     * rejouer ici le checkpoint MINT legacy (self-autorite, currency_id de
+     * repli) echouerait contre la config descripteur et briquait le boot d'un
+     * membre ayant rejoint une monnaie. */
+    if (storage_ready && !currency_from_descriptor) {
         err = create_boot_credit_once(&s_app,
                                       &storage_backend,
                                       &boot_record);
@@ -2684,6 +2690,9 @@ void app_main(void)
             ESP_LOGE(TAG, "boot credit failed: %s", esp_err_to_name(err));
             return;
         }
+    } else if (storage_ready) {
+        ESP_LOGI(TAG,
+                 "boot credit ignore (monnaie a descripteur: credit via CLAIM)");
     } else {
         ESP_LOGW(TAG, "boot credit skipped: persistent storage unavailable");
     }
@@ -2736,6 +2745,20 @@ void app_main(void)
         } else {
             ESP_LOGW(TAG, "dag store partition absent: %s",
                      esp_err_to_name(derr));
+        }
+    }
+
+    /* Palier C4 : membre d'une monnaie a descripteur -> auto-reclame le credit
+     * initial si la DAG restauree ne contient pas encore de CLAIM from==moi
+     * (idempotent, la garde est le DAG persiste). Place APRES la restauration
+     * dag_store (sinon on re-emettrait a chaque boot) et AVANT start_tasks
+     * (aucune concurrence sur s_app.dag). */
+    if (currency_from_descriptor) {
+        esp_err_t claim_err =
+            meshpay_app_runtime_claim_initial_credit(&s_runtime, 0);
+        if (claim_err != ESP_OK) {
+            ESP_LOGW(TAG, "credit initial non reclame: %s",
+                     esp_err_to_name(claim_err));
         }
     }
 

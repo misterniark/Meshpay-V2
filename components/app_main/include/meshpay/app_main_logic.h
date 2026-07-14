@@ -247,6 +247,23 @@ esp_err_t meshpay_app_runtime_invite_code(meshpay_app_runtime_t *runtime,
                                           char *out,
                                           size_t out_size);
 
+/*
+ * Palier C4 — auto-crédit initial (CLAIM). Si le device est membre d'une monnaie
+ * à descripteur dont initial_credit > 0 et que sa DAG ne contient AUCUNE CLAIM
+ * `from == moi` (la garde « déjà réclamé » est le DAG lui-même, persisté via
+ * dag_store), construit la CLAIM réflexive (montant = initial_credit, seq = 0,
+ * parents = tips courants), la valide (plafond max_supply), la committe
+ * localement (commit-on-send) et force la persistance. La propagation vers les
+ * pairs passe par la sync DAG (SUMMARY/REQUEST/BATCH), pas par un envoi direct.
+ *
+ * Idempotent : ESP_OK sans effet si non-membre, crédit nul, ou CLAIM déjà
+ * présente. ESP_ERR_INVALID_STATE si la validation refuse (plafond épuisé).
+ * À appeler au boot (main/) après la restauration de la DAG ; appelée aussi
+ * automatiquement à la rejointe (import réussi du descripteur).
+ */
+esp_err_t meshpay_app_runtime_claim_initial_credit(meshpay_app_runtime_t *runtime,
+                                                   uint64_t now_ms);
+
 #ifdef __cplusplus
 }
 #endif

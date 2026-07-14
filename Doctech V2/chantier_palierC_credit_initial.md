@@ -56,7 +56,7 @@ signé du descripteur (chaîne de confiance déjà ancrée par le code d'invitat
 | **C1** | Type **`CLAIM = 3`** : `meshpay_tx_create_claim` (`from==to`, `fee==0`, signé membre) ; `validate_common` accepte CLAIM + règle `from==to` ; décodeur accepte le type 3. | `meshpay_tx` | tests Unity : create/sign/verify, `from!=to` rejeté, `fee!=0` rejeté, decode round-trip, encode borné |
 | **C2** | `initial_credit` copié dans `meshpay_currency_config_t` (par `config_from_descriptor`) ; chemin de validation CLAIM dans `validate_tx` : `from==to`, `amount == config.initial_credit`, signé par le membre (`from`), **PAS** de vérif `founder_public`, compté dans `total_minted`, borné par `max_supply` ; `get_balance` crédite `to`. | `currency` | tests : CLAIM correct crédite ; `amount != initial_credit` rejeté ; CLAIM > `max_supply` rejeté ; CLAIM ne passe pas la vérif fondateur ; solde reflète le crédit |
 | **C3** | Vérifier que le conflit `(from, seq==0)` couvre bien la CLAIM ; durcir `tx_shape_valid` (CLAIM ⇒ `from==to`, `fee==0`, `amount!=0`). | `dag` | tests : 2 CLAIM même membre → 2ᵉ `CONFLICT`, `count` inchangé ; CLAIM de membres différents coexistent ; convergence digest (A→B == B→A) |
-| **C4** | Auto-émission : après import réussi (B4 `handle_join_offer`) OU au boot si membre & pas de CLAIM `from==moi` dans le DAG → construire CLAIM (`amount=initial_credit`, `seq=0`), commit local + propagation (DAG sync). `initial_credit==0` ⇒ skip. Fonction runtime testable + câblage `main/`. | `app_main` + `main/` | tests **bridged** : B rejoint A → B s'auto-crédite → `balance(B)==initial_credit` ; A voit le solde de B après sync ; idempotence (pas de 2ᵉ CLAIM) ; `initial_credit==0` → aucune CLAIM |
+| **C4** | Auto-émission : après import réussi (B4 `handle_join_offer`) OU au boot si membre & pas de CLAIM `from==moi` dans le DAG → construire CLAIM (`amount=initial_credit`, `seq=0`), commit local + propagation (DAG sync). `initial_credit==0` ⇒ skip. Fonction runtime testable + câblage `main/`. **Inclut le fix boot-credit** : `create_boot_credit_once` (MINT legacy self-autorité) gaté sur `!currency_from_descriptor` — sans quoi le rejeu du checkpoint legacy contre la config descripteur (`ERR_WRONG_ID`) **briquait le boot** de tout membre ayant rejoint une monnaie (bug latent découvert en C4, jamais mordu au banc faute de reboot membre firmware). | `app_main` + `main/` | tests **bridged** : B rejoint A → B s'auto-crédite → `balance(B)==initial_credit` ; A voit le solde de B après sync ; idempotence (pas de 2ᵉ CLAIM) ; `initial_credit==0` → aucune CLAIM ; plafond épuisé → refus non destructif |
 
 ## 4. Flux de bout en bout
 
@@ -82,8 +82,11 @@ signé du descripteur (chaîne de confiance déjà ancrée par le code d'invitat
 - **Politique multi-monnaie / révocation de membre / vouchers nominatifs** = hors v1
   (l'octroi est universel et borné par `max_supply`).
 
-## 6. Ordre d'implémentation proposé
+## 6. Ordre d'implémentation
 
-C1 (type CLAIM, logique pure, TDD) → C2 (validation currency) → C3 (unicité DAG) →
-C4 (runtime auto-émission + bridged test). Validation banc on-device au fil de l'eau ;
-chaque sous-palier committé séparément (façon A/B). Tests ESP-NOW seulement.
+C1 (type CLAIM, logique pure, TDD) → **C3 (unicité DAG) → C2 (validation currency)**
+→ C4 (runtime auto-émission + bridged test). Ordre C3/C2 permuté à l'implémentation :
+les tests C2 (« la CLAIM crédite le solde ») exigent une CLAIM réellement mergée dans
+le DAG, donc `tx_shape_valid` (C3) devait l'accepter d'abord. Validation banc
+on-device au fil de l'eau ; chaque sous-palier committé séparément (façon A/B).
+Tests ESP-NOW seulement.
