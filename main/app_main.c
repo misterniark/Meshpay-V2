@@ -145,8 +145,8 @@ static meshpay_hal_lilygo_t5s3_h752_driver_t s_lilygo_h752_display_driver;
 /* HAL d'affichage T-Deck : écran ST7789 SPI 320×240 (Phase 2 Palier 0). */
 static meshpay_hal_t s_display_hal;
 static meshpay_hal_lilygo_tdeck_driver_t s_tdeck_display_driver;
-/* Tâche de diagnostic I2C (tactile GT911 + clavier) : active uniquement sur T-Deck. */
-static TaskHandle_t s_tdeck_diag_task;
+/* Tâche UI T-Deck (rendu ST7789 + saisie clavier, Palier D4) : uniquement sur T-Deck. */
+static TaskHandle_t s_tdeck_ui_task;
 #endif
 #if MESHPAY_RADIO_HAS_ESPNOW
 static meshpay_hal_espnow_driver_t s_espnow_driver;
@@ -439,7 +439,13 @@ static void fb_rect(uint16_t *fb,
         }
     }
 }
+#endif /* Waveshare — primitives clippées à sa hauteur (avant la police partagée) */
 
+/* Police bitmap 5x7 — partagée par les écrans RGB565 320 px (Waveshare + T-Deck).
+ * Données pures, agnostiques de la carte : hoistée hors du bloc Waveshare pour
+ * éviter de la dupliquer côté T-Deck. Le H752 (e-paper, échelles > 4) garde sa
+ * propre fonte. */
+#if CONFIG_MESHPAY_BOARD_WAVESHARE_S3_TOUCH || CONFIG_MESHPAY_BOARD_LILYGO_TDECK
 static const uint8_t *font5x7(char ch)
 {
     static const uint8_t space[5] = {0, 0, 0, 0, 0};
@@ -513,7 +519,9 @@ static const uint8_t *font5x7(char ch)
     }
     return space;
 }
+#endif /* police partagée Waveshare + T-Deck */
 
+#if CONFIG_MESHPAY_BOARD_WAVESHARE_S3_TOUCH
 static void fb_text(uint16_t *fb,
                     uint16_t x,
                     uint16_t y,
@@ -1163,37 +1171,487 @@ static void waveshare_touch_task(void *arg)
 }
 #endif
 
-/* ── Tâche diagnostic T-Deck (tactile GT911 + clavier I2C) ──────────────── */
+/* ── UI T-Deck : rendu ST7789 320×240 + saisie clavier (Palier D4) ──────── */
 #if CONFIG_MESHPAY_BOARD_LILYGO_TDECK
-/* Tâche de validation au banc : poll le tactile et le clavier toutes les 150 ms
- * et logue toute activité en série. Permet de vérifier l'I2C sans matériel UI. */
-static void tdeck_diag_task(void *arg)
-{
-    static const char *DIAG_TAG = "tdeck_diag";
-    (void)arg;
 
-    ESP_LOGI(DIAG_TAG, "tâche diagnostic T-Deck démarrée (poll 150 ms)");
+/* Palette RGB565 (thème sombre, cohérent avec le style Waveshare). */
+#define TDECK_UI_BG        0x0841 /* gris très foncé (fond) */
+#define TDECK_UI_PANEL     0x2124 /* panneau des boutons */
+#define TDECK_UI_TEXT      0xFFFF /* texte principal */
+#define TDECK_UI_ACCENT    0x07E0 /* vert (titre, valeurs) */
+#define TDECK_UI_MUTED     0xC638 /* gris clair (secondaire) */
+#define TDECK_UI_WARN      0xFFE0 /* jaune (footer/alerte) */
+
+/* Cadence de la tâche UI. */
+#define TDECK_UI_POLL_MS   40  /* période de scrutation clavier */
+#define TDECK_UI_RENDER_MS 150 /* rafraîchissement écran maxi */
+
+/* Géométrie de la barre d'actions en bas d'écran (jusqu'à 4 boutons). */
+#define TDECK_ACT_Y   208
+#define TDECK_ACT_H   28
+#define TDECK_ACT_GAP 6
+
+/* Rectangle plein, clippé au cadre 320×240. Le T-Deck a le même stride (320)
+ * que le Waveshare mais une hauteur différente (240 vs 172), d'où des primitives
+ * dédiées plutôt que le partage de fb_rect. */
+static void tdeck_fb_rect(uint16_t *fb,
+                          uint16_t x,
+                          uint16_t y,
+                          uint16_t w,
+                          uint16_t h,
+                          uint16_t color)
+{
+    if (fb == NULL || x >= MESHPAY_HAL_TDECK_WIDTH ||
+        y >= MESHPAY_HAL_TDECK_HEIGHT) {
+        return;
+    }
+    if ((uint32_t)x + w > MESHPAY_HAL_TDECK_WIDTH) {
+        w = (uint16_t)(MESHPAY_HAL_TDECK_WIDTH - x);
+    }
+    if ((uint32_t)y + h > MESHPAY_HAL_TDECK_HEIGHT) {
+        h = (uint16_t)(MESHPAY_HAL_TDECK_HEIGHT - y);
+    }
+    for (uint16_t row = 0; row < h; ++row) {
+        uint16_t *line =
+            fb + ((size_t)y + row) * MESHPAY_HAL_TDECK_WIDTH + x;
+        for (uint16_t col = 0; col < w; ++col) {
+            line[col] = color;
+        }
+    }
+}
+
+/* Texte 5x7 mis à l'échelle, réutilise la police partagée font5x7. */
+static void tdeck_fb_text(uint16_t *fb,
+                          uint16_t x,
+                          uint16_t y,
+                          const char *text,
+                          uint16_t color,
+                          uint8_t scale)
+{
+    if (fb == NULL || text == NULL || scale == 0) {
+        return;
+    }
+    uint16_t cursor = x;
+    for (const char *p = text;
+         *p != '\0' && cursor < (MESHPAY_HAL_TDECK_WIDTH - 4);
+         ++p) {
+        const uint8_t *glyph = font5x7(*p);
+        for (uint8_t col = 0; col < 5; ++col) {
+            for (uint8_t row = 0; row < 7; ++row) {
+                if ((glyph[col] & (1U << row)) != 0) {
+                    tdeck_fb_rect(fb,
+                                  (uint16_t)(cursor + col * scale),
+                                  (uint16_t)(y + row * scale),
+                                  scale,
+                                  scale,
+                                  color);
+                }
+            }
+        }
+        cursor = (uint16_t)(cursor + 6U * scale);
+    }
+}
+
+/* Bouton : panneau plein + liseré accent + label (préfixe touche) centré. */
+static void tdeck_fb_button(uint16_t *fb,
+                            uint16_t x,
+                            uint16_t y,
+                            uint16_t w,
+                            uint16_t h,
+                            const char *label,
+                            uint16_t fill,
+                            uint16_t text_color)
+{
+    tdeck_fb_rect(fb, x, y, w, h, fill);
+    tdeck_fb_rect(fb, x, y, w, 2, TDECK_UI_ACCENT);
+    /* Centrage horizontal (police 6 px/car à l'échelle 1). */
+    uint16_t tw = (uint16_t)(strlen(label) * 6U);
+    uint16_t tx = (w > tw) ? (uint16_t)(x + (w - tw) / 2U) : x;
+    tdeck_fb_text(fb, tx, (uint16_t)(y + (h - 7) / 2U), label, text_color, 1);
+}
+
+/* Écrans de saisie : le clavier alimente le texte/les chiffres (pas les
+ * raccourcis numériques d'action). Miroir de waveshare_input_screen. */
+static bool tdeck_input_screen(meshpay_ui_screen_t screen)
+{
+    return screen == MESHPAY_UI_SCREEN_SETUP_PIN ||
+           screen == MESHPAY_UI_SCREEN_PAY ||
+           screen == MESHPAY_UI_SCREEN_JOIN ||
+           screen == MESHPAY_UI_SCREEN_CREATE;
+}
+
+/* Peint la vue courante sur l'écran ST7789. Layout générique piloté par la
+ * struct de vue : fonctionne pour tous les écrans (wallet + monnaie). */
+static void render_tdeck_view(uint16_t *fb, const meshpay_ui_view_t *view)
+{
+    if (fb == NULL || view == NULL) {
+        return;
+    }
+    const size_t pixels =
+        (size_t)MESHPAY_HAL_TDECK_WIDTH * MESHPAY_HAL_TDECK_HEIGHT;
+    for (size_t i = 0; i < pixels; ++i) {
+        fb[i] = TDECK_UI_BG;
+    }
+
+    /* Bandeau titre + lignes principales. */
+    tdeck_fb_rect(fb, 0, 0, MESHPAY_HAL_TDECK_WIDTH, 6, TDECK_UI_ACCENT);
+    tdeck_fb_text(fb, 12, 16, view->title, TDECK_UI_TEXT, 3);
+    tdeck_fb_text(fb, 12, 58, view->primary, TDECK_UI_ACCENT, 2);
+    tdeck_fb_text(fb, 12, 88, view->secondary, TDECK_UI_MUTED, 2);
+
+    /* Lignes de détail (historique / réseau / menu monnaie). On s'arrête avant
+     * la bande footer/actions (y ≥ 188) pour ne pas écrire par-dessus. */
+    uint16_t dy = 118;
+    for (uint8_t i = 0; i < MESHPAY_UI_DETAIL_LINE_MAX && dy + 7 <= 188; ++i) {
+        if (view->detail_lines[i][0] == '\0') {
+            continue;
+        }
+        tdeck_fb_text(fb, 12, dy, view->detail_lines[i], TDECK_UI_TEXT, 1);
+        dy = (uint16_t)(dy + 12);
+    }
+
+    /* Footer d'alerte éventuel. */
+    if (view->footer[0] != '\0') {
+        tdeck_fb_text(fb, 12, 190, view->footer, TDECK_UI_WARN, 1);
+    }
+
+    /* Bas d'écran : barre d'actions sur TOUS les écrans (sinon aucun bouton
+     * tactile pour valider/sortir d'un écran de saisie). Sur les écrans menu, on
+     * préfixe chaque bouton de sa touche numérique (1-4) ; sur les écrans de
+     * saisie, pas de préfixe (les chiffres tapent le montant/le texte, les
+     * boutons restent tactiles + Entrée/Retour au clavier). */
+    if (view->action_count > 0) {
+        const bool numbered = !tdeck_input_screen(view->screen);
+        uint16_t n = view->action_count > 4 ? 4 : view->action_count;
+        uint16_t span =
+            (uint16_t)(MESHPAY_HAL_TDECK_WIDTH - 24 - (n - 1) * TDECK_ACT_GAP);
+        uint16_t bw = (uint16_t)(span / n);
+        for (uint16_t i = 0; i < n; ++i) {
+            uint16_t bx = (uint16_t)(12 + i * (bw + TDECK_ACT_GAP));
+            /* Marge large : le compilateur borne %u à 10 chiffres pour l'analyse
+             * de troncature, il faut donc ≥ 10 + ":" + label + NUL. */
+            char label[MESHPAY_UI_ACTION_LABEL_MAX + 12];
+            if (numbered) {
+                snprintf(label, sizeof(label), "%u:%s", (unsigned)(i + 1),
+                         view->action_labels[i]);
+            } else {
+                snprintf(label, sizeof(label), "%s", view->action_labels[i]);
+            }
+            uint16_t fill = TDECK_UI_PANEL;
+            if (view->actions[i] == MESHPAY_UI_ACTION_CONFIRM &&
+                !view->confirm_enabled) {
+                fill = TDECK_UI_MUTED;
+            }
+            tdeck_fb_button(fb,
+                            bx,
+                            TDECK_ACT_Y,
+                            bw,
+                            TDECK_ACT_H,
+                            label,
+                            fill,
+                            TDECK_UI_TEXT);
+        }
+    }
+
+    esp_err_t err = meshpay_hal_display_flush(&s_display_hal,
+                                              fb,
+                                              MESHPAY_HAL_TDECK_WIDTH,
+                                              MESHPAY_HAL_TDECK_HEIGHT);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "T-Deck UI flush failed: %s", esp_err_to_name(err));
+    }
+}
+
+/* Persiste le hash du PIN sur la NVS chiffrée (si le stockage est présent).
+ * Miroir de waveshare_persist_pin_locked (APIs storage agnostiques de la carte). */
+static esp_err_t tdeck_persist_pin_locked(void)
+{
+    if (!s_runtime.has_storage) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(meshpay_storage_record_set_pin_hash(
+                            &s_runtime.storage_record,
+                            s_app.wallet.pin_hash),
+                        TAG,
+                        "");
+    return meshpay_storage_save(&s_runtime.storage_backend,
+                                &s_runtime.storage_record);
+}
+
+/* Valide le PIN saisi à l'écran SETUP_PIN : le pose sur le wallet, le persiste,
+ * puis notifie l'UI. Sans ce câblage, un T-Deck neuf resterait bloqué sur
+ * SETUP_PIN (Entrée sans effet) — révélé par la revue adversariale D4. */
+static esp_err_t tdeck_confirm_pin_locked(void)
+{
+    char pin[MESHPAY_UI_PIN_ENTRY_MAX + 1] = {0};
+    size_t pin_len = 0;
+    esp_err_t err =
+        meshpay_ui_pin_entry(&s_app.ui, pin, sizeof(pin), &pin_len);
+    if (err == ESP_OK) {
+        err = meshpay_wallet_set_pin(&s_app.wallet, pin, pin_len);
+    }
+    if (err == ESP_OK) {
+        err = tdeck_persist_pin_locked();
+    }
+    rns_crypto_secure_zero(pin, sizeof(pin));
+    (void)meshpay_ui_on_pin_result(&s_app.ui, err == ESP_OK, false);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "T-Deck PIN setup failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+/* Applique une action UI (navigation + écrans monnaie). Verrou s_runtime.lock
+ * supposé déjà pris par l'appelant. Le submit runtime terminal (créer la monnaie,
+ * armer la rejointe) est câblé en D6 ; ici on ne fait que la navigation. */
+static esp_err_t tdeck_apply_action_locked(meshpay_ui_action_t action)
+{
+    switch (action) {
+    case MESHPAY_UI_ACTION_HOME:
+        (void)meshpay_ui_clear_entry(&s_app.ui);
+        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_HOME);
+    case MESHPAY_UI_ACTION_PAY:
+        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_PAYEE);
+    case MESHPAY_UI_ACTION_RECEIVE:
+        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_RECEIVE);
+    case MESHPAY_UI_ACTION_HISTORY:
+        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_HISTORY);
+    case MESHPAY_UI_ACTION_NETWORK:
+        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_NETWORK);
+    case MESHPAY_UI_ACTION_CURRENCY:
+        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_CURRENCY_MENU);
+    case MESHPAY_UI_ACTION_CREATE:
+        /* wizard_begin pré-remplit les défauts ET navigue vers l'écran CREATE. */
+        return meshpay_ui_wizard_begin(&s_app.ui);
+    case MESHPAY_UI_ACTION_JOIN:
+        (void)meshpay_ui_clear_entry(&s_app.ui);
+        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_JOIN);
+    case MESHPAY_UI_ACTION_SHOW_CODE:
+        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_FOUNDER_CODE);
+    case MESHPAY_UI_ACTION_NEXT_FIELD:
+        return meshpay_ui_wizard_next_field(&s_app.ui);
+    case MESHPAY_UI_ACTION_PREV_FIELD:
+        return meshpay_ui_wizard_prev_field(&s_app.ui);
+    case MESHPAY_UI_ACTION_BACKSPACE:
+        return meshpay_ui_backspace(&s_app.ui);
+    case MESHPAY_UI_ACTION_CLEAR:
+        return meshpay_ui_clear_entry(&s_app.ui);
+    case MESHPAY_UI_ACTION_CONFIRM:
+        if (s_app.ui.screen == MESHPAY_UI_SCREEN_SETUP_PIN) {
+            /* Setup wallet de base : indispensable pour atteindre HOME (et le
+             * wizard de création, qui exige has_pin). Pas du ressort de D6. */
+            return tdeck_confirm_pin_locked();
+        }
+        if (s_app.ui.screen == MESHPAY_UI_SCREEN_PAYEE) {
+            return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_PAY);
+        }
+        /* CREATE/JOIN : le submit runtime réel est câblé en D6. */
+        return ESP_OK;
+    case MESHPAY_UI_ACTION_NONE:
+    default:
+        return ESP_OK;
+    }
+}
+
+/* Convertit un point tactile (coordonnées écran paysage 320×240) en index de
+ * bouton de la barre d'actions du bas. Doit rester STRICTEMENT aligné sur la
+ * géométrie de render_tdeck_view (mêmes constantes TDECK_ACT_*).
+ * Retourne l'index [0..n-1] ou -1 si le point est hors de tout bouton. */
+static int tdeck_touch_button_index(const meshpay_ui_view_t *view,
+                                    int16_t x,
+                                    int16_t y)
+{
+    if (view == NULL || view->action_count == 0) {
+        return -1;
+    }
+    if (y < TDECK_ACT_Y || y >= TDECK_ACT_Y + TDECK_ACT_H) {
+        return -1;
+    }
+    uint16_t n = view->action_count > 4 ? 4 : view->action_count;
+    uint16_t span =
+        (uint16_t)(MESHPAY_HAL_TDECK_WIDTH - 24 - (n - 1) * TDECK_ACT_GAP);
+    uint16_t bw = (uint16_t)(span / n);
+    for (uint16_t i = 0; i < n; ++i) {
+        uint16_t bx = (uint16_t)(12 + i * (bw + TDECK_ACT_GAP));
+        if (x >= (int16_t)bx && x < (int16_t)(bx + bw)) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* Transforme une coordonnée tactile BRUTE (GT911 en orientation portrait native :
+ * rx sur l'axe court 0..239, ry sur l'axe long 0..319) en coordonnée ÉCRAN
+ * paysage 320×240. L'écran est piloté avec MADCTL MV+MX ; on échange donc les
+ * axes et on inverse la verticale (le menu du bas était atteignable par le haut).
+ * out_x/out_y sont clampés au cadre. */
+static void tdeck_touch_to_screen(int16_t rx,
+                                  int16_t ry,
+                                  int16_t *out_x,
+                                  int16_t *out_y)
+{
+    int16_t sx = ry;                                                /* axe 320 -> largeur */
+    int16_t sy = (int16_t)(MESHPAY_HAL_TDECK_HEIGHT - 1) - rx;      /* axe 240, inversé */
+    if (sx < 0) {
+        sx = 0;
+    } else if (sx >= MESHPAY_HAL_TDECK_WIDTH) {
+        sx = MESHPAY_HAL_TDECK_WIDTH - 1;
+    }
+    if (sy < 0) {
+        sy = 0;
+    } else if (sy >= MESHPAY_HAL_TDECK_HEIGHT) {
+        sy = MESHPAY_HAL_TDECK_HEIGHT - 1;
+    }
+    *out_x = sx;
+    *out_y = sy;
+}
+
+/* Applique un tap tactile : transforme les coords brutes en coords écran, cherche
+ * le bouton touché dans la vue courante et déclenche son action. Le log brut+mappé
+ * sert de sonde de calibration (orientation GT911 à confirmer à l'œil). */
+static bool tdeck_handle_tap(int16_t raw_x, int16_t raw_y)
+{
+    int16_t x = 0;
+    int16_t y = 0;
+    tdeck_touch_to_screen(raw_x, raw_y, &x, &y);
+
+    if (s_runtime.lock == NULL ||
+        xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return false;
+    }
+    bool handled = false;
+    esp_err_t err = ESP_OK;
+    meshpay_ui_view_t view;
+    if (meshpay_ui_build_view(&s_app.ui, &view) == ESP_OK) {
+        int idx = tdeck_touch_button_index(&view, x, y);
+        if (idx >= 0) {
+            err = tdeck_apply_action_locked(view.actions[idx]);
+            handled = true;
+        }
+    }
+    xSemaphoreGive(s_runtime.lock);
+    ESP_LOGI("tdeck_ui",
+             "tap raw=(%d,%d) map=(%d,%d) -> %s (%s)",
+             (int)raw_x,
+             (int)raw_y,
+             (int)x,
+             (int)y,
+             handled ? "bouton" : "hors zone",
+             esp_err_to_name(err));
+    return handled;
+}
+
+/* Traduit une touche clavier en évènement UI, sous verrou. */
+static void tdeck_handle_key(char key)
+{
+    if (s_runtime.lock == NULL) {
+        return;
+    }
+    if (xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return;
+    }
+
+    meshpay_ui_screen_t screen = s_app.ui.screen;
+    esp_err_t err = ESP_OK;
+
+    if (key == '\r' || key == '\n') {
+        err = tdeck_apply_action_locked(MESHPAY_UI_ACTION_CONFIRM);
+    } else if (key == '\b' || key == 0x7F) {
+        err = tdeck_apply_action_locked(MESHPAY_UI_ACTION_BACKSPACE);
+    } else if (key == '\t') {
+        err = tdeck_apply_action_locked(MESHPAY_UI_ACTION_NEXT_FIELD);
+    } else if (!tdeck_input_screen(screen) && key >= '1' && key <= '4') {
+        /* Écran menu : la touche numérique choisit l'action à cet index. */
+        meshpay_ui_view_t v;
+        if (meshpay_ui_build_view(&s_app.ui, &v) == ESP_OK) {
+            uint8_t idx = (uint8_t)(key - '1');
+            if (idx < v.action_count) {
+                err = tdeck_apply_action_locked(v.actions[idx]);
+            }
+        }
+    } else if (key >= 0x20 && key < 0x7F) {
+        /* Caractère imprimable : saisie texte/chiffre (routage interne UI). */
+        err = meshpay_ui_input_char(&s_app.ui, key);
+    }
+
+    xSemaphoreGive(s_runtime.lock);
+
+    ESP_LOGI("tdeck_ui",
+             "touche 0x%02x '%c' -> %s",
+             (unsigned)(uint8_t)key,
+             (key >= 32 && key < 127) ? key : '.',
+             esp_err_to_name(err));
+}
+
+/* Tâche UI T-Deck : scrute le clavier, applique l'entrée et rend l'écran. */
+static void tdeck_ui_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI("tdeck_ui", "tâche UI T-Deck démarrée (poll %d ms)", TDECK_UI_POLL_MS);
+
+    /* Framebuffer 320×240 (150 Ko) alloué UNE fois. On le place en PSRAM : le
+     * flush recopie chaque chunk dans un buffer interne DMA-capable (voir
+     * tdeck_display_flush), donc la PSRAM convient et on épargne la RAM interne
+     * (le wallet + Reticulum + LoRa la sollicitent déjà). Repli interne sinon. */
+    const size_t fb_bytes = (size_t)MESHPAY_HAL_TDECK_WIDTH *
+                            MESHPAY_HAL_TDECK_HEIGHT * sizeof(uint16_t);
+    uint16_t *fb = (uint16_t *)heap_caps_malloc(fb_bytes, MALLOC_CAP_SPIRAM);
+    if (fb == NULL) {
+        fb = (uint16_t *)malloc(fb_bytes);
+    }
+    if (fb == NULL) {
+        ESP_LOGE("tdeck_ui",
+                 "framebuffer alloc échouée (%u o) — tâche UI arrêtée",
+                 (unsigned)fb_bytes);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    static bool have_last = false;
+    static meshpay_ui_view_t last_view;
+    int64_t last_render_us = 0;
+    bool was_pressed = false;
 
     while (true) {
-        /* --- Lecture tactile GT911 --- */
-        meshpay_touch_state_t st = {0};
-        esp_err_t err = meshpay_hal_touch_read(&s_display_hal, &st);
-        if (err == ESP_OK && st.pressed) {
-            ESP_LOGI(DIAG_TAG, "touch x=%d y=%d", (int)st.x, (int)st.y);
-        }
-
-        /* --- Lecture clavier ESP32-C3 (@0x55) --- */
+        /* Lecture clavier (non bloquante : 0 = aucune touche). */
         uint8_t key = 0;
-        err = meshpay_hal_keyboard_read(&s_display_hal, &key);
-        if (err == ESP_OK && key != 0) {
-            /* Affiche le code hex et le caractère imprimable si possible */
-            ESP_LOGI(DIAG_TAG,
-                     "key=0x%02x '%c'",
-                     (unsigned)key,
-                     (key >= 32U && key < 127U) ? (char)key : '.');
+        if (meshpay_hal_keyboard_read(&s_display_hal, &key) == ESP_OK &&
+            key != 0) {
+            tdeck_handle_key((char)key);
+            last_render_us = 0; /* force un rendu immédiat au tour suivant */
         }
 
-        vTaskDelay(pdMS_TO_TICKS(150));
+        /* Lecture tactile GT911 : déclenche sur le front montant (appui neuf),
+         * comme la tâche tactile du Waveshare. */
+        meshpay_touch_state_t touch = {0};
+        if (meshpay_hal_touch_read(&s_display_hal, &touch) == ESP_OK) {
+            if (touch.pressed && !was_pressed &&
+                tdeck_handle_tap(touch.x, touch.y)) {
+                last_render_us = 0; /* rendu immédiat après une action */
+            }
+            was_pressed = touch.pressed;
+        }
+
+        /* Rendu si la vue a changé, ou au plus tard toutes les RENDER_MS. */
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - last_render_us > (int64_t)TDECK_UI_RENDER_MS * 1000) {
+            if (s_runtime.lock != NULL &&
+                xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+                meshpay_ui_view_t view;
+                esp_err_t err = meshpay_ui_build_view(&s_app.ui, &view);
+                xSemaphoreGive(s_runtime.lock);
+                if (err == ESP_OK &&
+                    (!have_last ||
+                     memcmp(&view, &last_view, sizeof(view)) != 0)) {
+                    render_tdeck_view(fb, &view);
+                    memcpy(&last_view, &view, sizeof(last_view));
+                    have_last = true;
+                }
+            }
+            last_render_us = now_us;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(TDECK_UI_POLL_MS));
     }
 }
 #endif /* CONFIG_MESHPAY_BOARD_LILYGO_TDECK */
@@ -2830,16 +3288,17 @@ void app_main(void)
 #endif
 
 #if CONFIG_MESHPAY_BOARD_LILYGO_TDECK
-    /* Tâche de diagnostic I2C T-Deck : poll tactile GT911 + clavier ESP32-C3.
-     * Démarre même si l'écran n'est pas parfaitement initialisé (diagnostic indépendant).
-     * Pile 3072 octets : lecture I2C simple, pas de framebuffer. */
-    if (xTaskCreate(tdeck_diag_task,
-                    "tdeck_diag",
-                    3072,
+    /* Tâche UI T-Deck : scrute le clavier ESP32-C3 (@0x55) et rend l'écran
+     * ST7789. Le framebuffer (150 Ko) est en tas, mais meshpay_ui_build_view
+     * consomme beaucoup de pile (grosses structs de vue) : on aligne sur la
+     * pile éprouvée des tâches UI (8192), pas une valeur réduite qui déborde. */
+    if (xTaskCreate(tdeck_ui_task,
+                    "tdeck_ui",
+                    MESHPAY_APP_TASK_STACK_WORDS,
                     NULL,
                     MESHPAY_APP_TASK_PRIORITY,
-                    &s_tdeck_diag_task) != pdPASS) {
-        ESP_LOGW(TAG, "T-Deck diag task start failed");
+                    &s_tdeck_ui_task) != pdPASS) {
+        ESP_LOGW(TAG, "T-Deck UI task start failed");
     }
 #endif
 
@@ -2869,6 +3328,15 @@ void app_main(void)
                     &s_join_request_task) != pdPASS) {
         ESP_LOGW(TAG, "join request task start failed");
     }
+
+    /* Diagnostic de dimensionnement : les piles de tâches vivent en RAM interne
+     * (jamais en PSRAM) ; si une création de tâche échoue ci-dessus, ces chiffres
+     * disent de combien on est court. */
+    ESP_LOGI(TAG,
+             "heap interne libre=%u max_bloc=%u psram libre=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     const rns_node_stats_t *stats = rns_node_stats(&s_node);
     ESP_LOGI(TAG, "reticulum node ready tx=%u tasks=%s,%s,%s,%s radio=%s",
