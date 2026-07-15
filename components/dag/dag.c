@@ -323,3 +323,59 @@ size_t meshpay_dag_purge_foreign(meshpay_dag_t *dag, uint32_t currency_id)
     dag->count = kept;
     return purged;
 }
+
+/* --- Phase B : coupe totale refondatrice --- */
+
+bool meshpay_dag_below_floor(const meshpay_dag_t *dag, const meshpay_tx_t *tx)
+{
+    if (dag == NULL || tx == NULL || dag->checkpoint.generation == 0) {
+        return false;
+    }
+    const meshpay_checkpoint_account_t *acct =
+        meshpay_checkpoint_find_account(&dag->checkpoint, tx->from);
+    if (acct == NULL) {
+        return false; /* compte inconnu du checkpoint : rien à trancher ici */
+    }
+    return tx->seq <= acct->seq_floor;
+}
+
+esp_err_t meshpay_dag_adopt_checkpoint(meshpay_dag_t *dag,
+                                       const meshpay_checkpoint_t *cp,
+                                       size_t *purged)
+{
+    if (purged != NULL) {
+        *purged = 0;
+    }
+    if (dag == NULL || cp == NULL || cp->generation == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Jamais de retour en arrière : une génération déjà vue (ou plus vieille)
+     * ne re-purge rien — l'adoption est monotone comme l'horizon. */
+    if (cp->generation <= dag->checkpoint.generation) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    memcpy(&dag->checkpoint, cp, sizeof(dag->checkpoint));
+
+    /* Purge sous plancher : même compactage stable que purge_foreign (ordre
+     * relatif préservé, slots zéroïsés, parents pendants tolérés). */
+    size_t kept = 0;
+    for (size_t i = 0; i < dag->count; ++i) {
+        if (!meshpay_dag_below_floor(dag, &dag->transactions[i])) {
+            if (kept != i) {
+                memcpy(&dag->transactions[kept], &dag->transactions[i],
+                       sizeof(dag->transactions[kept]));
+            }
+            kept++;
+        }
+    }
+    size_t removed = dag->count - kept;
+    if (removed > 0) {
+        memset(&dag->transactions[kept], 0,
+               removed * sizeof(dag->transactions[0]));
+    }
+    dag->count = kept;
+    if (purged != NULL) {
+        *purged = removed;
+    }
+    return ESP_OK;
+}

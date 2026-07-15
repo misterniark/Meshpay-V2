@@ -10,6 +10,20 @@
 #define MESHPAY_DAG_SYNC_REQUEST_PATH "/meshpay/dag/request"
 #define MESHPAY_DAG_SYNC_REQUEST_TIMEOUT_MS 30000U
 
+static void put_u32(uint8_t *out, uint32_t value)
+{
+    out[0] = (uint8_t)(value >> 24);
+    out[1] = (uint8_t)(value >> 16);
+    out[2] = (uint8_t)(value >> 8);
+    out[3] = (uint8_t)value;
+}
+
+static uint32_t get_u32(const uint8_t *in)
+{
+    return ((uint32_t)in[0] << 24) | ((uint32_t)in[1] << 16) |
+           ((uint32_t)in[2] << 8) | (uint32_t)in[3];
+}
+
 static void put_u16(uint8_t *out, uint16_t value)
 {
     out[0] = (uint8_t)(value >> 8);
@@ -75,6 +89,12 @@ esp_err_t meshpay_dag_sync_build_summary(
     if (meshpay_dag_digest(dag, digest) == ESP_OK) {
         memcpy(packet->data + pos, digest, MESHPAY_DAG_SYNC_DIGEST_SIZE);
         pos += MESHPAY_DAG_SYNC_DIGEST_SIZE;
+        /* Phase B : la GÉNÉRATION d'horizon suit le digest (queue optionnelle,
+         * même pattern de compat) — un pair en retard de checkpoint se voit et
+         * se fait pousser le re-genesis signé au lieu de re-demander des tx
+         * élaguées à l'infini. */
+        put_u32(packet->data + pos, dag->checkpoint.generation);
+        pos += 4;
     }
     packet->data_len = pos;
     return ESP_OK;
@@ -95,7 +115,8 @@ esp_err_t meshpay_dag_sync_parse_summary(const rns_packet_t *packet,
     size_t base = 4U + (size_t)summary->tip_count * MESHPAY_TX_ID_SIZE;
     if (summary->tip_count > MESHPAY_DAG_SYNC_MAX_TIPS ||
         (packet->data_len != base &&
-         packet->data_len != base + MESHPAY_DAG_SYNC_DIGEST_SIZE)) {
+         packet->data_len != base + MESHPAY_DAG_SYNC_DIGEST_SIZE &&
+         packet->data_len != base + MESHPAY_DAG_SYNC_DIGEST_SIZE + 4U)) {
         return ESP_ERR_INVALID_SIZE;
     }
     size_t pos = 4;
@@ -104,9 +125,15 @@ esp_err_t meshpay_dag_sync_parse_summary(const rns_packet_t *packet,
         pos += MESHPAY_TX_ID_SIZE;
     }
     /* Digest optionnel (compat : ancien format sans digest). */
-    if (packet->data_len == base + MESHPAY_DAG_SYNC_DIGEST_SIZE) {
+    if (packet->data_len >= base + MESHPAY_DAG_SYNC_DIGEST_SIZE) {
         memcpy(summary->digest, packet->data + pos, MESHPAY_DAG_SYNC_DIGEST_SIZE);
         summary->has_digest = true;
+        pos += MESHPAY_DAG_SYNC_DIGEST_SIZE;
+    }
+    /* Génération d'horizon optionnelle (Phase B ; 0 pour les formats
+     * antérieurs — traité comme « aucun checkpoint »). */
+    if (packet->data_len == base + MESHPAY_DAG_SYNC_DIGEST_SIZE + 4U) {
+        summary->generation = get_u32(packet->data + pos);
     }
     return ESP_OK;
 }

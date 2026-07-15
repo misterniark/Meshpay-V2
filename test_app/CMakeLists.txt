@@ -20,6 +20,7 @@ set(EXTRA_COMPONENT_DIRS
     "../components/storage"
     "../components/meshpay_tx"
     "../components/currency_descriptor"
+    "../components/checkpoint"
     "../components/descriptor_sync"
     "../components/dag"
     "../components/dag_store"

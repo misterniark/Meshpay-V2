@@ -30,6 +30,9 @@ typedef struct {
     uint8_t tips[MESHPAY_DAG_SYNC_MAX_TIPS][MESHPAY_TX_ID_SIZE];
     uint8_t digest[MESHPAY_DAG_SYNC_DIGEST_SIZE]; /* valide ssi has_digest */
     bool has_digest;
+    /* Phase B : génération du checkpoint adopté par l'émetteur (0 = aucun,
+     * ou summary d'un firmware d'avant la Phase B — queue optionnelle). */
+    uint32_t generation;
 } meshpay_dag_sync_summary_t;
 
 esp_err_t meshpay_dag_sync_build_summary(

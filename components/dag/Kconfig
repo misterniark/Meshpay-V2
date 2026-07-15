@@ -1,0 +1,24 @@
+menu "MeshPay DAG"
+
+config MESHPAY_DAG_WINDOW
+    int "Taille de la fenêtre DAG (transactions)"
+    default 250
+    range 8 250
+    help
+        Nombre maximal de transactions tenues en RAM (la struct fait
+        ~296 octets par transaction, allouée en PSRAM via s_app). Un
+        build de banc peut la réduire (ex. 20) pour déclencher un vrai
+        cycle de checkpoint avec une poignée de paiements réels.
+
+config MESHPAY_DAG_CHECKPOINT_THRESHOLD
+    int "Seuil de déclenchement du checkpoint fondateur"
+    default 200
+    range 4 250
+    help
+        Quand la fenêtre du FONDATEUR atteint ce seuil, il émet un
+        checkpoint signé (re-genesis : soldes + planchers de seq +
+        annuaire) et la flotte élague. Doit rester inférieur à la
+        fenêtre (la marge absorbe les tx qui circulent pendant la
+        propagation du checkpoint).
+
+endmenu

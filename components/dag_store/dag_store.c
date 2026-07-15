@@ -327,3 +327,185 @@ esp_err_t meshpay_dag_store_load(const meshpay_dag_store_backend_t *backend,
              (unsigned)count);
     return ESP_OK;
 }
+
+/* CRC32 complet d'un buffer (init/final 0xFFFFFFFF), pour la zone checkpoint. */
+static uint32_t crc32_ieee(const void *data, size_t len)
+{
+    return crc32_update(0xFFFFFFFFu, data, len) ^ 0xFFFFFFFFu;
+}
+
+/* --- Phase B : zone checkpoint en queue de partition --- */
+
+#define CP_STORE_MAGIC 0x44535043u  /* 'C','P','S','D' */
+#define CP_STORE_MAGIC2 0x43505346u /* footer */
+#define CP_STORE_VERSION 1u
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    uint32_t generation;
+    uint32_t length; /* longueur du wire CBOR signé qui suit */
+} cp_store_header_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t crc32;
+    uint32_t magic2;
+} cp_store_footer_t;
+
+static size_t cp_slot_size(const meshpay_dag_store_backend_t *be)
+{
+    return round_up(sizeof(cp_store_header_t) + MESHPAY_CHECKPOINT_CBOR_MAX +
+                        sizeof(cp_store_footer_t),
+                    be->erase_size);
+}
+
+static size_t cp_slot_base(const meshpay_dag_store_backend_t *be, int slot)
+{
+    size_t z = cp_slot_size(be);
+    return be->size - (size_t)(2 - slot) * z;
+}
+
+/* Lit le header d'un slot checkpoint ; rend la génération valide ou 0. */
+static uint32_t cp_slot_generation(const meshpay_dag_store_backend_t *be,
+                                   int slot)
+{
+    cp_store_header_t hdr;
+    if (be->read(be->ctx, cp_slot_base(be, slot), &hdr, sizeof(hdr)) !=
+        ESP_OK) {
+        return 0;
+    }
+    if (hdr.magic != CP_STORE_MAGIC || hdr.version != CP_STORE_VERSION ||
+        hdr.length == 0 || hdr.length > MESHPAY_CHECKPOINT_CBOR_MAX ||
+        hdr.generation == 0) {
+        return 0;
+    }
+    return hdr.generation;
+}
+
+esp_err_t meshpay_dag_store_save_checkpoint(
+    const meshpay_dag_store_backend_t *backend,
+    const meshpay_checkpoint_t *cp,
+    const char *reason)
+{
+    if (backend == NULL || backend->read == NULL || backend->write == NULL ||
+        backend->erase == NULL || cp == NULL || cp->generation == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* La zone doit tenir dans la partition SANS mordre le slot fenêtre 1
+     * (capacité réelle du snapshot fenêtre << size/2, vérifié ici). */
+    size_t z = cp_slot_size(backend);
+    if (backend->size < 2 * z ||
+        backend->size / 2U + slot_capacity(backend) >
+            backend->size) { /* garde structurelle (layout historique) */
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    /* Slot inactif = génération la plus basse (0 = libre/invalide). */
+    uint32_t gen0 = cp_slot_generation(backend, 0);
+    uint32_t gen1 = cp_slot_generation(backend, 1);
+    int target = (gen0 <= gen1) ? 0 : 1;
+
+    /* Un buffer unique [header|wire|footer] paddé 16 o (contrainte d'écriture
+     * en flash CHIFFRÉE — même pattern que le save fenêtre), sur le TAS, une
+     * seule écriture dans le slot INACTIF : une coupure laisse l'autre slot
+     * (le checkpoint précédent) intact. */
+    size_t max_total = sizeof(cp_store_header_t) +
+                       MESHPAY_CHECKPOINT_CBOR_MAX +
+                       sizeof(cp_store_footer_t);
+    size_t padded_max = round_up(max_total, 16U);
+    uint8_t *buf = (uint8_t *)malloc(padded_max);
+    if (buf == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    memset(buf, 0xFF, padded_max);
+
+    size_t wire_len = 0;
+    esp_err_t err = meshpay_checkpoint_encode(
+        cp, buf + sizeof(cp_store_header_t), MESHPAY_CHECKPOINT_CBOR_MAX,
+        &wire_len);
+    if (err != ESP_OK) {
+        free(buf);
+        return err;
+    }
+    cp_store_header_t *hdr = (cp_store_header_t *)buf;
+    hdr->magic = CP_STORE_MAGIC;
+    hdr->version = CP_STORE_VERSION;
+    hdr->reserved = 0;
+    hdr->generation = cp->generation;
+    hdr->length = (uint32_t)wire_len;
+    cp_store_footer_t *footer =
+        (cp_store_footer_t *)(buf + sizeof(cp_store_header_t) + wire_len);
+    footer->crc32 = crc32_ieee(buf + sizeof(cp_store_header_t), wire_len);
+    footer->magic2 = CP_STORE_MAGIC2;
+
+    size_t total = sizeof(cp_store_header_t) + wire_len +
+                   sizeof(cp_store_footer_t);
+    size_t padded = round_up(total, 16U);
+    size_t base = cp_slot_base(backend, target);
+    err = backend->erase(backend->ctx, base, z);
+    if (err == ESP_OK) {
+        err = backend->write(backend->ctx, base, buf, padded);
+    }
+    free(buf);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "checkpoint saved slot=%d gen=%u len=%u reason=%s",
+                 target, (unsigned)cp->generation, (unsigned)wire_len,
+                 reason != NULL ? reason : "?");
+    }
+    return err;
+}
+
+esp_err_t meshpay_dag_store_load_checkpoint(
+    const meshpay_dag_store_backend_t *backend,
+    meshpay_checkpoint_t *out_cp)
+{
+    if (backend == NULL || backend->read == NULL || out_cp == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (backend->size < 2 * cp_slot_size(backend)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    int best = -1;
+    uint32_t best_gen = 0;
+    for (int slot = 0; slot < 2; ++slot) {
+        uint32_t gen = cp_slot_generation(backend, slot);
+        if (gen > best_gen) {
+            /* Valide le footer AVANT d'élire le slot (commit incomplet =
+             * slot ignoré). */
+            cp_store_header_t hdr;
+            size_t base = cp_slot_base(backend, slot);
+            if (backend->read(backend->ctx, base, &hdr, sizeof(hdr)) !=
+                ESP_OK) {
+                continue;
+            }
+            uint8_t *wire = (uint8_t *)malloc(hdr.length);
+            if (wire == NULL) {
+                return ESP_ERR_NO_MEM;
+            }
+            cp_store_footer_t footer;
+            esp_err_t err = backend->read(backend->ctx, base + sizeof(hdr),
+                                          wire, hdr.length);
+            if (err == ESP_OK) {
+                err = backend->read(backend->ctx,
+                                    base + sizeof(hdr) + hdr.length, &footer,
+                                    sizeof(footer));
+            }
+            if (err == ESP_OK && footer.magic2 == CP_STORE_MAGIC2 &&
+                footer.crc32 == crc32_ieee(wire, hdr.length) &&
+                meshpay_checkpoint_decode(wire, hdr.length, out_cp) ==
+                    ESP_OK) {
+                best = slot;
+                best_gen = gen;
+            }
+            free(wire);
+        }
+    }
+    if (best < 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    ESP_LOGI(TAG, "checkpoint loaded slot=%d gen=%u", best,
+             (unsigned)best_gen);
+    return ESP_OK;
+}

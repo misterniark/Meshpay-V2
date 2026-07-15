@@ -3563,6 +3563,52 @@ void app_main(void)
             } else {
                 ESP_LOGW(TAG, "dag store load err=%s", esp_err_to_name(lerr));
             }
+            /* Phase B : restaure le checkpoint persisté et l'adopte — APRÈS
+             * la fenêtre (une fenêtre vide + checkpoint est l'état légitime
+             * post-coupe). Vérifié contre la clé du DESCRIPTEUR avant toute
+             * adoption ; l'adoption purge les résidus sous plancher si la
+             * fenêtre persistée précédait la coupe. Buffer sur le TAS. */
+            if (s_app.currency.has_descriptor) {
+                meshpay_checkpoint_t *cp = calloc(1, sizeof(*cp));
+                if (cp != NULL) {
+                    if (meshpay_dag_store_load_checkpoint(&dag_store_be, cp) ==
+                        ESP_OK) {
+                        if (cp->currency_id == s_app.currency.currency_id &&
+                            meshpay_checkpoint_verify(
+                                cp, s_app.currency.founder_public) == ESP_OK) {
+                            size_t cpurged = 0;
+                            if (meshpay_dag_adopt_checkpoint(&s_app.dag, cp,
+                                                             &cpurged) ==
+                                ESP_OK) {
+                                /* next_seq au-dessus de MON plancher : sans
+                                 * ça, fenêtre vide => seq repartirait sous
+                                 * l'horizon et toutes mes tx seraient des
+                                 * rejeux refusés partout. */
+                                const meshpay_checkpoint_account_t *me =
+                                    meshpay_checkpoint_find_account(
+                                        &s_app.dag.checkpoint,
+                                        s_app.local_destination);
+                                if (me != NULL &&
+                                    me->seq_floor >= s_app.wallet.next_seq) {
+                                    s_app.wallet.next_seq = me->seq_floor + 1;
+                                }
+                                (void)refresh_app_balance(&s_app, 0);
+                                ESP_LOGI(TAG,
+                                         "checkpoint adopte au boot gen=%u "
+                                         "purge=%u next_seq=%u",
+                                         (unsigned)s_app.dag.checkpoint
+                                             .generation,
+                                         (unsigned)cpurged,
+                                         (unsigned)s_app.wallet.next_seq);
+                            }
+                        } else {
+                            ESP_LOGW(TAG,
+                                     "checkpoint persiste invalide: ignore");
+                        }
+                    }
+                    free(cp);
+                }
+            }
             (void)meshpay_app_runtime_set_dag_store(&s_runtime, &dag_store_be);
         } else {
             ESP_LOGW(TAG, "dag store partition absent: %s",

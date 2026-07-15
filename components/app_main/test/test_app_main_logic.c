@@ -1819,6 +1819,171 @@ static void join_a_currency(meshpay_app_runtime_t *runtime, meshpay_app_t *app,
     TEST_ASSERT_TRUE(app->currency.has_descriptor); /* pré-condition membre */
 }
 
+/* Variante de sign_min_descriptor qui paramètre le crédit initial et le plafond
+ * (sign_min_descriptor fige initial_credit = 0, inutilisable pour C4). */
+static void sign_credit_descriptor(rns_identity_t *founder, uint8_t founder_seed,
+                                   uint32_t initial_credit, uint64_t max_supply,
+                                   meshpay_currency_descriptor_signed_t *out)
+{
+    load_identity(founder, founder_seed);
+    meshpay_currency_descriptor_t body;
+    meshpay_currency_descriptor_init(&body);
+    strncpy(body.name, "Minimistan", sizeof(body.name) - 1);
+    strncpy(body.symbol, "MIN", sizeof(body.symbol) - 1);
+    body.max_supply = max_supply;
+    body.transfer_fee = 2;
+    body.initial_credit = initial_credit;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_sign(out, &body, founder));
+}
+
+/* --- Phase B (P4) : le checkpoint voyage du fondateur au membre --- */
+
+/* Deux cases à UN runtime chacun (le tail de la suite n'a plus assez de haut
+ * de heap pour deux jeux de queues — dette « harnais anti-fuites » au carnet) ;
+ * le cycle bout-à-bout réel est prouvé au banc à fenêtre réduite (P5). */
+
+TEST_CASE("stale peer summary triggers checkpoint push", "[app_main][p4]")
+{
+    /* Membre d'une monnaie à crédit, auto-CLAIM en fenêtre. */
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t rt;
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t sd;
+    member_runtime_init(&rt, app, &mock);
+    sign_credit_descriptor(&founder, 0x30, 100, 12345, &sd);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_arm_join_anchor(
+                                  &rt, sd.genesis_hash,
+                                  MESHPAY_CURRENCY_INVITE_ANCHOR_LEN, 1000));
+    rns_packet_t offer;
+    build_join_offer(&sd, &offer);
+    inject_reticulum_packet(&rt, &offer, 1000);
+    TEST_ASSERT_TRUE(app->currency.has_descriptor);
+    TEST_ASSERT_EQUAL_size_t(1, meshpay_dag_count(&app->dag));
+
+    /* Il adopte un checkpoint gen 1 (construit/signé par le fondateur). */
+    meshpay_checkpoint_t *cp = malloc(sizeof(meshpay_checkpoint_t));
+    TEST_ASSERT_NOT_NULL(cp);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_build_checkpoint(
+                                  &app->currency, &app->dag, 5000, cp));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_checkpoint_sign(cp, &founder));
+    size_t purged = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_adopt_checkpoint(&app->dag, cp,
+                                                           &purged));
+    free(cp);
+
+    /* Un pair EN RETARD (gén 0 dans son summary) se manifeste : le noeud doit
+     * pousser le RE-GENESIS signé (fragments Resource), rate-limité. */
+    packet_list_probe_t *probe = calloc(1, sizeof(*probe));
+    TEST_ASSERT_NOT_NULL(probe);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
+                                  &rt, packet_list_probe_cb, probe));
+    meshpay_dag_t *stale = test_pool_dag(1);
+    meshpay_dag_init(stale);
+    uint8_t stale_src[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    memset(stale_src, 0x5A, sizeof(stale_src));
+    rns_packet_t summary;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_sync_build_summary(
+                                  stale, stale_src, &summary));
+    inject_reticulum_packet(&rt, &summary, 6000);
+    TEST_ASSERT_TRUE(probe->count > 0);
+    uint32_t first_push = probe->count;
+    /* Rate-limit : un second summary en retard DANS la fenêtre de silence ne
+     * re-pousse pas (~3 Ko de Resource économisés). */
+    inject_reticulum_packet(&rt, &summary, 6500);
+    TEST_ASSERT_EQUAL_UINT32(first_push, probe->count);
+    free(probe);
+    /* Rend les queues/verrou au heap : la suite est longue et chaque runtime
+     * non détruit ampute le budget des tests suivants (dette harnais). */
+    meshpay_app_runtime_destroy(&rt);
+}
+
+TEST_CASE("member adopts checkpoint from sync resource", "[app_main][p4]")
+{
+    /* Membre gén 0 : sa CLAIM auto est sa seule tx (solde = crédit 100). */
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t rt;
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t sd;
+    member_runtime_init(&rt, app, &mock);
+    sign_credit_descriptor(&founder, 0x30, 100, 12345, &sd);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_arm_join_anchor(
+                                  &rt, sd.genesis_hash,
+                                  MESHPAY_CURRENCY_INVITE_ANCHOR_LEN, 1000));
+    rns_packet_t offer;
+    build_join_offer(&sd, &offer);
+    inject_reticulum_packet(&rt, &offer, 1000);
+    TEST_ASSERT_EQUAL_size_t(1, meshpay_dag_count(&app->dag));
+    uint32_t balance_before = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(
+                                  &app->currency, &app->dag,
+                                  app->local_destination, &balance_before));
+    TEST_ASSERT_EQUAL_UINT32(100, balance_before);
+
+    /* Le FONDATEUR (hors runtime : API pures) refonde une DAG contenant la
+     * CLAIM du membre, signe, et son checkpoint part en fragments Resource. */
+    meshpay_dag_t *f_dag = test_pool_dag(1);
+    meshpay_dag_init(f_dag);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
+                      meshpay_dag_merge_tx(f_dag,
+                                           meshpay_dag_at(&app->dag, 0)));
+    meshpay_checkpoint_t *cp = malloc(sizeof(meshpay_checkpoint_t));
+    TEST_ASSERT_NOT_NULL(cp);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_build_checkpoint(
+                                  &app->currency, f_dag, 5000, cp));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_checkpoint_sign(cp, &founder));
+    uint8_t *wire = malloc(MESHPAY_CHECKPOINT_CBOR_MAX);
+    TEST_ASSERT_NOT_NULL(wire);
+    size_t wire_len = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_checkpoint_encode(
+                                  cp, wire, MESHPAY_CHECKPOINT_CBOR_MAX,
+                                  &wire_len));
+    free(cp);
+    rns_link_t link;
+    rns_link_clear(&link);
+    link.status = RNS_LINK_STATUS_ACTIVE;
+    link.mtu = RNS_PACKET_MTU;
+    link.mode = RNS_LINK_MODE_AES256_CBC;
+    memset(link.link_id, 0x30, RNS_DESTINATION_HASH_SIZE);
+    rns_packet_t *packets = calloc(RNS_RESOURCE_MAX_FRAGMENTS,
+                                   sizeof(*packets));
+    TEST_ASSERT_NOT_NULL(packets);
+    size_t packet_count = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_resource_create_packets(
+                                  &link, wire, wire_len, packets,
+                                  RNS_RESOURCE_MAX_FRAGMENTS, &packet_count));
+    free(wire);
+    TEST_ASSERT_TRUE(packet_count > 0);
+
+    /* Adoption par la sync : vérifiée contre la clé du descripteur, purge de
+     * la CLAIM (au checkpoint), solde conservé via l'état refondé, membre
+     * toujours membre, digest = celui du fondateur (fenêtres vides). */
+    for (size_t i = 0; i < packet_count; ++i) {
+        inject_reticulum_packet(&rt, &packets[i], 6100);
+    }
+    free(packets);
+    TEST_ASSERT_EQUAL_UINT32(1, app->dag.checkpoint.generation);
+    TEST_ASSERT_EQUAL_size_t(0, meshpay_dag_count(&app->dag));
+    uint32_t balance_after = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(
+                                  &app->currency, &app->dag,
+                                  app->local_destination, &balance_after));
+    TEST_ASSERT_EQUAL_UINT32(balance_before, balance_after);
+    TEST_ASSERT_TRUE(meshpay_currency_is_member(&app->currency, &app->dag,
+                                                app->local_destination));
+    size_t f_purged = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_adopt_checkpoint(
+                                  f_dag, &app->dag.checkpoint, &f_purged));
+    uint8_t f_digest[RNS_CRYPTO_SHA256_SIZE];
+    uint8_t m_digest[RNS_CRYPTO_SHA256_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(f_dag, f_digest));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(&app->dag, m_digest));
+    TEST_ASSERT_EQUAL_MEMORY(f_digest, m_digest, sizeof(f_digest));
+    meshpay_app_runtime_destroy(&rt);
+}
+
 TEST_CASE("join nominal via invite code imports descriptor", "[app_main][b4]")
 {
     meshpay_app_t *app = test_pool_app(0);
@@ -2488,23 +2653,6 @@ TEST_CASE("bridged join: member requests, founder serves, member imports", "[app
 
 /* --- Palier C4 : auto-émission du crédit initial (CLAIM) --- */
 
-/* Variante de sign_min_descriptor qui paramètre le crédit initial et le plafond
- * (sign_min_descriptor fige initial_credit = 0, inutilisable pour C4). */
-static void sign_credit_descriptor(rns_identity_t *founder, uint8_t founder_seed,
-                                   uint32_t initial_credit, uint64_t max_supply,
-                                   meshpay_currency_descriptor_signed_t *out)
-{
-    load_identity(founder, founder_seed);
-    meshpay_currency_descriptor_t body;
-    meshpay_currency_descriptor_init(&body);
-    strncpy(body.name, "Minimistan", sizeof(body.name) - 1);
-    strncpy(body.symbol, "MIN", sizeof(body.symbol) - 1);
-    body.max_supply = max_supply;
-    body.transfer_fee = 2;
-    body.initial_credit = initial_credit;
-    TEST_ASSERT_EQUAL(ESP_OK,
-                      meshpay_currency_descriptor_sign(out, &body, founder));
-}
 
 /* Pompe les files RETICULUM des deux runtimes pontés jusqu'à épuisement : chaque
  * traitement peut re-remplir la file de l'autre (REQUEST->OFFER, SUMMARY->

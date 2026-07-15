@@ -146,6 +146,9 @@ typedef struct {
     bool dag_store_ready;                   /* backend dag_store installe */
     bool dag_dirty;                         /* DAG modifiee depuis le dernier save */
     uint64_t dag_saved_ms;                  /* horodatage du dernier save reussi */
+    /* Phase B : rate-limit du push de checkpoint vers un pair en retard de
+     * génération (~3 Ko de Resource — un par fenêtre de silence suffit). */
+    uint64_t checkpoint_push_quiet_until_ms;
     meshpay_storage_backend_t storage_backend;
     meshpay_storage_record_t storage_record;
     bool has_storage;

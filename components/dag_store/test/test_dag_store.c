@@ -165,3 +165,76 @@ TEST_CASE("dag store round trips a larger dag", "[dag_store]")
     TEST_ASSERT_EQUAL_MEMORY(digest_src, digest_dst, RNS_CRYPTO_SHA256_SIZE);
     free(buf);
 }
+
+/* --- Phase B (P3) : persistance du checkpoint en queue de partition --- */
+
+TEST_CASE("dag store checkpoint roundtrip and generations", "[dag_store][p3]")
+{
+    uint8_t *buf = malloc(STORE_SIZE);
+    TEST_ASSERT_NOT_NULL(buf);
+    meshpay_dag_store_mock_t mock;
+    meshpay_dag_store_mock_init(&mock, buf, STORE_SIZE);
+    meshpay_dag_store_backend_t be = meshpay_dag_store_mock_backend(&mock);
+
+    /* Partition vierge : aucun checkpoint. */
+    meshpay_checkpoint_t *loaded = malloc(sizeof(meshpay_checkpoint_t));
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      meshpay_dag_store_load_checkpoint(&be, loaded));
+
+    /* Un checkpoint signé plausible (2 comptes). */
+    rns_identity_t founder;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(&founder));
+    meshpay_checkpoint_t *cp = malloc(sizeof(meshpay_checkpoint_t));
+    TEST_ASSERT_NOT_NULL(cp);
+    meshpay_checkpoint_init(cp);
+    cp->currency_id = 0xc5c42609;
+    cp->generation = 1;
+    cp->created_at_ms = 42;
+    cp->account_count = 1;
+    fill_seq(cp->accounts[0].account, RNS_IDENTITY_HASH_SIZE, 0x21);
+    cp->accounts[0].balance = 8;
+    cp->accounts[0].seq_floor = 3;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_checkpoint_sign(cp, &founder));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_dag_store_save_checkpoint(&be, cp, "test"));
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_store_load_checkpoint(&be, loaded));
+    TEST_ASSERT_EQUAL_UINT32(1, loaded->generation);
+    TEST_ASSERT_EQUAL_UINT32(8, loaded->accounts[0].balance);
+    /* Le wire relu est toujours VÉRIFIABLE (signature intacte). */
+    uint8_t founder_public[RNS_IDENTITY_PUBLIC_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_identity_get_public_key(&founder, founder_public));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_checkpoint_verify(loaded, founder_public));
+
+    /* Génération 2 dans l'AUTRE slot : le load élit la plus haute ; le
+     * slot gen 1 survit comme repli (double-buffer). */
+    cp->generation = 2;
+    cp->accounts[0].balance = 6;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_checkpoint_sign(cp, &founder));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_dag_store_save_checkpoint(&be, cp, "test2"));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_store_load_checkpoint(&be, loaded));
+    TEST_ASSERT_EQUAL_UINT32(2, loaded->generation);
+    TEST_ASSERT_EQUAL_UINT32(6, loaded->accounts[0].balance);
+
+    /* Coexistence : la FENÊTRE se sauve toujours sans écraser la zone
+     * checkpoint (et réciproquement). */
+    meshpay_dag_t *dag = test_pool_dag(0);
+    meshpay_dag_init(dag);
+    meshpay_tx_t tx;
+    make_mint(&tx, 0x31, 5);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &tx));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_store_save(&be, dag, "fenetre"));
+    meshpay_dag_t *reloaded = test_pool_dag(1);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_store_load(&be, reloaded));
+    TEST_ASSERT_EQUAL_size_t(1, meshpay_dag_count(reloaded));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_store_load_checkpoint(&be, loaded));
+    TEST_ASSERT_EQUAL_UINT32(2, loaded->generation);
+
+    free(cp);
+    free(loaded);
+    free(buf);
+}

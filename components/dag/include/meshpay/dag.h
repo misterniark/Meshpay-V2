@@ -1,6 +1,8 @@
 #pragma once
 
+#include "meshpay/checkpoint.h"
 #include "meshpay/meshpay_tx.h"
+#include "sdkconfig.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -10,8 +12,11 @@
 extern "C" {
 #endif
 
-#define MESHPAY_DAG_MAX_TRANSACTIONS 250
-#define MESHPAY_DAG_CHECKPOINT_THRESHOLD 200
+/* Phase B : fenêtre et seuil configurables (Kconfig) — défauts historiques
+ * 250/200 ; un build de banc à fenêtre réduite (ex. 20/16) déclenche un vrai
+ * cycle checkpoint→élagage avec quelques paiements réels. */
+#define MESHPAY_DAG_MAX_TRANSACTIONS CONFIG_MESHPAY_DAG_WINDOW
+#define MESHPAY_DAG_CHECKPOINT_THRESHOLD CONFIG_MESHPAY_DAG_CHECKPOINT_THRESHOLD
 #define MESHPAY_DAG_MAX_TIPS 32
 
 typedef enum {
@@ -26,6 +31,13 @@ typedef enum {
 typedef struct {
     meshpay_tx_t transactions[MESHPAY_DAG_MAX_TRANSACTIONS];
     size_t count;
+    /* Phase B — le checkpoint ADOPTÉ (re-genesis signé fondateur) vit avec la
+     * fenêtre qu'il résume : soldes refondés, planchers de seq (anti-rejeu +
+     * désignation de la coupe), annuaire des clés. generation == 0 : aucun
+     * checkpoint (état genesis). La couche currency le lit pour les soldes,
+     * l'annuaire et le gate — sans changement de signatures (elle reçoit déjà
+     * la DAG partout). */
+    meshpay_checkpoint_t checkpoint;
 } meshpay_dag_t;
 
 void meshpay_dag_init(meshpay_dag_t *dag);
@@ -69,6 +81,25 @@ esp_err_t meshpay_dag_digest(const meshpay_dag_t *dag,
  * (le registre de repli y est la monnaie légitime) ni sur un monitor.
  */
 size_t meshpay_dag_purge_foreign(meshpay_dag_t *dag, uint32_t currency_id);
+
+/*
+ * Phase B — adopte un checkpoint (déjà VÉRIFIÉ par l'appelant contre la clé
+ * du descripteur : ni la signature ni la génération ne sont re-jugées ici) et
+ * purge la fenêtre selon ses planchers : toute tx `seq <= seq_floor(from)`
+ * dont le compte figure au checkpoint disparaît — la coupe totale
+ * refondatrice. Compactage en place, ordre préservé, slots zéroïsés, parents
+ * pendants tolérés (décision N0). Retourne le nombre de tx purgées dans
+ * *purged (optionnel). Refuse (INVALID_ARG) un checkpoint de génération 0 ou
+ * d'une génération <= celle déjà adoptée (jamais de retour en arrière).
+ */
+esp_err_t meshpay_dag_adopt_checkpoint(meshpay_dag_t *dag,
+                                       const meshpay_checkpoint_t *cp,
+                                       size_t *purged);
+
+/* Vrai si la tx est SOUS l'horizon du checkpoint adopté : son compte figure
+ * au checkpoint et son seq est <= au plancher. C'est le test d'anti-rejeu
+ * partagé par l'adoption (purge) et le gate d'ingestion (refus). */
+bool meshpay_dag_below_floor(const meshpay_dag_t *dag, const meshpay_tx_t *tx);
 
 #ifdef __cplusplus
 }

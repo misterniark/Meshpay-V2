@@ -29,6 +29,10 @@ typedef enum {
      * TRANSITOIRE par nature : la CLAIM peut être en route par la sync —
      * l'appelant retient/re-tente (cf. rétention F1) au lieu de rejeter. */
     MESHPAY_CURRENCY_ERR_UNKNOWN_MEMBER,
+    /* Phase B : tx d'AVANT l'horizon du checkpoint adopté (seq <= plancher du
+     * compte) — son effet est déjà dans l'état refondé. Rejet DÉFINITIF :
+     * re-livraison d'un pair en retard ou rejeu malveillant. */
+    MESHPAY_CURRENCY_ERR_REPLAY,
 } meshpay_currency_result_t;
 
 typedef struct {
@@ -140,6 +144,26 @@ meshpay_currency_result_t meshpay_currency_ingest_check(
     const meshpay_currency_config_t *config,
     const meshpay_dag_t *dag,
     const meshpay_tx_t *tx);
+
+/*
+ * Phase B — construit (SANS signer) le checkpoint N+1 côté FONDATEUR depuis
+ * l'état complet courant : génération = adoptée + 1, soldes par compte
+ * (checkpoint précédent + fenêtre, par récurrence), planchers de seq
+ * (max(plancher précédent, seq observés en fenêtre)), annuaire (clé du
+ * checkpoint précédent ou de la CLAIM en fenêtre ; l'autorité garde une clé
+ * NULLE — la sienne est au descripteur), digest d'horizon (8 o du digest DAG).
+ * Le set des comptes = comptes du checkpoint précédent ∪ comptes touchés par
+ * la fenêtre ∪ l'autorité — il ne fait que croître ; au-delà de
+ * MESHPAY_CHECKPOINT_MAX_ACCOUNTS : ESP_ERR_INVALID_SIZE (l'émission échoue,
+ * la fenêtre continue jusqu'à saturation — augmenter le Kconfig).
+ * L'appelant signe ensuite (meshpay_checkpoint_sign) puis adopte/diffuse.
+ * out_cp fait ~3 Ko : JAMAIS sur une pile de tâche (leçons des chantiers I/M).
+ */
+esp_err_t meshpay_currency_build_checkpoint(
+    const meshpay_currency_config_t *config,
+    const meshpay_dag_t *dag,
+    uint64_t created_at_ms,
+    meshpay_checkpoint_t *out_cp);
 
 #ifdef __cplusplus
 }

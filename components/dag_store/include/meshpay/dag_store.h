@@ -63,6 +63,26 @@ esp_err_t meshpay_dag_store_save(const meshpay_dag_store_backend_t *backend,
 esp_err_t meshpay_dag_store_load(const meshpay_dag_store_backend_t *backend,
                                  meshpay_dag_t *dag);
 
+/*
+ * Phase B — persistance du CHECKPOINT signé, dans une zone dédiée en QUEUE de
+ * partition (double-buffer à part : le checkpoint change rarement — à
+ * l'émission/adoption — alors que la fenêtre se sauve au débounce ; les slots
+ * fenêtre gardent leurs offsets historiques, seul le slot 1 perd la queue en
+ * capacité théorique — marge réelle très large). Le blob stocké est le WIRE
+ * CBOR signé tel quel : au boot, l'appelant DOIT le vérifier
+ * (meshpay_checkpoint_verify contre la clé du descripteur) AVANT de l'adopter
+ * (meshpay_dag_adopt_checkpoint) — le store ne connaît pas la racine de
+ * confiance. save : slot inactif + footer-commit (coupure = ancien conservé).
+ * load : ESP_ERR_NOT_FOUND si aucun checkpoint persisté.
+ */
+esp_err_t meshpay_dag_store_save_checkpoint(
+    const meshpay_dag_store_backend_t *backend,
+    const meshpay_checkpoint_t *cp,
+    const char *reason);
+esp_err_t meshpay_dag_store_load_checkpoint(
+    const meshpay_dag_store_backend_t *backend,
+    meshpay_checkpoint_t *out_cp);
+
 /* ------------------------------------------------------------------ */
 /* Mock RAM pour les tests (simule une flash : erase=0xFF, write=copie). */
 /* ------------------------------------------------------------------ */

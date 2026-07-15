@@ -1,0 +1,13 @@
+menu "MeshPay checkpoint (Phase B)"
+
+config MESHPAY_CHECKPOINT_MAX_ACCOUNTS
+    int "Nombre maximal de comptes portés par un checkpoint"
+    default 32
+    range 4 128
+    help
+        Borne du tableau de comptes du checkpoint signé fondateur
+        (~88 octets par compte dans la struct, ~96 sur le wire CBOR).
+        Le blob doit tenir dans la zone checkpoint de la partition
+        dagstore et transiter en une Resource radio.
+
+endmenu

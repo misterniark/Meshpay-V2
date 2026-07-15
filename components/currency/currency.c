@@ -1,5 +1,7 @@
 #include "meshpay/currency.h"
 
+#include "esp_check.h"
+
 #include "meshpay/meshpay_tx.h"
 #include "meshpay/rns/rns_crypto.h"
 #include "meshpay/rns/rns_destination.h"
@@ -126,6 +128,16 @@ esp_err_t meshpay_currency_total_minted(
     }
 
     uint64_t total = 0;
+    /* Phase B : la masse frappée AVANT l'horizon a quitté la fenêtre mais pas
+     * la circulation — dans ce modèle sans destruction (les frais vont à
+     * l'autorité), elle vaut exactement la somme des soldes refondés du
+     * checkpoint. Le plafond max_supply reste donc exact par récurrence. */
+    if (dag->checkpoint.generation != 0 &&
+        dag->checkpoint.currency_id == config->currency_id) {
+        for (uint16_t i = 0; i < dag->checkpoint.account_count; ++i) {
+            total += dag->checkpoint.accounts[i].balance;
+        }
+    }
     for (size_t i = 0; i < meshpay_dag_count(dag); ++i) {
         const meshpay_tx_t *tx = meshpay_dag_at(dag, i);
         if (tx == NULL || tx->currency_id != config->currency_id) {
@@ -162,6 +174,16 @@ esp_err_t meshpay_currency_get_balance(
     }
 
     int64_t acc = 0;
+    /* Phase B : le solde part du checkpoint adopté (l'état refondé signé du
+     * fondateur), la fenêtre n'apporte que la contribution post-horizon. */
+    if (dag->checkpoint.generation != 0 &&
+        dag->checkpoint.currency_id == config->currency_id) {
+        const meshpay_checkpoint_account_t *ca =
+            meshpay_checkpoint_find_account(&dag->checkpoint, account);
+        if (ca != NULL) {
+            acc = (int64_t)ca->balance;
+        }
+    }
     bool has_fee_recipient = config->mint_authority_count > 0;
     const uint8_t *fee_recipient =
         has_fee_recipient ? config->mint_authorities[0] : NULL;
@@ -359,6 +381,18 @@ bool meshpay_currency_is_member(
     if (meshpay_currency_is_mint_authority(config, account)) {
         return true;
     }
+    /* Phase B : l'annuaire du checkpoint fait foi pour les membres dont la
+     * CLAIM a été élaguée (clé non nulle = membre refondé ; un compte à clé
+     * nulle est un solde orphelin conservé, PAS un membre). */
+    if (dag->checkpoint.generation != 0 &&
+        dag->checkpoint.currency_id == config->currency_id) {
+        const meshpay_checkpoint_account_t *ca =
+            meshpay_checkpoint_find_account(&dag->checkpoint, account);
+        if (ca != NULL &&
+            !bytes_zero(ca->member_public, RNS_IDENTITY_PUBLIC_SIZE)) {
+            return true;
+        }
+    }
     for (size_t i = 0; i < meshpay_dag_count(dag); ++i) {
         const meshpay_tx_t *tx = meshpay_dag_at(dag, i);
         if (currency_claim_valid(config, tx) &&
@@ -388,6 +422,20 @@ esp_err_t meshpay_currency_member_key(
     if (meshpay_currency_is_mint_authority(config, account)) {
         memcpy(out_public, config->founder_public, RNS_IDENTITY_PUBLIC_SIZE);
         return ESP_OK;
+    }
+    /* Phase B : l'annuaire du checkpoint d'abord — la CLAIM d'un membre
+     * refondé a été élaguée (et son rejeu est refusé au gate), sa clé vit
+     * dans l'état signé. Le lien clé<->compte a été vérifié par le fondateur
+     * à la construction et la table est couverte par sa signature. */
+    if (dag->checkpoint.generation != 0 &&
+        dag->checkpoint.currency_id == config->currency_id) {
+        const meshpay_checkpoint_account_t *ca =
+            meshpay_checkpoint_find_account(&dag->checkpoint, account);
+        if (ca != NULL &&
+            !bytes_zero(ca->member_public, RNS_IDENTITY_PUBLIC_SIZE)) {
+            memcpy(out_public, ca->member_public, RNS_IDENTITY_PUBLIC_SIZE);
+            return ESP_OK;
+        }
     }
     /* Membre ordinaire : sa clé est publiée par sa CLAIM (wire v2). Le lien
      * clé<->compte a été vérifié à l'INGESTION (ingest_check) — ici on ne fait
@@ -440,6 +488,14 @@ meshpay_currency_result_t meshpay_currency_ingest_check(
      * confiance (l'appelant ne gate pas la config de repli). */
     if (!config->has_descriptor) {
         return MESHPAY_CURRENCY_ERR_INVALID;
+    }
+    /* Phase B — anti-rejeu d'avant-horizon : une tx dont le compte figure au
+     * checkpoint avec seq <= plancher a DÉJÀ été comptée dans l'état refondé.
+     * Sa re-livraison (pair en retard, ou malveillant qui rejoue l'histoire)
+     * est un REJET DÉFINITIF, avant même la crypto. Couvre aussi la re-CLAIM
+     * (seq 0 <= plancher pour tout compte refondé). */
+    if (meshpay_dag_below_floor(dag, tx)) {
+        return MESHPAY_CURRENCY_ERR_REPLAY;
     }
 
     /* RÈGLES STATELESS UNIQUEMENT (déterministes quel que soit l'ordre
@@ -524,9 +580,26 @@ size_t meshpay_currency_member_count(
     if (config == NULL || dag == NULL) {
         return 0;
     }
-    /* Chaque CLAIM valide = un membre distinct : l'unicité (from, seq==0)
-     * scopée par monnaie interdit deux CLAIM d'un même compte. */
+    /* Phase B : les membres refondés d'abord — comptes de l'annuaire du
+     * checkpoint à clé non nulle (les soldes orphelins sans clé ne sont pas
+     * des membres), hors autorités (comptées à part, comme avant). */
     size_t count = 0;
+    bool has_checkpoint = dag->checkpoint.generation != 0 &&
+                          dag->checkpoint.currency_id == config->currency_id;
+    if (has_checkpoint) {
+        for (uint16_t i = 0; i < dag->checkpoint.account_count; ++i) {
+            const meshpay_checkpoint_account_t *ca =
+                &dag->checkpoint.accounts[i];
+            if (!bytes_zero(ca->member_public, RNS_IDENTITY_PUBLIC_SIZE) &&
+                !meshpay_currency_is_mint_authority(config, ca->account)) {
+                count++;
+            }
+        }
+    }
+    /* Chaque CLAIM valide de la FENÊTRE = un membre distinct : l'unicité
+     * (from, seq==0) scopée par monnaie interdit deux CLAIM d'un même compte,
+     * et le gate anti-rejeu interdit la CLAIM d'un compte déjà refondé (pas
+     * de double compte possible avec l'annuaire ci-dessus). */
     for (size_t i = 0; i < meshpay_dag_count(dag); ++i) {
         if (currency_claim_valid(config, meshpay_dag_at(dag, i))) {
             count++;
@@ -547,4 +620,114 @@ size_t meshpay_currency_member_count(
         }
     }
     return count;
+}
+
+/* --- Phase B : construction du checkpoint côté fondateur --- */
+
+/* Ajoute `account` au set du checkpoint s'il n'y est pas ; rend son index ou
+ * -1 si la table est pleine. */
+static int checkpoint_intern_account(meshpay_checkpoint_t *cp,
+                                     const uint8_t account[MESHPAY_TX_DESTINATION_HASH_SIZE])
+{
+    for (uint16_t i = 0; i < cp->account_count; ++i) {
+        if (memcmp(cp->accounts[i].account, account,
+                   MESHPAY_TX_DESTINATION_HASH_SIZE) == 0) {
+            return (int)i;
+        }
+    }
+    if (cp->account_count >= MESHPAY_CHECKPOINT_MAX_ACCOUNTS) {
+        return -1;
+    }
+    int idx = (int)cp->account_count;
+    memcpy(cp->accounts[idx].account, account,
+           MESHPAY_TX_DESTINATION_HASH_SIZE);
+    cp->account_count++;
+    return idx;
+}
+
+esp_err_t meshpay_currency_build_checkpoint(
+    const meshpay_currency_config_t *config,
+    const meshpay_dag_t *dag,
+    uint64_t created_at_ms,
+    meshpay_checkpoint_t *out_cp)
+{
+    if (config == NULL || dag == NULL || out_cp == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Le checkpoint n'a de sens que sous une monnaie à descripteur (c'est la
+     * clé du descripteur qui le signera et le fera vérifier partout). */
+    if (!config->has_descriptor || config->mint_authority_count == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    meshpay_checkpoint_init(out_cp);
+    out_cp->currency_id = config->currency_id;
+    out_cp->generation = dag->checkpoint.generation + 1;
+    out_cp->created_at_ms = created_at_ms;
+    uint8_t digest[RNS_CRYPTO_SHA256_SIZE];
+    ESP_RETURN_ON_ERROR(meshpay_dag_digest(dag, digest), "currency", "");
+    memcpy(out_cp->horizon_digest, digest, MESHPAY_CHECKPOINT_DIGEST_SIZE);
+
+    /* 1) Le set des comptes : ceux déjà refondés (récurrence), l'autorité
+     * (les frais la créditent même sans tx à son nom), puis tout compte
+     * touché par la fenêtre (from et to du registre actif). */
+    if (dag->checkpoint.generation != 0 &&
+        dag->checkpoint.currency_id == config->currency_id) {
+        for (uint16_t i = 0; i < dag->checkpoint.account_count; ++i) {
+            if (checkpoint_intern_account(
+                    out_cp, dag->checkpoint.accounts[i].account) < 0) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+        }
+    }
+    if (checkpoint_intern_account(out_cp, config->mint_authorities[0]) < 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    for (size_t i = 0; i < meshpay_dag_count(dag); ++i) {
+        const meshpay_tx_t *tx = meshpay_dag_at(dag, i);
+        if (tx == NULL || tx->currency_id != config->currency_id) {
+            continue;
+        }
+        if (checkpoint_intern_account(out_cp, tx->from) < 0 ||
+            checkpoint_intern_account(out_cp, tx->to) < 0) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+    }
+
+    /* 2) Refonte par compte : solde (récurrence via get_balance), plancher
+     * (max du plancher hérité et des seq de la fenêtre), annuaire (clé
+     * héritée ou publiée par la CLAIM en fenêtre ; autorité = clé nulle). */
+    for (uint16_t i = 0; i < out_cp->account_count; ++i) {
+        meshpay_checkpoint_account_t *a = &out_cp->accounts[i];
+        ESP_RETURN_ON_ERROR(meshpay_currency_get_balance(config, dag,
+                                                         a->account,
+                                                         &a->balance),
+                            "currency", "");
+        const meshpay_checkpoint_account_t *prev =
+            (dag->checkpoint.generation != 0)
+                ? meshpay_checkpoint_find_account(&dag->checkpoint,
+                                                  a->account)
+                : NULL;
+        a->seq_floor = (prev != NULL) ? prev->seq_floor : 0;
+        for (size_t j = 0; j < meshpay_dag_count(dag); ++j) {
+            const meshpay_tx_t *tx = meshpay_dag_at(dag, j);
+            if (tx == NULL || tx->currency_id != config->currency_id ||
+                !account_equal(tx->from, a->account)) {
+                continue;
+            }
+            if (tx->seq > a->seq_floor) {
+                a->seq_floor = tx->seq;
+            }
+        }
+        if (!meshpay_currency_is_mint_authority(config, a->account)) {
+            /* member_key rend la clé héritée du checkpoint ou celle de la
+             * CLAIM en fenêtre ; NOT_FOUND = solde orphelin (clé nulle). */
+            uint8_t key[RNS_IDENTITY_PUBLIC_SIZE];
+            if (meshpay_currency_member_key(config, dag, a->account, key) ==
+                ESP_OK) {
+                memcpy(a->member_public, key, sizeof(a->member_public));
+            }
+        }
+    }
+    return ESP_OK;
 }

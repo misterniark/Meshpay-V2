@@ -21,6 +21,7 @@ idf_component_register(
         "../../components/storage/test/test_storage.c"
         "../../components/meshpay_tx/test/test_meshpay_tx.c"
         "../../components/currency_descriptor/test/test_currency_descriptor.c"
+        "../../components/checkpoint/test/test_checkpoint.c"
         "../../components/descriptor_sync/test/test_descriptor_sync.c"
         "../../components/dag/test/test_dag.c"
         "../../components/dag_store/test/test_dag_store.c"
@@ -34,6 +35,6 @@ idf_component_register(
         "../../components/app_main/test/test_app_main_logic.c"
         "../../components/hardware_smoke/test/test_hardware_smoke.c"
     INCLUDE_DIRS "."
-    REQUIRES unity project_skeleton rns_fixtures rns_crypto rns_identity rns_destination rns_packet rns_packet_crypto rns_announce rns_transport_core rns_iface_espnow rns_iface_lora rns_link_request rns_request_response rns_resource rns_node rns_radio storage meshpay_tx currency_descriptor descriptor_sync dag dag_store currency wallet payment_engine dag_sync dag_monitor device_hal ui app_main hardware_smoke
+    REQUIRES unity project_skeleton rns_fixtures rns_crypto rns_identity rns_destination rns_packet rns_packet_crypto rns_announce rns_transport_core rns_iface_espnow rns_iface_lora rns_link_request rns_request_response rns_resource rns_node rns_radio storage meshpay_tx currency_descriptor checkpoint descriptor_sync dag dag_store currency wallet payment_engine dag_sync dag_monitor device_hal ui app_main hardware_smoke
     WHOLE_ARCHIVE
 )

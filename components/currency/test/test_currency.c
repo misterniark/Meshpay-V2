@@ -826,3 +826,177 @@ TEST_CASE("currency ingest check accepts genuine txs and refuses forgeries",
     TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_WRONG_ID,
                       meshpay_currency_ingest_check(&config, dag, &alien));
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Phase B (P2) — checkpoint : coupe totale refondatrice
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+TEST_CASE("checkpoint rebuild keeps balances directory and floors",
+          "[currency][p2]")
+{
+    meshpay_currency_config_t config;
+    meshpay_dag_t *dag = test_pool_dag(0);
+    rns_identity_t founder;
+    rns_identity_t member;
+    uint8_t member_account[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    ingest_fixture(&config, dag, &founder, &member, member_account);
+    const uint8_t *founder_account = config.mint_authorities[0];
+
+    /* Le membre paie 10 (+fee 1) au fondateur : soldes membre 89, fondateur
+     * 11 (10 + le fee). initial_credit de la fixture = 100, fee = 1. */
+    meshpay_tx_t pay;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_create_transfer(
+                                  &pay, &member, member_account,
+                                  founder_account, 10, 1,
+                                  config.transfer_fee, config.currency_id,
+                                  NULL, 0, 2000));
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
+                      meshpay_currency_ingest_check(&config, dag, &pay));
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &pay));
+
+    uint32_t member_before = 0;
+    uint32_t founder_before = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(
+                                  &config, dag, member_account,
+                                  &member_before));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(
+                                  &config, dag, founder_account,
+                                  &founder_before));
+    uint64_t minted_before = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_total_minted(&config, dag,
+                                                            &minted_before));
+    size_t members_before = meshpay_currency_member_count(&config, dag);
+    size_t count_before = meshpay_dag_count(dag);
+    TEST_ASSERT_TRUE(count_before >= 2);
+
+    /* Le FONDATEUR refonde : build (générations, comptes, planchers) + sign. */
+    meshpay_checkpoint_t *cp = malloc(sizeof(meshpay_checkpoint_t));
+    TEST_ASSERT_NOT_NULL(cp);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_build_checkpoint(
+                                  &config, dag, 5000, cp));
+    TEST_ASSERT_EQUAL_UINT32(1, cp->generation);
+    const meshpay_checkpoint_account_t *m_acct =
+        meshpay_checkpoint_find_account(cp, member_account);
+    const meshpay_checkpoint_account_t *f_acct =
+        meshpay_checkpoint_find_account(cp, founder_account);
+    TEST_ASSERT_NOT_NULL(m_acct);
+    TEST_ASSERT_NOT_NULL(f_acct);
+    TEST_ASSERT_EQUAL_UINT32(member_before, m_acct->balance);
+    TEST_ASSERT_EQUAL_UINT32(founder_before, f_acct->balance);
+    TEST_ASSERT_EQUAL_UINT32(1, m_acct->seq_floor); /* CLAIM seq0 + pay seq1 */
+    /* Annuaire : la clé du membre survit, l'autorité reste « au descripteur ». */
+    uint8_t member_public[RNS_IDENTITY_PUBLIC_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_identity_get_public_key(&member, member_public));
+    TEST_ASSERT_EQUAL_MEMORY(member_public, m_acct->member_public,
+                             RNS_IDENTITY_PUBLIC_SIZE);
+    uint8_t zero_key[RNS_IDENTITY_PUBLIC_SIZE] = {0};
+    TEST_ASSERT_EQUAL_MEMORY(zero_key, f_acct->member_public,
+                             RNS_IDENTITY_PUBLIC_SIZE);
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_checkpoint_sign(cp, &founder));
+
+    /* ADOPTION : coupe TOTALE — la fenêtre se vide, l'état ne bouge PAS. */
+    size_t purged = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_adopt_checkpoint(dag, cp, &purged));
+    TEST_ASSERT_EQUAL_size_t(count_before, purged);
+    TEST_ASSERT_EQUAL_size_t(0, meshpay_dag_count(dag));
+
+    uint32_t member_after = 0;
+    uint32_t founder_after = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(
+                                  &config, dag, member_account, &member_after));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(
+                                  &config, dag, founder_account,
+                                  &founder_after));
+    TEST_ASSERT_EQUAL_UINT32(member_before, member_after);
+    TEST_ASSERT_EQUAL_UINT32(founder_before, founder_after);
+    uint64_t minted_after = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_total_minted(&config, dag,
+                                                            &minted_after));
+    TEST_ASSERT_EQUAL_UINT64(minted_before, minted_after);
+    TEST_ASSERT_EQUAL_size_t(members_before,
+                             meshpay_currency_member_count(&config, dag));
+    TEST_ASSERT_TRUE(meshpay_currency_is_member(&config, dag, member_account));
+    uint8_t resolved[RNS_IDENTITY_PUBLIC_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_member_key(
+                                  &config, dag, member_account, resolved));
+    TEST_ASSERT_EQUAL_MEMORY(member_public, resolved,
+                             RNS_IDENTITY_PUBLIC_SIZE);
+
+    /* ANTI-REJEU : la CLAIM et le paiement élagués, re-livrés par un pair en
+     * retard (ou rejoués), sont REFUSÉS définitivement. */
+    meshpay_tx_t replay_claim;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_create_claim(
+                                  &replay_claim, &member, member_account,
+                                  config.initial_credit, config.currency_id,
+                                  NULL, 0, 1000));
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_REPLAY,
+                      meshpay_currency_ingest_check(&config, dag,
+                                                    &replay_claim));
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_REPLAY,
+                      meshpay_currency_ingest_check(&config, dag, &pay));
+
+    /* La VIE CONTINUE post-horizon : un nouveau paiement (seq au-dessus du
+     * plancher) passe le gate, s'applique sur une fenêtre vide (parents
+     * pendants tolérés) et les soldes suivent depuis la base refondée. */
+    meshpay_tx_t next;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_create_transfer(
+                                  &next, &member, member_account,
+                                  founder_account, 5, 2, config.transfer_fee,
+                                  config.currency_id, NULL, 0, 6000));
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
+                      meshpay_currency_ingest_check(&config, dag, &next));
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &next));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(
+                                  &config, dag, member_account, &member_after));
+    TEST_ASSERT_EQUAL_UINT32(member_before - 5 - config.transfer_fee,
+                             member_after);
+
+    /* Génération 2 : la refonte se compose par récurrence. */
+    meshpay_checkpoint_t *cp2 = malloc(sizeof(meshpay_checkpoint_t));
+    TEST_ASSERT_NOT_NULL(cp2);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_build_checkpoint(
+                                  &config, dag, 7000, cp2));
+    TEST_ASSERT_EQUAL_UINT32(2, cp2->generation);
+    const meshpay_checkpoint_account_t *m2 =
+        meshpay_checkpoint_find_account(cp2, member_account);
+    TEST_ASSERT_NOT_NULL(m2);
+    TEST_ASSERT_EQUAL_UINT32(member_after, m2->balance);
+    TEST_ASSERT_EQUAL_UINT32(2, m2->seq_floor);
+    TEST_ASSERT_EQUAL_MEMORY(member_public, m2->member_public,
+                             RNS_IDENTITY_PUBLIC_SIZE);
+    free(cp2);
+    free(cp);
+}
+
+TEST_CASE("checkpoint adoption is monotonic and scoped", "[currency][p2]")
+{
+    meshpay_currency_config_t config;
+    meshpay_dag_t *dag = test_pool_dag(0);
+    rns_identity_t founder;
+    rns_identity_t member;
+    uint8_t member_account[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    ingest_fixture(&config, dag, &founder, &member, member_account);
+
+    meshpay_checkpoint_t *cp = malloc(sizeof(meshpay_checkpoint_t));
+    TEST_ASSERT_NOT_NULL(cp);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_build_checkpoint(&config, dag, 100, cp));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_checkpoint_sign(cp, &founder));
+    size_t purged = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_adopt_checkpoint(dag, cp, &purged));
+
+    /* Ré-adopter la MÊME génération (ou une plus vieille) : refus monotone. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_dag_adopt_checkpoint(dag, cp, &purged));
+
+    /* Génération 0 : jamais adoptable. */
+    meshpay_checkpoint_t *bad = malloc(sizeof(meshpay_checkpoint_t));
+    TEST_ASSERT_NOT_NULL(bad);
+    meshpay_checkpoint_init(bad);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_dag_adopt_checkpoint(dag, bad, &purged));
+    free(bad);
+    free(cp);
+}

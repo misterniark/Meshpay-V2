@@ -992,6 +992,11 @@ UBaseType_t meshpay_app_runtime_queue_depth(const meshpay_app_runtime_t *runtime
 }
 
 static esp_err_t runtime_persist_wallet_state(meshpay_app_runtime_t *runtime);
+static void runtime_make_dag_sync_link(
+    const uint8_t destination[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    rns_link_t *link);
+static esp_err_t runtime_refresh_balance(meshpay_app_runtime_t *runtime,
+                                         uint64_t now_ms);
 
 /* Intervalle minimal entre deux sauvegardes DAG « débouncées » (anti-usure
  * flash). Un commit de paiement LOCAL force une sauvegarde immédiate hors de ce
@@ -1005,11 +1010,145 @@ static void runtime_dag_mark_dirty(meshpay_app_runtime_t *runtime)
     runtime->dag_dirty = true;
 }
 
+/* ── Phase B : émission (fondateur), diffusion et adoption du checkpoint ──── */
+
+/* Diffuse le checkpoint ADOPTÉ courant en Resource broadcast (le flux est
+ * identifié par notre propre destination ; tous les pairs à portée le
+ * réassemblent, comme observé pour les batchs ciblés). Verrou tenu. */
+static void runtime_send_checkpoint_locked(meshpay_app_runtime_t *runtime)
+{
+    if (runtime->packet_tx == NULL ||
+        runtime->app->dag.checkpoint.generation == 0) {
+        return;
+    }
+    uint8_t *wire = malloc(MESHPAY_CHECKPOINT_CBOR_MAX);
+    rns_packet_t *packets =
+        calloc(RNS_RESOURCE_MAX_FRAGMENTS, sizeof(*packets));
+    if (wire == NULL || packets == NULL) {
+        free(wire);
+        free(packets);
+        return;
+    }
+    size_t wire_len = 0;
+    esp_err_t err = meshpay_checkpoint_encode(&runtime->app->dag.checkpoint,
+                                              wire,
+                                              MESHPAY_CHECKPOINT_CBOR_MAX,
+                                              &wire_len);
+    if (err == ESP_OK) {
+        rns_link_t link;
+        runtime_make_dag_sync_link(runtime->app->local_destination, &link);
+        size_t packet_count = 0;
+        err = rns_resource_create_packets(&link, wire, wire_len, packets,
+                                          RNS_RESOURCE_MAX_FRAGMENTS,
+                                          &packet_count);
+        for (size_t i = 0; err == ESP_OK && i < packet_count; ++i) {
+            err = runtime->packet_tx(&packets[i], runtime->packet_tx_ctx);
+        }
+        if (err == ESP_OK) {
+            ESP_LOGI(APP_RUNTIME_TAG,
+                     "checkpoint tx gen=%u len=%u packets=%u",
+                     (unsigned)runtime->app->dag.checkpoint.generation,
+                     (unsigned)wire_len, (unsigned)packet_count);
+        }
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(APP_RUNTIME_TAG, "checkpoint tx err=%s",
+                 esp_err_to_name(err));
+    }
+    free(wire);
+    free(packets);
+}
+
+/* Adopte un checkpoint DÉJÀ décodé : vérifie la monnaie ET la signature
+ * contre la clé du DESCRIPTEUR (l'unique racine), purge sous plancher,
+ * relève next_seq au-dessus de MON plancher (sans ça mes futures tx seraient
+ * des rejeux refusés partout), persiste fenêtre + checkpoint, rafraîchit le
+ * solde. Verrou tenu. Génération non supérieure : no-op silencieux. */
+static void runtime_adopt_checkpoint_locked(meshpay_app_runtime_t *runtime,
+                                            const meshpay_checkpoint_t *cp,
+                                            uint64_t now_ms,
+                                            const char *origin)
+{
+    meshpay_app_t *app = runtime->app;
+    if (!app->currency.has_descriptor ||
+        cp->currency_id != app->currency.currency_id ||
+        cp->generation <= app->dag.checkpoint.generation) {
+        return;
+    }
+    if (meshpay_checkpoint_verify(cp, app->currency.founder_public) !=
+        ESP_OK) {
+        ESP_LOGW(APP_RUNTIME_TAG,
+                 "checkpoint gen=%u REFUSÉ (signature != fondateur)",
+                 (unsigned)cp->generation);
+        return;
+    }
+    size_t purged = 0;
+    if (meshpay_dag_adopt_checkpoint(&app->dag, cp, &purged) != ESP_OK) {
+        return;
+    }
+    const meshpay_checkpoint_account_t *me =
+        meshpay_checkpoint_find_account(&app->dag.checkpoint,
+                                        app->local_destination);
+    if (me != NULL && me->seq_floor >= app->wallet.next_seq) {
+        app->wallet.next_seq = me->seq_floor + 1;
+        (void)runtime_persist_wallet_state(runtime);
+    }
+    if (runtime->dag_store_ready) {
+        (void)meshpay_dag_store_save_checkpoint(&runtime->dag_store, cp,
+                                                origin);
+        (void)meshpay_dag_store_save(&runtime->dag_store, &app->dag,
+                                     "checkpoint");
+        runtime->dag_dirty = false;
+        runtime->dag_saved_ms = now_ms;
+    }
+    (void)runtime_refresh_balance(runtime, now_ms);
+    ESP_LOGI(APP_RUNTIME_TAG,
+             "checkpoint adopté gen=%u purge=%u next_seq=%u origine=%s",
+             (unsigned)app->dag.checkpoint.generation, (unsigned)purged,
+             (unsigned)app->wallet.next_seq, origin);
+}
+
+/* FONDATEUR au seuil : refonde (build sur le TAS), signe de SON identité
+ * (celle du descripteur), adopte localement puis diffuse. Verrou tenu. */
+static void runtime_maybe_emit_checkpoint(meshpay_app_runtime_t *runtime,
+                                          uint64_t now_ms)
+{
+    meshpay_app_t *app = runtime->app;
+    if (!app->currency.has_descriptor ||
+        !meshpay_dag_needs_checkpoint(&app->dag) ||
+        !meshpay_currency_is_mint_authority(&app->currency,
+                                            app->local_destination)) {
+        return;
+    }
+    meshpay_checkpoint_t *cp = calloc(1, sizeof(*cp));
+    if (cp == NULL) {
+        return;
+    }
+    esp_err_t err = meshpay_currency_build_checkpoint(&app->currency,
+                                                      &app->dag, now_ms, cp);
+    if (err == ESP_OK) {
+        err = meshpay_checkpoint_sign(cp, &app->identity);
+    }
+    if (err == ESP_OK) {
+        runtime_adopt_checkpoint_locked(runtime, cp, now_ms, "emission");
+        runtime_send_checkpoint_locked(runtime);
+    } else {
+        /* Table pleine (INVALID_SIZE) ou refus : la fenêtre continue jusqu'à
+         * saturation — augmenter MESHPAY_CHECKPOINT_MAX_ACCOUNTS. */
+        ESP_LOGW(APP_RUNTIME_TAG, "emission checkpoint err=%s",
+                 esp_err_to_name(err));
+    }
+    free(cp);
+}
+
 /* Persiste la fenêtre DAG si nécessaire. `force` contourne le débounce (utilisé
  * après un commit de paiement local, le cas le plus critique à ne pas perdre). */
 static void runtime_dag_flush(meshpay_app_runtime_t *runtime, uint64_t now_ms,
                               bool force, const char *reason)
 {
+    /* Phase B : le seuil se vérifie au même rythme que la persistance — chez
+     * le fondateur, la refonte part AVANT le save (la fenêtre repart vide). */
+    runtime_maybe_emit_checkpoint(runtime, now_ms);
     if (!runtime->dag_store_ready || !runtime->dag_dirty) {
         return;
     }
@@ -1184,6 +1323,25 @@ static esp_err_t runtime_handle_dag_summary(meshpay_app_runtime_t *runtime,
              (unsigned)summary.tip_count,
              (unsigned)local_count,
              converged ? 1U : 0U);
+    /* Phase B : la GÉNÉRATION se juge AVANT la convergence de digest — deux
+     * fenêtres identiques (voire vides) sous des générations différentes ont
+     * des SOLDES différents du tout au tout : ce n'est pas une convergence.
+     * Pair en retard : ses tx « manquantes » sont sous notre horizon
+     * (élaguées, il ne peut plus les obtenir) et il rejettera nos batchs.
+     * Le seul remède qui converge : lui pousser le RE-GENESIS signé
+     * (rate-limité — un push par fenêtre de silence, la Resource fait ~3 Ko). */
+    if (runtime->app->dag.checkpoint.generation > summary.generation) {
+        if (now_ms >= runtime->checkpoint_push_quiet_until_ms) {
+            runtime->checkpoint_push_quiet_until_ms = now_ms + 5000U;
+            runtime_send_checkpoint_locked(runtime);
+        }
+        return ESP_OK;
+    }
+    /* Pair d'une génération FUTURE : il nous poussera son checkpoint (règle
+     * ci-dessus, miroir) — demander ses tx serait du gâchis (rejeu partiel). */
+    if (summary.generation > runtime->app->dag.checkpoint.generation) {
+        return ESP_OK;
+    }
     if (converged) {
         return ESP_OK;
     }
@@ -1393,6 +1551,26 @@ static esp_err_t runtime_handle_dag_resource(meshpay_app_runtime_t *runtime,
      * presente + `apply err=...` ci-dessous => H2). */
     ESP_LOGI(APP_RUNTIME_TAG,
              "dag resource reassembled batch_len=%u", (unsigned)batch_len);
+
+    /* Phase B : une Resource peut porter un CHECKPOINT signé (préfixe magic
+     * 'CHKP' — aucune collision possible avec un batch, dont les 2 premiers
+     * octets sont un count <= 128). Décodé sur le TAS, vérifié contre la clé
+     * du descripteur, adopté si génération supérieure. */
+    if (batch_len > MESHPAY_CHECKPOINT_PREFIX_SIZE &&
+        batch[0] == (uint8_t)(MESHPAY_CHECKPOINT_MAGIC & 0xFF) &&
+        batch[1] == (uint8_t)((MESHPAY_CHECKPOINT_MAGIC >> 8) & 0xFF) &&
+        batch[2] == (uint8_t)((MESHPAY_CHECKPOINT_MAGIC >> 16) & 0xFF) &&
+        batch[3] == (uint8_t)((MESHPAY_CHECKPOINT_MAGIC >> 24) & 0xFF)) {
+        meshpay_checkpoint_t *cp = calloc(1, sizeof(*cp));
+        if (cp != NULL) {
+            if (meshpay_checkpoint_decode(batch, batch_len, cp) == ESP_OK) {
+                runtime_adopt_checkpoint_locked(runtime, cp, now_ms, "sync");
+            }
+            free(cp);
+        }
+        free(batch);
+        return ESP_OK;
+    }
 
     /* Filtre d'ingestion (chantier nettoyage currency legacy) : sous une
      * monnaie à descripteur, seules les tx du registre actif entrent — les
@@ -1766,6 +1944,14 @@ static esp_err_t runtime_claim_initial_credit_locked(
     }
     /* Monnaie sans crédit initial : rien à réclamer. */
     if (app->currency.initial_credit == 0) {
+        return ESP_OK;
+    }
+    /* Déjà réclamé ? Phase B : mon compte à l'ANNUAIRE du checkpoint adopté
+     * (ma CLAIM a été élaguée, mon crédit vit dans l'état refondé — la
+     * ré-émettre serait un rejeu, refusé par les pairs de toute façon). */
+    if (app->dag.checkpoint.generation != 0 &&
+        meshpay_checkpoint_find_account(&app->dag.checkpoint,
+                                        app->local_destination) != NULL) {
         return ESP_OK;
     }
     /* Déjà réclamé ? (une CLAIM from==moi dans la fenêtre DAG persistée) */
