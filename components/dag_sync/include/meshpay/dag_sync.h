@@ -99,6 +99,52 @@ esp_err_t meshpay_dag_sync_apply_batch_filtered(
     size_t *merged_count,
     size_t *skipped_foreign_count);
 
+/*
+ * Durcissement ingestion — verdict d'un gate de validation par tx, appelé
+ * AVANT le merge (dag_sync ne connaît pas la couche monnaie : le gate est
+ * injecté par l'orchestrateur) :
+ *  - ACCEPT : la tx peut être mergée ;
+ *  - REJECT : refus DÉFINITIF (signature fausse, forge...) — compté dans
+ *    skipped_invalid, jamais re-testé, jamais fatal pour le batch (un pair
+ *    pollué pré-durcissement ne doit pas bloquer la sync des tx saines) ;
+ *  - RETRY : refus TRANSITOIRE (la CLAIM de l'émetteur peut être plus loin
+ *    dans le batch) — re-testé à chaque passe du multi-passes, compté
+ *    seulement s'il subsiste à la stabilisation.
+ */
+typedef enum {
+    MESHPAY_DAG_SYNC_GATE_ACCEPT = 0,
+    MESHPAY_DAG_SYNC_GATE_REJECT,
+    MESHPAY_DAG_SYNC_GATE_RETRY,
+} meshpay_dag_sync_gate_verdict_t;
+
+typedef meshpay_dag_sync_gate_verdict_t (*meshpay_dag_sync_tx_gate_t)(
+    void *ctx,
+    const meshpay_tx_t *tx);
+
+/* Borne du nombre de tx par batch pour la table des verdicts du gate (le
+ * format réel plafonne ~80 tx par BATCH_MAX_SIZE ; 128 = marge + garde-fou
+ * contre un count forgé). */
+#define MESHPAY_DAG_SYNC_BATCH_MAX_TXS 128
+
+/*
+ * Variante complète : filtre par registre (cf. _filtered) + gate de
+ * validation injecté. Le verdict de chaque tx est mémorisé : une tx n'est
+ * gatée qu'une fois (plus les re-tests des RETRY), le coût crypto ne se
+ * multiplie pas par le nombre de passes. gate NULL = pas de validation
+ * (repli, monitor). skipped_invalid_count (optionnel) = REJECT + RETRY
+ * résiduels à la stabilisation.
+ */
+esp_err_t meshpay_dag_sync_apply_batch_gated(
+    meshpay_dag_t *target_dag,
+    const uint8_t *batch,
+    size_t batch_len,
+    const uint32_t *allowed_currency_id,
+    meshpay_dag_sync_tx_gate_t gate,
+    void *gate_ctx,
+    size_t *merged_count,
+    size_t *skipped_foreign_count,
+    size_t *skipped_invalid_count);
+
 #ifdef __cplusplus
 }
 #endif

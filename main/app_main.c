@@ -4,6 +4,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "esp_timer.h"
 #include "meshpay/app_main_logic.h"
 #include "meshpay/dag_monitor.h"
@@ -86,7 +87,15 @@ typedef struct {
 } meshpay_announce_reply_entry_t;
 
 static rns_node_t s_node;
-static meshpay_app_t s_app;
+/* L'état applicatif (~80 Ko dont la fenêtre DAG 250 × sizeof(meshpay_tx_t))
+ * vit en PSRAM : en .bss il épuisait la RAM interne au point que les
+ * DERNIÈRES créations de tâches du boot échouaient (« DAG summary task start
+ * failed » sur les 4 devices, firmware durcissement 2026-07-15) — plus aucun
+ * summary périodique, réseau muet après la salve de boot, pris pour un gel.
+ * Alloué en tête d'app_main (repli RAM interne si PSRAM absente) ; la macro
+ * préserve les ~150 usages existants `s_app.x`. */
+static meshpay_app_t *s_app_ptr;
+#define s_app (*s_app_ptr)
 static meshpay_app_runtime_t s_runtime;
 static char s_device_alias[MESHPAY_STORAGE_ALIAS_MAX];
 static meshpay_announce_reply_entry_t
@@ -3206,6 +3215,25 @@ void app_main(void)
              meshpay_project_skeleton_name(),
              (unsigned)meshpay_project_skeleton_schema_version());
     ESP_LOGI(TAG, "crypto profile: %s", RNS_CRYPTO_SIGNATURE_SCHEME);
+
+    /* État applicatif en PSRAM (cf. la déclaration de s_app_ptr). L'échec est
+     * fatal : sans état, rien à exécuter. Le repli 8-bit couvre une éventuelle
+     * cible sans PSRAM (la macro CAP_SPIRAM y échoue proprement). */
+    s_app_ptr = heap_caps_calloc(1, sizeof(meshpay_app_t),
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_app_ptr == NULL) {
+        s_app_ptr = heap_caps_calloc(1, sizeof(meshpay_app_t),
+                                     MALLOC_CAP_8BIT);
+    }
+    if (s_app_ptr == NULL) {
+        ESP_LOGE(TAG, "allocation etat applicatif impossible (%u o)",
+                 (unsigned)sizeof(meshpay_app_t));
+        return;
+    }
+    ESP_LOGI(TAG, "etat applicatif: %u o (%s)",
+             (unsigned)sizeof(meshpay_app_t),
+             esp_ptr_external_ram(s_app_ptr) ? "PSRAM" : "RAM interne");
+
     init_display_if_available();
 
 #if CONFIG_MESHPAY_DAG_MONITOR_ONLY

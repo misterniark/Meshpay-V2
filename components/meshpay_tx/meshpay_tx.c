@@ -17,9 +17,19 @@ static const char *TAG = "meshpay_tx";
 #define CBOR_KEY_CURRENCY 9
 #define CBOR_KEY_ID 10
 #define CBOR_KEY_SIGNATURE 11
+/* Wire v2 (durcissement ingestion) : clé publique du membre, CLAIM seulement. */
+#define CBOR_KEY_MEMBER_PUBLIC 12
 
 #define SIGNABLE_FIELD_COUNT 9
 #define FULL_FIELD_COUNT 11
+
+/* La map CBOR a un count FIXE par type : les CLAIM portent une clé de plus
+ * (member_public). L'encodage reste canonique (un seul wire possible par tx). */
+static size_t signable_field_count(const meshpay_tx_t *tx)
+{
+    return SIGNABLE_FIELD_COUNT +
+           (tx->type == MESHPAY_TX_TYPE_CLAIM ? 1U : 0U);
+}
 
 typedef struct {
     uint8_t *buf;
@@ -161,7 +171,19 @@ static esp_err_t encode_signable_fields(cbor_writer_t *writer,
     ESP_RETURN_ON_ERROR(cbor_write_uint(writer, tx->timestamp_ms), TAG, "");
 
     ESP_RETURN_ON_ERROR(cbor_write_uint(writer, CBOR_KEY_CURRENCY), TAG, "");
-    return cbor_write_uint(writer, tx->currency_id);
+    ESP_RETURN_ON_ERROR(cbor_write_uint(writer, tx->currency_id), TAG, "");
+
+    /* CLAIM uniquement : la clé du membre fait partie du contenu SIGNÉ (aucune
+     * malléabilité possible, même théorique). Absente du wire pour les autres
+     * types (validate_common exige alors un champ nul). */
+    if (tx->type == MESHPAY_TX_TYPE_CLAIM) {
+        ESP_RETURN_ON_ERROR(cbor_write_uint(writer, CBOR_KEY_MEMBER_PUBLIC),
+                            TAG, "");
+        ESP_RETURN_ON_ERROR(cbor_write_bstr(writer, tx->member_public,
+                                            sizeof(tx->member_public)),
+                            TAG, "");
+    }
+    return ESP_OK;
 }
 
 static bool hash_is_zero(const uint8_t *hash, size_t len)
@@ -208,6 +230,14 @@ static esp_err_t validate_common(const meshpay_tx_t *tx, bool require_signature)
         if (tx->seq != 0) {
             return ESP_ERR_INVALID_ARG;
         }
+        /* Wire v2 : la CLAIM publie la clé du membre — champ obligatoire. */
+        if (hash_is_zero(tx->member_public, sizeof(tx->member_public))) {
+            return ESP_ERR_INVALID_ARG;
+        }
+    } else if (!hash_is_zero(tx->member_public, sizeof(tx->member_public))) {
+        /* Forme stricte : hors CLAIM, aucune clé embarquée (pas de canal
+         * caché, encodage canonique par type). */
+        return ESP_ERR_INVALID_ARG;
     }
     if (require_signature &&
         (hash_is_zero(tx->id, sizeof(tx->id)) ||
@@ -239,7 +269,8 @@ esp_err_t meshpay_tx_encode_signable(const meshpay_tx_t *tx,
         .size = out_size,
         .pos = 0,
     };
-    ESP_RETURN_ON_ERROR(cbor_write_map(&writer, SIGNABLE_FIELD_COUNT), TAG, "");
+    ESP_RETURN_ON_ERROR(cbor_write_map(&writer, signable_field_count(tx)),
+                        TAG, "");
     ESP_RETURN_ON_ERROR(encode_signable_fields(&writer, tx), TAG, "");
     *out_len = writer.pos;
     return ESP_OK;
@@ -260,7 +291,8 @@ esp_err_t meshpay_tx_encode(const meshpay_tx_t *tx,
         .size = out_size,
         .pos = 0,
     };
-    ESP_RETURN_ON_ERROR(cbor_write_map(&writer, FULL_FIELD_COUNT), TAG, "");
+    ESP_RETURN_ON_ERROR(cbor_write_map(&writer, signable_field_count(tx) + 2U),
+                        TAG, "");
     ESP_RETURN_ON_ERROR(encode_signable_fields(&writer, tx), TAG, "");
 
     ESP_RETURN_ON_ERROR(cbor_write_uint(&writer, CBOR_KEY_ID), TAG, "");
@@ -386,6 +418,12 @@ esp_err_t meshpay_tx_create_claim(meshpay_tx_t *tx,
     /* Réflexivité imposée : from == to == membre. */
     memcpy(tx->from, member, sizeof(tx->from));
     memcpy(tx->to, member, sizeof(tx->to));
+    /* Wire v2 : publie la clé du signataire — l'acte de rejointe est aussi
+     * l'enregistrement de la clé dans l'annuaire que constitue la DAG. La
+     * cohérence clé↔compte (wallet-hash == member) est vérifiée à l'ingestion
+     * par la couche currency ; ici on garantit seulement clé == signataire. */
+    ESP_RETURN_ON_ERROR(rns_identity_get_public_key(signer, tx->member_public),
+                        TAG, "");
     tx->amount = amount;
     tx->seq = 0; /* réservé : pivot de l'unicité (from, 0) */
     tx->fee = 0; /* aucun frais sur un crédit */
@@ -500,7 +538,10 @@ esp_err_t meshpay_tx_decode(const uint8_t *data,
 
     uint64_t map_len = 0;
     ESP_RETURN_ON_ERROR(cbor_read_map_len(&reader, &map_len), TAG, "");
-    if (map_len != FULL_FIELD_COUNT) {
+    /* 11 champs, +1 (member_public) pour une CLAIM. La cohérence type↔champ
+     * est tranchée par validate_common en sortie (l'ordre des clés d'une map
+     * hostile ne permet pas de la vérifier au fil de l'eau). */
+    if (map_len != FULL_FIELD_COUNT && map_len != FULL_FIELD_COUNT + 1U) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -509,6 +550,11 @@ esp_err_t meshpay_tx_decode(const uint8_t *data,
         uint64_t key = 0;
         ESP_RETURN_ON_ERROR(cbor_read_uint(&reader, &key), TAG, "");
         if (key > 31U) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        /* Clé dupliquée = wire non canonique (et, à 12 entrées, un moyen de
+         * maquiller l'absence de member_public) : refus. */
+        if (present & (uint32_t)(1UL << key)) {
             return ESP_ERR_INVALID_ARG;
         }
         present |= (uint32_t)(1UL << key);
@@ -585,6 +631,11 @@ esp_err_t meshpay_tx_decode(const uint8_t *data,
         case CBOR_KEY_SIGNATURE:
             ESP_RETURN_ON_ERROR(cbor_read_bstr(&reader, tx->signature,
                                                sizeof(tx->signature)),
+                                TAG, "");
+            break;
+        case CBOR_KEY_MEMBER_PUBLIC:
+            ESP_RETURN_ON_ERROR(cbor_read_bstr(&reader, tx->member_public,
+                                               sizeof(tx->member_public)),
                                 TAG, "");
             break;
         default:

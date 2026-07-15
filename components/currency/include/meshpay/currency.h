@@ -24,6 +24,11 @@ typedef enum {
     MESHPAY_CURRENCY_ERR_INSUFFICIENT,
     MESHPAY_CURRENCY_ERR_BAD_SIGNATURE,
     MESHPAY_CURRENCY_ERR_BAD_AMOUNT, /* CLAIM dont amount != initial_credit */
+    /* Durcissement ingestion : la clé du compte émetteur n'est pas (encore)
+     * dans l'annuaire local (ni fondateur ni CLAIM dans la DAG). Motif
+     * TRANSITOIRE par nature : la CLAIM peut être en route par la sync —
+     * l'appelant retient/re-tente (cf. rétention F1) au lieu de rejeter. */
+    MESHPAY_CURRENCY_ERR_UNKNOWN_MEMBER,
 } meshpay_currency_result_t;
 
 typedef struct {
@@ -103,6 +108,38 @@ bool meshpay_currency_is_member(
 size_t meshpay_currency_member_count(
     const meshpay_currency_config_t *config,
     const meshpay_dag_t *dag);
+
+/*
+ * Durcissement ingestion — annuaire des clés dérivé de la DAG : la clé
+ * publique d'un compte est celle publiée par sa CLAIM (wire v2), ou celle du
+ * descripteur pour le fondateur. ESP_ERR_NOT_FOUND si le compte n'est pas au
+ * registre (sa CLAIM n'est peut-être pas encore arrivée : motif transitoire),
+ * ESP_ERR_INVALID_STATE sans descripteur (le repli n'a pas d'annuaire).
+ */
+esp_err_t meshpay_currency_member_key(
+    const meshpay_currency_config_t *config,
+    const meshpay_dag_t *dag,
+    const uint8_t account[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    uint8_t out_public[RNS_IDENTITY_PUBLIC_SIZE]);
+
+/*
+ * Durcissement ingestion — gate CRYPTO + règles STATIQUES d'une tx reçue du
+ * réseau (batch de sync ou paiement direct), à passer AVANT tout merge DAG :
+ *  - MINT : autorité + signature vérifiée contre la clé fondateur (descripteur) ;
+ *  - CLAIM : réflexivité, amount == initial_credit, lien clé<->compte
+ *    (wallet-hash(member_public) == from) et signature vérifiée contre la clé
+ *    publiée — une CLAIM forgée est indistinguable d'un refus de préimage ;
+ *  - TRANSFER : fee == transfer_fee, émetteur au registre (sinon
+ *    ERR_UNKNOWN_MEMBER, transitoire) et signature vérifiée contre sa clé.
+ * VOLONTAIREMENT ABSENTS (dépendants de l'état, donc de l'ordre d'application
+ * — les gater ferait diverger les noeuds) : solde et max_supply, qui restent
+ * à la défense comptable et au futur consensus (Phase B). Coût : une vérif
+ * Ed25519 (~ms) par tx — une fois à l'ingestion, jamais dans la comptabilité.
+ */
+meshpay_currency_result_t meshpay_currency_ingest_check(
+    const meshpay_currency_config_t *config,
+    const meshpay_dag_t *dag,
+    const meshpay_tx_t *tx);
 
 #ifdef __cplusplus
 }

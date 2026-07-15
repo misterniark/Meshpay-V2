@@ -35,6 +35,16 @@ typedef struct {
     uint64_t timestamp_ms;
     uint8_t parents[MESHPAY_TX_MAX_PARENTS][MESHPAY_TX_PARENT_ID_SIZE];
     uint8_t parent_count;
+    /* Chantier durcissement ingestion (wire v2, 2026-07-15) : la CLAIM — acte
+     * de rejointe — embarque la clé publique d'identité du membre (64 o). La
+     * DAG devient ainsi l'annuaire des clés : toute tx d'un compte se vérifie
+     * contre la clé publiée par sa CLAIM (ou celle du fondateur, publiée par
+     * le descripteur), indépendamment des announces volatiles. Non nul et
+     * couvert par la signature UNIQUEMENT pour une CLAIM ; strictement nul
+     * (et absent du wire CBOR) pour TRANSFER/MINT. Le lien clé↔compte
+     * (wallet-hash(member_public) == from) est vérifié par la couche
+     * currency à l'ingestion, pas ici (pas de dépendance rns_destination). */
+    uint8_t member_public[RNS_IDENTITY_PUBLIC_SIZE];
     uint8_t signature[MESHPAY_TX_SIGNATURE_SIZE];
 } meshpay_tx_t;
 

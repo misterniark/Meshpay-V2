@@ -1696,10 +1696,17 @@ static void member_runtime_init(meshpay_app_runtime_t *runtime,
                                 meshpay_app_t *app,
                                 meshpay_storage_mock_t *mock)
 {
-    uint8_t me[MESHPAY_TX_DESTINATION_HASH_SIZE];
-    fill_sequence(me, sizeof(me), 0x50);
     rns_identity_t self;
     load_identity(&self, 0x50);
+    /* Compte wallet CANONIQUE (dérivé de l'identité) : depuis le durcissement
+     * ingestion, le gate des pairs vérifie le lien clé<->compte des CLAIM —
+     * une adresse arbitraire rendrait ce runtime inapte à toute rejointe. */
+    rns_destination_t self_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&self,
+                                                            &self_wallet));
+    uint8_t me[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    memcpy(me, self_wallet.hash, sizeof(me));
     meshpay_currency_config_t config;
     meshpay_currency_config_init(&config, 1); /* repli : pas de descripteur */
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app, me, &self, &config, 1, true));
@@ -2195,10 +2202,17 @@ static void founder_runtime_init(meshpay_app_runtime_t *runtime,
                                  const meshpay_currency_descriptor_signed_t *signed_desc,
                                  uint8_t addr_seed)
 {
-    uint8_t addr[MESHPAY_TX_DESTINATION_HASH_SIZE];
-    fill_sequence(addr, sizeof(addr), addr_seed);
     rns_identity_t self;
     load_identity(&self, addr_seed);
+    /* Compte wallet CANONIQUE (cf. member_runtime_init) : quand addr_seed est
+     * aussi la graine du FONDATEUR du descripteur, le compte local coïncide
+     * alors avec l'autorité MINT dérivée — comme sur le vrai firmware. */
+    rns_destination_t self_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&self,
+                                                            &self_wallet));
+    uint8_t addr[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    memcpy(addr, self_wallet.hash, sizeof(addr));
     /* Config dérivée du descripteur -> has_descriptor = true (membre). */
     meshpay_currency_config_t config;
     TEST_ASSERT_EQUAL(ESP_OK,
@@ -2462,7 +2476,7 @@ TEST_CASE("bridged join: member auto-claims initial credit and peer syncs it",
                       meshpay_app_runtime_join_state(&runtime_b));
     TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(&app_b->dag));
     uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
-    fill_sequence(member, sizeof(member), 0x50); /* adresse de B (member_runtime_init) */
+    memcpy(member, app_b->local_destination, sizeof(member));
     uint32_t balance = 0;
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(
                                   &app_b->currency, &app_b->dag, member, &balance));
@@ -2513,7 +2527,7 @@ TEST_CASE("initial credit claim is idempotent across reboots", "[app_main][c4]")
                       meshpay_app_runtime_claim_initial_credit(&runtime, 1000));
     TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(&app->dag));
     uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
-    fill_sequence(member, sizeof(member), 0x50);
+    memcpy(member, app->local_destination, sizeof(member));
     uint32_t balance = 0;
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(
                                   &app->currency, &app->dag, member, &balance));
@@ -2662,7 +2676,7 @@ TEST_CASE("create currency makes local device the founder member", "[app_main][d
 
     /* Auto-crédité de initial_credit (une CLAIM réflexive dans le DAG). */
     uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
-    fill_sequence(member, sizeof(member), 0x50); /* local_destination */
+    memcpy(member, app->local_destination, sizeof(member));
     uint32_t balance = 0;
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_get_balance(&app->currency,
                                                            &app->dag, member,
@@ -3353,9 +3367,171 @@ TEST_CASE("payment targets and peer count are filtered to currency members",
     /* Cible de paiement : B seul (C filtré). */
     TEST_ASSERT_EQUAL_UINT8(1, app->ui.payment_peer_count);
     /* Compteur réseau : CLAIM de B + fondateur-autorité (sans CLAIM) = 2
-     * membres ; l'adresse locale du test n'est pas membre, rien à déduire. */
-    TEST_ASSERT_EQUAL_UINT8(2, app->ui.network_peers);
+     * membres ; depuis les comptes canoniques (durcissement), l'adresse
+     * locale EST l'autorité → « membres − moi » = 1, comme sur le firmware. */
+    TEST_ASSERT_EQUAL_UINT8(1, app->ui.network_peers);
 
     meshpay_app_runtime_destroy(&runtime);
     rns_announce_known_reset();
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Durcissement ingestion (I4) — gate au paiement direct + rétention étendue
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Broadcast DATA inerte (type applicatif inconnu 0x7F) : fait tourner la
+ * boucle reticulum — donc le retry F1 en tête — sans AUCUNE réaction des
+ * handlers (contrairement au DISCOVER, auquel un runtime MEMBRE répondrait
+ * par une OFFER qui polluerait la sonde TX). */
+static void inject_inert_packet(meshpay_app_runtime_t *runtime,
+                                uint64_t now_ms)
+{
+    rns_packet_t inert;
+    rns_packet_clear(&inert);
+    inert.header_type = RNS_PACKET_HEADER_TYPE_1;
+    inert.packet_type = RNS_PACKET_TYPE_DATA;
+    inert.destination_type = RNS_DESTINATION_TYPE_PLAIN;
+    fill_sequence(inert.destination_hash, RNS_PACKET_ADDRESS_SIZE, 0x7D);
+    inert.data[0] = 0x7F;
+    inert.data_len = 1;
+    inject_reticulum_packet(runtime, &inert, now_ms);
+}
+
+/* Le paiement d'un membre AUTHENTIQUE dont la CLAIM n'a pas encore atteint le
+ * récepteur est retenu (UNKNOWN_MEMBER, transitoire) puis livré quand la
+ * CLAIM arrive — le pendant « annuaire » de la course de crédit du Palier F1. */
+TEST_CASE("unknown member payment is held then delivered after its claim lands",
+          "[app_main][i4]")
+{
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t desc;
+    sign_named_descriptor(&founder, 0x2E, "Durcie", 100, &desc);
+
+    /* Récepteur B, ancré (gate actif). */
+    meshpay_app_t *app_b = test_pool_app(0);
+    meshpay_storage_mock_t mock_b;
+    meshpay_app_runtime_t runtime_b;
+    founder_runtime_init(&runtime_b, app_b, &mock_b, &desc, 0x2E);
+    packet_tx_probe_t probe = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
+                                  &runtime_b, packet_tx_probe_cb, &probe));
+
+    /* Payeur M : compte wallet CANONIQUE (dérivé de son identité — condition
+     * du lien clé<->compte du gate), CLAIM v2 réelle, même monnaie. */
+    rns_identity_t m_ident;
+    load_identity(&m_ident, 0x5E);
+    rns_destination_t m_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&m_ident,
+                                                            &m_wallet));
+    meshpay_currency_config_t config_m;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_config_from_descriptor(&config_m,
+                                                              &desc));
+    meshpay_app_t *app_m = test_pool_app(1);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_m, m_wallet.hash, &m_ident,
+                                               &config_m, 1, true));
+
+    meshpay_tx_t claim;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_claim(&claim, &m_ident, m_wallet.hash,
+                                              100, config_m.currency_id, NULL,
+                                              0, 500));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_m, &claim));
+    /* PAS de seed chez B : son annuaire ignore M — c'est la course testée. */
+
+    rns_packet_t payment;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_payment_engine_create_payment(
+                                  &app_m->payments, app_b->local_destination,
+                                  10, 800, &payment));
+
+    /* Paiement direct AVANT la CLAIM : retenu (UNKNOWN_MEMBER transitoire),
+     * pas de reject — l'unique paquet émis est le DAG REQUEST ciblé vers M. */
+    inject_reticulum_packet(&runtime_b, &payment, 1000);
+    TEST_ASSERT_EQUAL_UINT32(1, probe.count);
+    TEST_ASSERT_EQUAL(RNS_PACKET_CONTEXT_REQUEST, probe.last_packet.context);
+    TEST_ASSERT_NOT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_RECEIVED,
+                          app_b->ui.feedback);
+
+    /* La CLAIM de M arrive (raccourci : seed) ; l'événement suivant rejoue le
+     * paiement retenu → gate OK (annuaire complet) → ACK + livraison. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_b, &claim));
+    inject_inert_packet(&runtime_b, 2000);
+    TEST_ASSERT_EQUAL_UINT32(2, probe.count);
+    TEST_ASSERT_EQUAL_HEX8(MESHPAY_PAYMENT_MSG_ACK, probe.last_packet.data[0]);
+    TEST_ASSERT_EQUAL_UINT32(10, app_b->ui.balance);
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_RECEIVED, app_b->ui.feedback);
+
+    /* Idempotence : plus rien à rejouer. */
+    inject_inert_packet(&runtime_b, 2100);
+    TEST_ASSERT_EQUAL_UINT32(2, probe.count);
+
+    meshpay_app_runtime_destroy(&runtime_b);
+}
+
+/* Un paiement FORGÉ (usurpation du compte d'un membre connu, signature d'un
+ * imposteur) est rejeté immédiatement : motif définitif, aucun slot consommé. */
+TEST_CASE("forged payment from a known member account rejects immediately",
+          "[app_main][i4]")
+{
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t desc;
+    sign_named_descriptor(&founder, 0x4E, "Durcie2", 100, &desc);
+
+    meshpay_app_t *app_b = test_pool_app(0);
+    meshpay_storage_mock_t mock_b;
+    meshpay_app_runtime_t runtime_b;
+    founder_runtime_init(&runtime_b, app_b, &mock_b, &desc, 0x4E);
+    packet_tx_probe_t probe = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
+                                  &runtime_b, packet_tx_probe_cb, &probe));
+
+    /* Membre M connu de B (CLAIM v2 seedée). */
+    rns_identity_t m_ident;
+    load_identity(&m_ident, 0x6E);
+    rns_destination_t m_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&m_ident,
+                                                            &m_wallet));
+    meshpay_tx_t claim;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_claim(&claim, &m_ident, m_wallet.hash,
+                                              100,
+                                              app_b->currency.currency_id,
+                                              NULL, 0, 500));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_b, &claim));
+
+    /* L'imposteur signe un TRANSFER depuis le compte de M vers B. */
+    rns_identity_t imposter;
+    load_identity(&imposter, 0x7E);
+    meshpay_tx_t theft;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_transfer(
+                          &theft, &imposter, m_wallet.hash,
+                          app_b->local_destination, 10, 1,
+                          app_b->currency.transfer_fee,
+                          app_b->currency.currency_id, NULL, 0, 900));
+
+    rns_packet_t forged;
+    rns_packet_clear(&forged);
+    forged.header_type = RNS_PACKET_HEADER_TYPE_1;
+    forged.packet_type = RNS_PACKET_TYPE_DATA;
+    forged.destination_type = RNS_DESTINATION_TYPE_SINGLE;
+    memcpy(forged.destination_hash, app_b->local_destination,
+           RNS_PACKET_ADDRESS_SIZE);
+    forged.data[0] = MESHPAY_PAYMENT_MSG_TX;
+    size_t tx_len = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_encode(&theft, forged.data + 1,
+                                        sizeof(forged.data) - 1, &tx_len));
+    forged.data_len = 1 + tx_len;
+
+    inject_reticulum_packet(&runtime_b, &forged, 1000);
+    /* Reject immédiat (BAD_SIGNATURE définitif) : pas de rétention. */
+    TEST_ASSERT_EQUAL_UINT32(1, probe.count);
+    TEST_ASSERT_EQUAL_HEX8(MESHPAY_PAYMENT_MSG_REJECT,
+                           probe.last_packet.data[0]);
+    TEST_ASSERT_EQUAL_UINT32(0, app_b->ui.balance);
+
+    meshpay_app_runtime_destroy(&runtime_b);
 }

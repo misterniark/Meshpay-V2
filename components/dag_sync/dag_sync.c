@@ -402,6 +402,34 @@ esp_err_t meshpay_dag_sync_apply_batch_filtered(
     size_t *merged_count,
     size_t *skipped_foreign_count)
 {
+    return meshpay_dag_sync_apply_batch_gated(target_dag, batch, batch_len,
+                                              allowed_currency_id, NULL, NULL,
+                                              merged_count,
+                                              skipped_foreign_count, NULL);
+}
+
+/* États mémorisés par tx du batch (table des verdicts) : évite de re-décoder /
+ * re-gater ce qui est déjà tranché — seul TX_RETRY est re-testé à chaque
+ * passe (son motif — CLAIM de l'émetteur pas encore vue — peut se résoudre
+ * au fil des merges du MÊME batch). */
+typedef enum {
+    TX_PENDING = 0,  /* pas encore examiné (ou merge non fatal à retenter) */
+    TX_DONE,         /* mergé ou duplicate : plus rien à faire */
+    TX_SKIPPED,      /* foreign ou REJECT définitif : compté, plus re-testé */
+    TX_RETRY,        /* gate transitoire : re-testé à chaque passe */
+} tx_state_t;
+
+esp_err_t meshpay_dag_sync_apply_batch_gated(
+    meshpay_dag_t *target_dag,
+    const uint8_t *batch,
+    size_t batch_len,
+    const uint32_t *allowed_currency_id,
+    meshpay_dag_sync_tx_gate_t gate,
+    void *gate_ctx,
+    size_t *merged_count,
+    size_t *skipped_foreign_count,
+    size_t *skipped_invalid_count)
+{
     if (target_dag == NULL || batch == NULL || batch_len < 2) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -411,10 +439,18 @@ esp_err_t meshpay_dag_sync_apply_batch_filtered(
     if (skipped_foreign_count != NULL) {
         *skipped_foreign_count = 0;
     }
+    if (skipped_invalid_count != NULL) {
+        *skipped_invalid_count = 0;
+    }
 
     uint16_t count = get_u16(batch);
+    if (count > MESHPAY_DAG_SYNC_BATCH_MAX_TXS) {
+        return ESP_ERR_INVALID_SIZE;
+    }
     size_t merged = 0;
     size_t skipped_foreign = 0;
+    size_t skipped_invalid = 0;
+    tx_state_t states[MESHPAY_DAG_SYNC_BATCH_MAX_TXS] = {0};
 
     /* Application MULTI-PASSES. Un batch peut contenir des tx dans un ordre non
      * topologique du point de vue du recepteur (emission concurrente, branches
@@ -447,29 +483,58 @@ esp_err_t meshpay_dag_sync_apply_batch_filtered(
             if (encoded_len == 0 || pos + encoded_len > batch_len) {
                 return ESP_ERR_INVALID_SIZE;
             }
+            size_t tx_pos = pos;
+            pos += encoded_len;
+
+            /* Verdict déjà tranché (mergé, duplicate, skippé définitif) :
+             * rien à re-décoder ni re-gater aux passes suivantes. */
+            if (states[i] == TX_DONE || states[i] == TX_SKIPPED) {
+                continue;
+            }
 
             meshpay_tx_t tx;
-            ESP_RETURN_ON_ERROR(meshpay_tx_decode(batch + pos, encoded_len, &tx),
+            ESP_RETURN_ON_ERROR(meshpay_tx_decode(batch + tx_pos, encoded_len,
+                                                  &tx),
                                 "dag_sync", "");
-            pos += encoded_len;
 
             /* Filtre d'ingestion (chantier nettoyage currency legacy) : sous
              * une monnaie a descripteur, les tx d'un autre registre ne rentrent
-             * jamais — ni jugees ni mergees. Compte a la passe 0 uniquement
-             * (les passes suivantes re-parsent le meme batch). */
+             * jamais — ni jugees ni mergees. */
             if (allowed_currency_id != NULL &&
                 tx.currency_id != *allowed_currency_id) {
-                if (pass == 0) {
-                    skipped_foreign++;
-                }
+                states[i] = TX_SKIPPED;
+                skipped_foreign++;
                 continue;
+            }
+
+            /* Gate de validation (durcissement ingestion) : signature et
+             * règles statiques, injecté par l'orchestrateur. REJECT est
+             * définitif (compté ici) ; RETRY sera re-testé — la CLAIM de
+             * l'émetteur peut arriver par un merge ultérieur du même batch. */
+            if (gate != NULL) {
+                meshpay_dag_sync_gate_verdict_t verdict = gate(gate_ctx, &tx);
+                if (verdict == MESHPAY_DAG_SYNC_GATE_REJECT) {
+                    states[i] = TX_SKIPPED;
+                    skipped_invalid++;
+                    continue;
+                }
+                if (verdict == MESHPAY_DAG_SYNC_GATE_RETRY) {
+                    states[i] = TX_RETRY;
+                    continue;
+                }
             }
 
             meshpay_dag_merge_result_t result =
                 meshpay_dag_merge_tx(target_dag, &tx);
-            if (result == MESHPAY_DAG_MERGE_OK) {
-                merged++;
-                progress = true;
+            if (result == MESHPAY_DAG_MERGE_OK ||
+                result == MESHPAY_DAG_MERGE_DUPLICATE) {
+                if (result == MESHPAY_DAG_MERGE_OK) {
+                    merged++;
+                    /* Un merge peut débloquer un RETRY (CLAIM entrée) OU un
+                     * FULL/futur parent : re-passe justifiée. */
+                    progress = true;
+                }
+                states[i] = TX_DONE;
             } else if (result == MESHPAY_DAG_MERGE_CONFLICT ||
                        result == MESHPAY_DAG_MERGE_INVALID) {
                 /* Niveau DEBUG (et non WARN) : ce log est un outil de diagnostic
@@ -482,13 +547,28 @@ esp_err_t meshpay_dag_sync_apply_batch_filtered(
                          (int)result, (unsigned)tx.seq,
                          tx.from[0], tx.from[1], tx.from[2], tx.from[3]);
                 return ESP_ERR_INVALID_STATE;
+            } else {
+                /* FULL : non fatal, retenté. Reclasse PENDING même si la tx
+                 * avait été RETRY (le gate vient de l'accepter : la compter
+                 * « invalide » au bilan serait faux — c'est la fenêtre qui
+                 * est pleine). */
+                states[i] = TX_PENDING;
             }
-            /* DUPLICATE / MISSING_PARENT / FULL : non fatals (cf. ci-dessus). */
         }
         /* Validation de format faite une fois, sur la passe complete initiale :
          * tout le batch doit etre consomme exactement (pas d'octets en trop). */
         if (pass == 0 && pos != batch_len) {
             return ESP_ERR_INVALID_SIZE;
+        }
+        /* Tant qu'un RETRY subsiste, une passe de plus vaut le coup après un
+         * progrès ; sans progrès la boucle s'arrête et les RETRY résiduels
+         * sont comptés comme skippés (leur CLAIM n'est pas dans ce batch —
+         * un batch futur les livrera, la re-sync répète). */
+    }
+
+    for (uint16_t i = 0; i < count; ++i) {
+        if (states[i] == TX_RETRY) {
+            skipped_invalid++;
         }
     }
 
@@ -497,6 +577,9 @@ esp_err_t meshpay_dag_sync_apply_batch_filtered(
     }
     if (skipped_foreign_count != NULL) {
         *skipped_foreign_count = skipped_foreign;
+    }
+    if (skipped_invalid_count != NULL) {
+        *skipped_invalid_count = skipped_invalid;
     }
     return ESP_OK;
 }

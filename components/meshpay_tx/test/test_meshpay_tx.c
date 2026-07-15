@@ -314,5 +314,78 @@ TEST_CASE("meshpay tx encodes and decodes claim round trip", "[meshpay_tx][c1]")
     TEST_ASSERT_EQUAL_MEMORY(tx.id, decoded.id, sizeof(tx.id));
     TEST_ASSERT_EQUAL_MEMORY(tx.signature, decoded.signature,
                              sizeof(tx.signature));
+    /* Wire v2 : la clé du membre voyage dans la CLAIM et revient intacte. */
+    TEST_ASSERT_EQUAL_MEMORY(tx.member_public, decoded.member_public,
+                             sizeof(tx.member_public));
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_verify(&decoded, &signer_public));
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Wire v2 (durcissement ingestion) — la CLAIM publie la clé du membre
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* La clé embarquée est celle du signataire, elle est SIGNÉE (la modifier
+ * invalide la signature), et sa suppression rend la CLAIM invalide en forme. */
+TEST_CASE("meshpay tx claim carries the signer key inside the signed content",
+          "[meshpay_tx][i1]")
+{
+    rns_identity_t signer;
+    rns_identity_t signer_public;
+    load_identity(&signer, 0x8B);
+    load_public_identity(&signer, &signer_public);
+
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t parents[MESHPAY_TX_MAX_PARENTS][MESHPAY_TX_PARENT_ID_SIZE];
+    fill_claim_inputs(member, parents);
+
+    meshpay_tx_t tx;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_create_claim(&tx, &signer, member,
+                                                      1000, 7, parents, 1, 5));
+
+    /* La clé embarquée == la clé publique du signataire. */
+    uint8_t expected[RNS_IDENTITY_PUBLIC_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_get_public_key(&signer, expected));
+    TEST_ASSERT_EQUAL_MEMORY(expected, tx.member_public, sizeof(expected));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_verify(&tx, &signer_public));
+
+    /* Substituer la clé (attaque d'annuaire) casse la signature. */
+    meshpay_tx_t swapped = tx;
+    swapped.member_public[0] ^= 0x01;
+    TEST_ASSERT_NOT_EQUAL(ESP_OK, meshpay_tx_verify(&swapped, &signer_public));
+
+    /* La retirer casse la forme (une CLAIM v2 sans clé n'existe pas). */
+    meshpay_tx_t stripped = tx;
+    memset(stripped.member_public, 0, sizeof(stripped.member_public));
+    uint8_t wire[MESHPAY_TX_CBOR_MAX_SIZE];
+    size_t wire_len = 0;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_tx_encode(&stripped, wire, sizeof(wire),
+                                        &wire_len));
+}
+
+/* Forme stricte : hors CLAIM, aucune clé embarquée n'est tolérée (canal caché
+ * refusé à l'encodage comme au décodage). */
+TEST_CASE("meshpay tx rejects a member key on non claim types",
+          "[meshpay_tx][i1]")
+{
+    rns_identity_t signer;
+    load_identity(&signer, 0x8D);
+
+    uint8_t from[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t to[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    for (size_t i = 0; i < sizeof(from); ++i) {
+        from[i] = (uint8_t)(0x30 + i);
+        to[i] = (uint8_t)(0x60 + i);
+    }
+
+    meshpay_tx_t tx;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_tx_create_transfer(&tx, &signer, from, to,
+                                                         100, 1, 1, 7, NULL, 0,
+                                                         5));
+    tx.member_public[0] = 0xAA; /* greffe une clé sur un TRANSFER */
+
+    uint8_t wire[MESHPAY_TX_CBOR_MAX_SIZE];
+    size_t wire_len = 0;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_tx_encode(&tx, wire, sizeof(wire), &wire_len));
 }

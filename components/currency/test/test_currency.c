@@ -622,3 +622,207 @@ TEST_CASE("currency membership follows valid claims and mint authority",
     TEST_ASSERT_FALSE(meshpay_currency_is_member(NULL, dag, member));
     TEST_ASSERT_EQUAL_size_t(0, meshpay_currency_member_count(&config, NULL));
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Durcissement ingestion (I2) — annuaire des clés + gate crypto
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Monte une monnaie ancrée (descripteur signé) + un membre M dont la CLAIM
+ * v2 réelle (signée, clé embarquée) est déjà dans la DAG. Sort les identités
+ * et les hash de compte pour forger les attaques. */
+static void ingest_fixture(meshpay_currency_config_t *config,
+                           meshpay_dag_t *dag,
+                           rns_identity_t *founder,
+                           rns_identity_t *member,
+                           uint8_t member_account[MESHPAY_TX_DESTINATION_HASH_SIZE])
+{
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(founder));
+    meshpay_currency_descriptor_t body;
+    fill_descriptor_body(&body);
+    meshpay_currency_descriptor_signed_t desc;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_sign(&desc, &body, founder));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_config_from_descriptor(config, &desc));
+
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(member));
+    rns_destination_t member_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(member,
+                                                            &member_wallet));
+    memcpy(member_account, member_wallet.hash,
+           MESHPAY_TX_DESTINATION_HASH_SIZE);
+
+    /* CLAIM v2 réelle : amount == initial_credit (100), clé embarquée. */
+    meshpay_tx_t claim;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_claim(&claim, member, member_account,
+                                              config->initial_credit,
+                                              config->currency_id, NULL, 0,
+                                              1000));
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
+                      meshpay_currency_ingest_check(config, dag, &claim));
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &claim));
+}
+
+TEST_CASE("currency member key resolves founder and claimed members",
+          "[currency][i2]")
+{
+    meshpay_currency_config_t config;
+    meshpay_dag_t *dag = test_pool_dag(0);
+    rns_identity_t founder;
+    rns_identity_t member;
+    uint8_t member_account[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    ingest_fixture(&config, dag, &founder, &member, member_account);
+
+    /* Fondateur : clé lue dans le descripteur, sous son compte wallet. */
+    rns_destination_t founder_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&founder,
+                                                            &founder_wallet));
+    uint8_t resolved[RNS_IDENTITY_PUBLIC_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_member_key(&config, dag,
+                                                  founder_wallet.hash,
+                                                  resolved));
+    TEST_ASSERT_EQUAL_MEMORY(config.founder_public, resolved,
+                             sizeof(resolved));
+
+    /* Membre : clé lue dans sa CLAIM. */
+    uint8_t member_pub[RNS_IDENTITY_PUBLIC_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_identity_get_public_key(&member, member_pub));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_member_key(&config, dag, member_account,
+                                                  resolved));
+    TEST_ASSERT_EQUAL_MEMORY(member_pub, resolved, sizeof(resolved));
+
+    /* Compte jamais vu : NOT_FOUND (motif transitoire pour l'appelant). */
+    uint8_t stranger[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    memset(stranger, 0x5A, sizeof(stranger));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      meshpay_currency_member_key(&config, dag, stranger,
+                                                  resolved));
+
+    /* Config de repli (pas de descripteur) : pas d'annuaire. */
+    meshpay_currency_config_t fallback;
+    meshpay_currency_config_init(&fallback, 1);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_currency_member_key(&fallback, dag, stranger,
+                                                  resolved));
+}
+
+TEST_CASE("currency ingest check accepts genuine txs and refuses forgeries",
+          "[currency][i2]")
+{
+    meshpay_currency_config_t config;
+    meshpay_dag_t *dag = test_pool_dag(0);
+    rns_identity_t founder;
+    rns_identity_t member;
+    uint8_t member_account[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    ingest_fixture(&config, dag, &founder, &member, member_account);
+
+    rns_destination_t founder_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&founder,
+                                                            &founder_wallet));
+
+    /* MINT authentique du fondateur : accepté. */
+    meshpay_tx_t mint;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_mint(&mint, &founder,
+                                             founder_wallet.hash,
+                                             member_account, 500, 7,
+                                             config.currency_id, NULL, 0,
+                                             2000));
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
+                      meshpay_currency_ingest_check(&config, dag, &mint));
+
+    /* MINT forgé (from = autorité publique, signature bidon) : refusé. */
+    meshpay_tx_t forged_mint = mint;
+    forged_mint.signature[0] ^= 0x01;
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_BAD_SIGNATURE,
+                      meshpay_currency_ingest_check(&config, dag,
+                                                    &forged_mint));
+
+    /* TRANSFER authentique du membre (fee = 3 du descripteur) : accepté. */
+    meshpay_tx_t pay;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_transfer(&pay, &member, member_account,
+                                                 founder_wallet.hash, 10, 1,
+                                                 config.transfer_fee,
+                                                 config.currency_id, NULL, 0,
+                                                 3000));
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
+                      meshpay_currency_ingest_check(&config, dag, &pay));
+
+    /* TRANSFER au fee faux : refus définitif. */
+    meshpay_tx_t bad_fee;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_transfer(&bad_fee, &member,
+                                                 member_account,
+                                                 founder_wallet.hash, 10, 2, 1,
+                                                 config.currency_id, NULL, 0,
+                                                 3100));
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_BAD_FEE,
+                      meshpay_currency_ingest_check(&config, dag, &bad_fee));
+
+    /* TRANSFER usurpé : from = compte du membre, signé par un imposteur. */
+    rns_identity_t imposter;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(&imposter));
+    meshpay_tx_t stolen;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_transfer(&stolen, &imposter,
+                                                 member_account,
+                                                 founder_wallet.hash, 10, 3,
+                                                 config.transfer_fee,
+                                                 config.currency_id, NULL, 0,
+                                                 3200));
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_BAD_SIGNATURE,
+                      meshpay_currency_ingest_check(&config, dag, &stolen));
+
+    /* TRANSFER d'un compte hors annuaire : motif TRANSITOIRE dédié. */
+    rns_destination_t imposter_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&imposter,
+                                                            &imposter_wallet));
+    meshpay_tx_t unknown;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_transfer(&unknown, &imposter,
+                                                 imposter_wallet.hash,
+                                                 founder_wallet.hash, 10, 1,
+                                                 config.transfer_fee,
+                                                 config.currency_id, NULL, 0,
+                                                 3300));
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_UNKNOWN_MEMBER,
+                      meshpay_currency_ingest_check(&config, dag, &unknown));
+
+    /* CLAIM au mauvais montant : refusée AVANT toute crypto. */
+    meshpay_tx_t greedy;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_claim(&greedy, &imposter,
+                                              imposter_wallet.hash,
+                                              config.initial_credit + 1,
+                                              config.currency_id, NULL, 0,
+                                              3400));
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_BAD_AMOUNT,
+                      meshpay_currency_ingest_check(&config, dag, &greedy));
+
+    /* CLAIM d'usurpation : l'imposteur publie SA clé sous le COMPTE du membre
+     * (from == compte de M, signer == imposteur) : le lien clé<->compte casse. */
+    meshpay_tx_t hijack;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_claim(&hijack, &imposter,
+                                              member_account,
+                                              config.initial_credit,
+                                              config.currency_id, NULL, 0,
+                                              3500));
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_BAD_SIGNATURE,
+                      meshpay_currency_ingest_check(&config, dag, &hijack));
+
+    /* Mauvais registre : WRONG_ID avant tout le reste. */
+    meshpay_tx_t alien = pay;
+    alien.currency_id = config.currency_id + 1;
+    TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_ERR_WRONG_ID,
+                      meshpay_currency_ingest_check(&config, dag, &alien));
+}

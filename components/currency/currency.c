@@ -2,8 +2,19 @@
 
 #include "meshpay/meshpay_tx.h"
 #include "meshpay/rns/rns_crypto.h"
+#include "meshpay/rns/rns_destination.h"
 #include "meshpay/rns/rns_identity.h"
 #include <string.h>
+
+/* Vrai si le tampon est entièrement nul (champ optionnel absent). */
+static bool bytes_zero(const uint8_t *data, size_t len)
+{
+    uint8_t acc = 0;
+    for (size_t i = 0; i < len; ++i) {
+        acc |= data[i];
+    }
+    return acc == 0;
+}
 
 static bool account_equal(const uint8_t a[MESHPAY_TX_DESTINATION_HASH_SIZE],
                           const uint8_t b[MESHPAY_TX_DESTINATION_HASH_SIZE])
@@ -356,6 +367,154 @@ bool meshpay_currency_is_member(
         }
     }
     return false;
+}
+
+esp_err_t meshpay_currency_member_key(
+    const meshpay_currency_config_t *config,
+    const meshpay_dag_t *dag,
+    const uint8_t account[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    uint8_t out_public[RNS_IDENTITY_PUBLIC_SIZE])
+{
+    if (config == NULL || dag == NULL || account == NULL ||
+        out_public == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Le fondateur publie sa clé dans le corps SIGNÉ du descripteur —
+     * l'annuaire ne vaut que pour une monnaie à descripteur (le repli n'a ni
+     * clé fondateur ni CLAIM authentifiables). */
+    if (!config->has_descriptor) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (meshpay_currency_is_mint_authority(config, account)) {
+        memcpy(out_public, config->founder_public, RNS_IDENTITY_PUBLIC_SIZE);
+        return ESP_OK;
+    }
+    /* Membre ordinaire : sa clé est publiée par sa CLAIM (wire v2). Le lien
+     * clé<->compte a été vérifié à l'INGESTION (ingest_check) — ici on ne fait
+     * que la relire ; une CLAIM pré-v2 (clé nulle) ne compte pas. */
+    for (size_t i = 0; i < meshpay_dag_count(dag); ++i) {
+        const meshpay_tx_t *tx = meshpay_dag_at(dag, i);
+        if (currency_claim_valid(config, tx) &&
+            account_equal(tx->from, account) &&
+            !bytes_zero(tx->member_public, RNS_IDENTITY_PUBLIC_SIZE)) {
+            memcpy(out_public, tx->member_public, RNS_IDENTITY_PUBLIC_SIZE);
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+/* Vérifie que `public_key` est bien la clé du compte `account` : la
+ * destination meshpay.wallet dérivée de la clé doit redonner exactement le
+ * hash `account`. C'est le verrou anti-usurpation de l'annuaire : publier la
+ * clé d'autrui échoue ici (préimage), publier une clé à soi sous le hash d'un
+ * autre aussi. */
+static bool currency_key_binds_account(
+    const uint8_t public_key[RNS_IDENTITY_PUBLIC_SIZE],
+    const uint8_t account[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    rns_identity_t *out_identity)
+{
+    if (rns_identity_load_public(out_identity, public_key) != ESP_OK) {
+        return false;
+    }
+    rns_destination_t wallet;
+    if (rns_destination_create_meshpay_wallet(out_identity, &wallet) !=
+        ESP_OK) {
+        return false;
+    }
+    return memcmp(wallet.hash, account, MESHPAY_TX_DESTINATION_HASH_SIZE) == 0;
+}
+
+meshpay_currency_result_t meshpay_currency_ingest_check(
+    const meshpay_currency_config_t *config,
+    const meshpay_dag_t *dag,
+    const meshpay_tx_t *tx)
+{
+    if (config == NULL || dag == NULL || tx == NULL) {
+        return MESHPAY_CURRENCY_ERR_INVALID;
+    }
+    if (tx->currency_id != config->currency_id) {
+        return MESHPAY_CURRENCY_ERR_WRONG_ID;
+    }
+    /* Le gate exige l'ancrage descripteur : sans lui, aucune racine de
+     * confiance (l'appelant ne gate pas la config de repli). */
+    if (!config->has_descriptor) {
+        return MESHPAY_CURRENCY_ERR_INVALID;
+    }
+
+    /* RÈGLES STATELESS UNIQUEMENT (déterministes quel que soit l'ordre
+     * d'application) : signature, lien clé<->compte, autorité, montants
+     * statiques. Le solde et le plafond de frappe dépendent de l'état au
+     * moment de l'application (ordre, forks) : les gater ici ferait diverger
+     * les noeuds — ils restent à la défense comptable (get_balance,
+     * total_minted) et au futur consensus/checkpoint (Phase B). */
+
+    if (tx->type == MESHPAY_TX_TYPE_MINT) {
+        if (!meshpay_currency_is_mint_authority(config, tx->from)) {
+            return MESHPAY_CURRENCY_ERR_NOT_AUTHORITY;
+        }
+        rns_identity_t founder;
+        if (rns_identity_load_public(&founder, config->founder_public) !=
+            ESP_OK) {
+            return MESHPAY_CURRENCY_ERR_INVALID;
+        }
+        if (meshpay_tx_verify(tx, &founder) != ESP_OK) {
+            return MESHPAY_CURRENCY_ERR_BAD_SIGNATURE;
+        }
+        return MESHPAY_CURRENCY_OK;
+    }
+
+    if (tx->type == MESHPAY_TX_TYPE_CLAIM) {
+        /* Réflexivité et seq==0 déjà imposés par la forme (validate_common au
+         * décodage) ; re-vérifiés en défense (le gate peut recevoir une struct
+         * construite autrement). */
+        if (!account_equal(tx->from, tx->to) || tx->seq != 0) {
+            return MESHPAY_CURRENCY_ERR_INVALID;
+        }
+        if (tx->amount != config->initial_credit) {
+            return MESHPAY_CURRENCY_ERR_BAD_AMOUNT;
+        }
+        /* Le coeur du wire v2 : la clé publiée DOIT redonner le compte, et la
+         * signature DOIT être la sienne. Une CLAIM forgée échoue ici quel que
+         * soit son maquillage. */
+        rns_identity_t member;
+        if (!currency_key_binds_account(tx->member_public, tx->from,
+                                        &member)) {
+            return MESHPAY_CURRENCY_ERR_BAD_SIGNATURE;
+        }
+        if (meshpay_tx_verify(tx, &member) != ESP_OK) {
+            return MESHPAY_CURRENCY_ERR_BAD_SIGNATURE;
+        }
+        return MESHPAY_CURRENCY_OK;
+    }
+
+    if (tx->type == MESHPAY_TX_TYPE_TRANSFER) {
+        if (tx->fee != config->transfer_fee) {
+            return MESHPAY_CURRENCY_ERR_BAD_FEE;
+        }
+        /* L'émetteur doit être au registre (fondateur ou CLAIM déjà ingérée) :
+         * sa clé s'y lit, la signature se vérifie contre elle. L'absence est
+         * un motif TRANSITOIRE (sa CLAIM peut être en route). */
+        uint8_t sender_public[RNS_IDENTITY_PUBLIC_SIZE];
+        esp_err_t err = meshpay_currency_member_key(config, dag, tx->from,
+                                                    sender_public);
+        if (err == ESP_ERR_NOT_FOUND) {
+            return MESHPAY_CURRENCY_ERR_UNKNOWN_MEMBER;
+        }
+        if (err != ESP_OK) {
+            return MESHPAY_CURRENCY_ERR_INVALID;
+        }
+        rns_identity_t sender;
+        if (rns_identity_load_public(&sender, sender_public) != ESP_OK) {
+            return MESHPAY_CURRENCY_ERR_INVALID;
+        }
+        if (meshpay_tx_verify(tx, &sender) != ESP_OK) {
+            return MESHPAY_CURRENCY_ERR_BAD_SIGNATURE;
+        }
+        return MESHPAY_CURRENCY_OK;
+    }
+
+    return MESHPAY_CURRENCY_ERR_INVALID;
 }
 
 size_t meshpay_currency_member_count(

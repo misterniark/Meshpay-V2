@@ -350,6 +350,9 @@ TEST_CASE("dag sync apply_batch filters foreign currency txs", "[dag_sync][n2]")
     make_tx(&claim, MESHPAY_TX_TYPE_CLAIM, 0x30, alice, alice, 8, 0,
             on_legacy, 1);
     claim.currency_id = active;
+    /* Wire v2 : une CLAIM sans clé embarquée ne s'ENCODE plus (forme) — ce
+     * test n'exerce pas le gate, une clé factice non nulle suffit. */
+    fill_sequence(claim.member_public, sizeof(claim.member_public), 0xC4);
 
     uint8_t on_claim[1][MESHPAY_TX_PARENT_ID_SIZE];
     memcpy(on_claim[0], claim.id, MESHPAY_TX_PARENT_ID_SIZE);
@@ -497,4 +500,145 @@ TEST_CASE("dag sync summary carries the dag digest", "[dag_sync]")
     TEST_ASSERT_TRUE(summary_slow.has_digest);
     TEST_ASSERT_NOT_EQUAL(0, memcmp(summary.digest, summary_slow.digest,
                                     MESHPAY_DAG_SYNC_DIGEST_SIZE));
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Durcissement ingestion (I3) — gate injecté dans apply_batch
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+#include "meshpay/currency.h"
+#include "meshpay/currency_descriptor.h"
+#include "meshpay/rns/rns_destination.h"
+
+typedef struct {
+    meshpay_currency_config_t *config;
+    meshpay_dag_t *dag;
+    unsigned calls;
+} gate_ctx_t;
+
+/* Gate de test : la vraie politique currency, plus un compteur d'appels
+ * (vérifie que la table des verdicts évite les re-vérifications inutiles). */
+static meshpay_dag_sync_gate_verdict_t test_tx_gate(void *raw,
+                                                    const meshpay_tx_t *tx)
+{
+    gate_ctx_t *ctx = raw;
+    ctx->calls++;
+    meshpay_currency_result_t result =
+        meshpay_currency_ingest_check(ctx->config, ctx->dag, tx);
+    if (result == MESHPAY_CURRENCY_OK) {
+        return MESHPAY_DAG_SYNC_GATE_ACCEPT;
+    }
+    if (result == MESHPAY_CURRENCY_ERR_UNKNOWN_MEMBER) {
+        return MESHPAY_DAG_SYNC_GATE_RETRY;
+    }
+    return MESHPAY_DAG_SYNC_GATE_REJECT;
+}
+
+/* Batch volontairement retors : le TRANSFER du membre PRÉCÈDE sa CLAIM
+ * (annuaire vide à la première passe → RETRY), et une tx forgée s'y glisse.
+ * Attendu : les deux tx authentiques finissent mergées (multi-passes), la
+ * forge est comptée skipped_invalid, rien n'est fatal. */
+TEST_CASE("dag sync gated batch retries transfer until claim lands and drops forgeries",
+          "[dag_sync][i3]")
+{
+    rns_identity_t founder;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(&founder));
+    meshpay_currency_descriptor_t body;
+    meshpay_currency_descriptor_init(&body);
+    strncpy(body.name, "Gate", sizeof(body.name) - 1);
+    strncpy(body.symbol, "GAT", sizeof(body.symbol) - 1);
+    body.initial_credit = 8;
+    body.transfer_fee = 0;
+    body.created_at_ms = 1000;
+    meshpay_currency_descriptor_signed_t desc;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_sign(&desc, &body, &founder));
+    meshpay_currency_config_t config;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_config_from_descriptor(&config, &desc));
+
+    rns_identity_t member;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(&member));
+    rns_destination_t member_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&member,
+                                                            &member_wallet));
+    rns_destination_t founder_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&founder,
+                                                            &founder_wallet));
+
+    meshpay_tx_t claim;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_claim(&claim, &member,
+                                              member_wallet.hash, 8,
+                                              config.currency_id, NULL, 0,
+                                              2000));
+    meshpay_tx_t pay;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_transfer(&pay, &member,
+                                                 member_wallet.hash,
+                                                 founder_wallet.hash, 3, 1, 0,
+                                                 config.currency_id, NULL, 0,
+                                                 3000));
+    /* Forge : TRANSFER depuis le compte du membre, signature bidon. */
+    meshpay_tx_t forged = pay;
+    forged.seq = 2;
+    fill_sequence(forged.id, sizeof(forged.id), 0xE0);
+    fill_sequence(forged.signature, sizeof(forged.signature), 0xE8);
+
+    meshpay_tx_t ordered[3] = { pay, forged, claim };
+    uint8_t batch[MESHPAY_DAG_SYNC_BATCH_MAX_SIZE];
+    size_t batch_len = 0;
+    encode_batch_manual(ordered, 3, batch, sizeof(batch), &batch_len);
+
+    meshpay_dag_t *dag = test_pool_dag(0);
+    gate_ctx_t ctx = { .config = &config, .dag = dag, .calls = 0 };
+    size_t merged = 0;
+    size_t skipped_foreign = 0;
+    size_t skipped_invalid = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_dag_sync_apply_batch_gated(
+                          dag, batch, batch_len, &config.currency_id,
+                          test_tx_gate, &ctx, &merged, &skipped_foreign,
+                          &skipped_invalid));
+    TEST_ASSERT_EQUAL_UINT32(2, merged);
+    TEST_ASSERT_EQUAL_UINT32(0, skipped_foreign);
+    TEST_ASSERT_EQUAL_UINT32(1, skipped_invalid);
+    TEST_ASSERT_TRUE(meshpay_dag_contains(dag, claim.id));
+    TEST_ASSERT_TRUE(meshpay_dag_contains(dag, pay.id));
+    TEST_ASSERT_FALSE(meshpay_dag_contains(dag, forged.id));
+    /* Économie des verdicts : pay 2× (RETRY sans annuaire, puis ACCEPT),
+     * forge 2× (RETRY tant que la clé de M est inconnue — indécidable —,
+     * puis REJECT une fois la CLAIM mergée), claim 1× → 5 appels, pas
+     * 3 × nombre de passes. */
+    TEST_ASSERT_EQUAL_UINT32(5, ctx.calls);
+
+    /* Le résidu transitoire est compté : un TRANSFER orphelin (membre jamais
+     * réclamé dans CE batch) reste dehors sans bloquer. */
+    rns_identity_t ghost;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(&ghost));
+    rns_destination_t ghost_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&ghost,
+                                                            &ghost_wallet));
+    meshpay_tx_t orphan;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_transfer(&orphan, &ghost,
+                                                 ghost_wallet.hash,
+                                                 founder_wallet.hash, 2, 1, 0,
+                                                 config.currency_id, NULL, 0,
+                                                 4000));
+    meshpay_tx_t only[1] = { orphan };
+    encode_batch_manual(only, 1, batch, sizeof(batch), &batch_len);
+    merged = 0;
+    skipped_invalid = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_dag_sync_apply_batch_gated(
+                          dag, batch, batch_len, &config.currency_id,
+                          test_tx_gate, &ctx, &merged, NULL,
+                          &skipped_invalid));
+    TEST_ASSERT_EQUAL_UINT32(0, merged);
+    TEST_ASSERT_EQUAL_UINT32(1, skipped_invalid);
+    TEST_ASSERT_FALSE(meshpay_dag_contains(dag, orphan.id));
 }

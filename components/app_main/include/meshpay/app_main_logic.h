@@ -21,7 +21,19 @@ extern "C" {
 #define MESHPAY_APP_CORE_TASK_NAME "core_task"
 
 #define MESHPAY_APP_QUEUE_DEFAULT_LENGTH 16
+/* ATTENTION dimensionnement : sur ESP-IDF, usStackDepth d'xTaskCreate est en
+ * OCTETS (pas en « mots » comme le FreeRTOS vanilla) — ces valeurs sont donc
+ * des OCTETS malgré le nom historique du champ (*_stack_words). 8 Ko
+ * suffisaient avant le durcissement de l'ingestion ; le gate ajoute la
+ * vérification Ed25519 (Monocypher, ~2-4 Ko de pile par vérif) sur la tâche
+ * RETICULUM (batchs de sync, paiements directs) et la tâche CORE signe les tx
+ * émises → piles relevées à 16/12 Ko. Cause établie par bisection au réel le
+ * 2026-07-15 : gel silencieux des 3 Waveshare à ~4,4 s d'uptime (débordement
+ * de pile = corruption différée, symptôme SANS panic — le banc test_app,
+ * mono-tâche sur pile de 128 Ko, ne peut PAS l'attraper). */
 #define MESHPAY_APP_TASK_STACK_WORDS 8192
+#define MESHPAY_APP_RETICULUM_STACK_BYTES 16384
+#define MESHPAY_APP_CORE_STACK_BYTES 12288
 
 /* Palier E2 — capacité de la liste des monnaies découvertes (voir la zone
  * « Découverte » de meshpay_app_runtime_t et les API arm/emit/get/join). */

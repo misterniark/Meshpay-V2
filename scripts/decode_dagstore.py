@@ -38,8 +38,13 @@ TYPES = {1: "TRANSFER", 2: "MINT", 3: "CLAIM"}
 #   fee @76, currency_id @80, puis timestamp_ms (u64, alignement variable),
 #   parents[2][32], parent_count, signature[64].
 LAYOUTS = {
+    # wire v1 (avant durcissement ingestion)
     224: {"ts": 84, "parents": 92, "pcount": 156},
     232: {"ts": 88, "parents": 96, "pcount": 160},
+    # wire v2 : + member_public[64] entre parent_count et signature — les
+    # offsets lus ici ne bougent pas, seule l'enjambée record_size change.
+    288: {"ts": 84, "parents": 92, "pcount": 156},
+    296: {"ts": 88, "parents": 96, "pcount": 160},
 }
 
 

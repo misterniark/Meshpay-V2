@@ -360,23 +360,57 @@ esp_err_t meshpay_payment_engine_receive_payment(
         return err;
     }
     bool tx_is_for_us = account_equal(tx.to, engine->wallet->owner);
-    esp_err_t verify_err = verify_sender_if_known(&tx);
-    if (verify_err != ESP_OK) {
-        ESP_LOGW(TAG,
-                 "payment reject verify from=%02x%02x%02x%02x err=%s",
-                 tx.from[0],
-                 tx.from[1],
-                 tx.from[2],
-                 tx.from[3],
-                 esp_err_to_name(verify_err));
-        engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
-        if (tx_is_for_us) {
-            payment_status_packet(ack_packet,
-                                  tx.from,
-                                  MESHPAY_PAYMENT_MSG_REJECT,
-                                  tx.id);
+    if (engine->currency->has_descriptor) {
+        /* Durcissement ingestion : sous une monnaie à descripteur, le gate
+         * crypto complet (annuaire de la DAG) remplace la vérification
+         * opportuniste par announce — un émetteur silencieux (jamais annoncé)
+         * n'échappe plus à la vérification de signature. Le motif est mémorisé
+         * pour l'orchestrateur : UNKNOWN_MEMBER est TRANSITOIRE (la CLAIM du
+         * payeur peut être en route par la sync → rétention F1), tout le reste
+         * est définitif. */
+        meshpay_currency_result_t gate_result = meshpay_currency_ingest_check(
+            engine->currency, engine->dag, &tx);
+        if (gate_result != MESHPAY_CURRENCY_OK) {
+            engine->last_currency_result = gate_result;
+            ESP_LOGW(TAG,
+                     "payment reject gate=%d from=%02x%02x%02x%02x dag=%u",
+                     (int)gate_result,
+                     tx.from[0],
+                     tx.from[1],
+                     tx.from[2],
+                     tx.from[3],
+                     (unsigned)meshpay_dag_count(engine->dag));
+            engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
+            if (tx_is_for_us) {
+                payment_status_packet(ack_packet,
+                                      tx.from,
+                                      MESHPAY_PAYMENT_MSG_REJECT,
+                                      tx.id);
+            }
+            return ESP_ERR_INVALID_STATE;
         }
-        return ESP_ERR_INVALID_STATE;
+    } else {
+        /* Config de repli (pas de descripteur, donc pas d'annuaire) :
+         * vérification opportuniste historique — signature contrôlée si
+         * l'émetteur s'est annoncé, sinon accepté (maillage ouvert de dev). */
+        esp_err_t verify_err = verify_sender_if_known(&tx);
+        if (verify_err != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "payment reject verify from=%02x%02x%02x%02x err=%s",
+                     tx.from[0],
+                     tx.from[1],
+                     tx.from[2],
+                     tx.from[3],
+                     esp_err_to_name(verify_err));
+            engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
+            if (tx_is_for_us) {
+                payment_status_packet(ack_packet,
+                                      tx.from,
+                                      MESHPAY_PAYMENT_MSG_REJECT,
+                                      tx.id);
+            }
+            return ESP_ERR_INVALID_STATE;
+        }
     }
     meshpay_currency_result_t currency_result =
         meshpay_currency_validate_tx(engine->currency, engine->dag, &tx);

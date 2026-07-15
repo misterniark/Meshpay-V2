@@ -525,8 +525,8 @@ meshpay_app_runtime_config_t meshpay_app_runtime_default_config(void)
         .reticulum_queue_length = MESHPAY_APP_QUEUE_DEFAULT_LENGTH,
         .core_queue_length = MESHPAY_APP_QUEUE_DEFAULT_LENGTH,
         .ui_stack_words = MESHPAY_APP_TASK_STACK_WORDS,
-        .reticulum_stack_words = MESHPAY_APP_TASK_STACK_WORDS,
-        .core_stack_words = MESHPAY_APP_TASK_STACK_WORDS,
+        .reticulum_stack_words = MESHPAY_APP_RETICULUM_STACK_BYTES,
+        .core_stack_words = MESHPAY_APP_CORE_STACK_BYTES,
         .ui_priority = MESHPAY_APP_TASK_PRIORITY,
         .reticulum_priority = MESHPAY_APP_TASK_PRIORITY,
         .core_priority = MESHPAY_APP_TASK_PRIORITY,
@@ -1247,6 +1247,31 @@ static esp_err_t runtime_handle_dag_request(meshpay_app_runtime_t *runtime,
     return ESP_OK;
 }
 
+/* Gate d'ingestion (durcissement) : traduit le verdict crypto/statique de la
+ * couche currency vers dag_sync. UNKNOWN_MEMBER est le SEUL motif transitoire
+ * (la CLAIM de l'émetteur peut être plus loin dans le batch ou dans un batch
+ * futur) ; tout le reste (signature fausse, forge, frais faux) est définitif.
+ * Log par tx en DEBUG seulement — même politique anti-spam radio que le log
+ * fatal d'apply_batch ; le bilan agrégé part en INFO chez l'appelant. */
+static meshpay_dag_sync_gate_verdict_t runtime_tx_gate(void *ctx,
+                                                       const meshpay_tx_t *tx)
+{
+    meshpay_app_runtime_t *runtime = ctx;
+    meshpay_currency_result_t result = meshpay_currency_ingest_check(
+        &runtime->app->currency, &runtime->app->dag, tx);
+    if (result == MESHPAY_CURRENCY_OK) {
+        return MESHPAY_DAG_SYNC_GATE_ACCEPT;
+    }
+    if (result == MESHPAY_CURRENCY_ERR_UNKNOWN_MEMBER) {
+        return MESHPAY_DAG_SYNC_GATE_RETRY;
+    }
+    ESP_LOGD(APP_RUNTIME_TAG,
+             "tx refusée à l'ingestion motif=%d type=%d from=%02x%02x%02x%02x",
+             (int)result, (int)tx->type,
+             tx->from[0], tx->from[1], tx->from[2], tx->from[3]);
+    return MESHPAY_DAG_SYNC_GATE_REJECT;
+}
+
 static esp_err_t runtime_handle_dag_resource(meshpay_app_runtime_t *runtime,
                                              const rns_packet_t *packet,
                                              uint64_t now_ms)
@@ -1284,19 +1309,23 @@ static esp_err_t runtime_handle_dag_resource(meshpay_app_runtime_t *runtime,
     /* Filtre d'ingestion (chantier nettoyage currency legacy) : sous une
      * monnaie à descripteur, seules les tx du registre actif entrent — les
      * legacy (boot-credits du repli, autres monnaies) sont skippées à la
-     * source. Config de repli : pas de filtre (comportement historique). */
+     * source. Config de repli : ni filtre ni gate (comportement historique,
+     * aucune racine de confiance sans descripteur). */
+    bool anchored = runtime->app->currency.has_descriptor;
     const uint32_t *allowed =
-        runtime->app->currency.has_descriptor
-            ? &runtime->app->currency.currency_id
-            : NULL;
+        anchored ? &runtime->app->currency.currency_id : NULL;
     size_t merged = 0;
     size_t skipped_foreign = 0;
-    err = meshpay_dag_sync_apply_batch_filtered(&runtime->app->dag,
-                                                batch,
-                                                batch_len,
-                                                allowed,
-                                                &merged,
-                                                &skipped_foreign);
+    size_t skipped_invalid = 0;
+    err = meshpay_dag_sync_apply_batch_gated(&runtime->app->dag,
+                                             batch,
+                                             batch_len,
+                                             allowed,
+                                             anchored ? runtime_tx_gate : NULL,
+                                             runtime,
+                                             &merged,
+                                             &skipped_foreign,
+                                             &skipped_invalid);
     free(batch);
     if (err != ESP_OK) {
         ESP_LOGW(APP_RUNTIME_TAG,
@@ -1312,9 +1341,10 @@ static esp_err_t runtime_handle_dag_resource(meshpay_app_runtime_t *runtime,
         runtime_retry_held_payments(runtime, now_ms);
     }
     ESP_LOGI(APP_RUNTIME_TAG,
-             "dag resource merged=%u skipped_foreign=%u total=%u",
+             "dag resource merged=%u skipped_foreign=%u skipped_invalid=%u total=%u",
              (unsigned)merged,
              (unsigned)skipped_foreign,
+             (unsigned)skipped_invalid,
              (unsigned)meshpay_dag_count(&runtime->app->dag));
     return runtime_refresh_balance(runtime, now_ms);
 }
@@ -1412,12 +1442,14 @@ static void runtime_retry_held_payments(meshpay_app_runtime_t *runtime,
             ESP_LOGI(APP_RUNTIME_TAG, "paiement retenu livré après sync");
             continue;
         }
-        const bool still_insufficient =
+        const bool still_transient =
             err == ESP_ERR_INVALID_STATE &&
-            runtime->app->payments.last_currency_result ==
-                MESHPAY_CURRENCY_ERR_INSUFFICIENT;
-        if (still_insufficient && now_ms < slot->deadline_ms) {
-            continue; /* la sync peut encore livrer le crédit manquant */
+            (runtime->app->payments.last_currency_result ==
+                 MESHPAY_CURRENCY_ERR_INSUFFICIENT ||
+             runtime->app->payments.last_currency_result ==
+                 MESHPAY_CURRENCY_ERR_UNKNOWN_MEMBER);
+        if (still_transient && now_ms < slot->deadline_ms) {
+            continue; /* la sync peut encore livrer crédit ou CLAIM manquants */
         }
         slot->used = false;
         if (runtime->packet_tx != NULL && ack.data_len > 0 &&
@@ -2074,12 +2106,16 @@ static esp_err_t runtime_process_reticulum(meshpay_app_runtime_t *runtime,
                                                      &event->packet,
                                                      event->now_ms,
                                                      &ack);
-        /* Palier F1 : insuffisance transitoire probable (le crédit du payeur
-         * n'est pas encore livré par la sync) → retenir au lieu de rejeter.
-         * L'ack-reject préparé par l'engine porte l'adresse du payeur. */
+        /* Palier F1 (étendu au durcissement) : motif transitoire probable —
+         * le crédit du payeur (INSUFFICIENT) ou sa CLAIM même (UNKNOWN_MEMBER,
+         * l'annuaire ne le connaît pas encore) n'est pas livré par la sync →
+         * retenir au lieu de rejeter. L'ack-reject préparé par l'engine porte
+         * l'adresse du payeur. */
         if (err == ESP_ERR_INVALID_STATE &&
-            runtime->app->payments.last_currency_result ==
-                MESHPAY_CURRENCY_ERR_INSUFFICIENT &&
+            (runtime->app->payments.last_currency_result ==
+                 MESHPAY_CURRENCY_ERR_INSUFFICIENT ||
+             runtime->app->payments.last_currency_result ==
+                 MESHPAY_CURRENCY_ERR_UNKNOWN_MEMBER) &&
             ack.data_len > 0 && ack.data[0] == MESHPAY_PAYMENT_MSG_REJECT &&
             runtime_hold_payment(runtime, &event->packet,
                                  ack.destination_hash,
@@ -2324,7 +2360,6 @@ esp_err_t meshpay_app_runtime_process_one(meshpay_app_runtime_t *runtime,
         err = ESP_ERR_INVALID_ARG;
         break;
     }
-
     xSemaphoreGive(runtime->lock);
     runtime_refresh_depths(runtime);
     return err;
