@@ -1533,6 +1533,27 @@ esp_err_t meshpay_app_runtime_create_currency(
     return err;
 }
 
+/* Palier D6 — mapping wizard UI → paramètres fondateur. Pur (pas de lock, pas
+ * d'état) : la validation métier reste dans create_currency. */
+esp_err_t meshpay_app_currency_params_from_wizard(
+    const meshpay_ui_wizard_t *wizard,
+    meshpay_app_currency_params_t *out)
+{
+    if (wizard == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out, 0, sizeof(*out));
+    (void)snprintf(out->name, sizeof(out->name), "%s", wizard->name);
+    (void)snprintf(out->symbol, sizeof(out->symbol), "%s", wizard->symbol);
+    out->max_supply = wizard->max_supply;
+    out->transfer_fee = wizard->transfer_fee;
+    out->initial_credit = wizard->initial_credit;
+    out->demurrage_bps = wizard->demurrage_bps;
+    /* Pas de booléen dédié dans le wizard : la fonte est active ssi bps > 0. */
+    out->demurrage_enabled = wizard->demurrage_bps > 0;
+    return ESP_OK;
+}
+
 /*
  * Palier B4 — traite un OFFER de descripteur reçu (data[0] == 0x34). Séquence
  * stricte : idempotence (déjà membre) -> armé ? -> parse -> matches_anchor ->

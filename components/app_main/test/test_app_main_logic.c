@@ -2760,3 +2760,63 @@ TEST_CASE("create currency rejects invalid params before signing", "[app_main][d
 
     meshpay_app_runtime_destroy(&runtime);
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Palier D6 — mapping wizard UI → paramètres fondateur
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Mapping nominal : chaque champ du wizard est recopié dans les params ;
+ * demurrage_bps=0 → fonte désactivée. */
+TEST_CASE("params from wizard copies fields and disables demurrage at 0 bps",
+          "[app_main][d6]")
+{
+    meshpay_ui_wizard_t wizard;
+    memset(&wizard, 0, sizeof(wizard));
+    (void)snprintf(wizard.name, sizeof(wizard.name), "Monnaie Test");
+    (void)snprintf(wizard.symbol, sizeof(wizard.symbol), "MT");
+    wizard.initial_credit = 250;
+    wizard.max_supply = 10000;
+    wizard.transfer_fee = 2;
+    wizard.demurrage_bps = 0;
+
+    meshpay_app_currency_params_t params;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_currency_params_from_wizard(&wizard, &params));
+    TEST_ASSERT_EQUAL_STRING("Monnaie Test", params.name);
+    TEST_ASSERT_EQUAL_STRING("MT", params.symbol);
+    TEST_ASSERT_EQUAL_UINT32(250, params.initial_credit);
+    TEST_ASSERT_EQUAL_UINT64(10000, params.max_supply);
+    TEST_ASSERT_EQUAL_UINT32(2, params.transfer_fee);
+    TEST_ASSERT_FALSE(params.demurrage_enabled);
+    TEST_ASSERT_EQUAL_UINT16(0, params.demurrage_bps);
+}
+
+/* Décision D3/D6 documentée dans ui.h : la fonte est active ssi bps > 0
+ * (pas de champ booléen séparé dans le wizard). */
+TEST_CASE("params from wizard enables demurrage when bps is positive",
+          "[app_main][d6]")
+{
+    meshpay_ui_wizard_t wizard;
+    memset(&wizard, 0, sizeof(wizard));
+    (void)snprintf(wizard.name, sizeof(wizard.name), "Fondante");
+    wizard.initial_credit = 100;
+    wizard.demurrage_bps = 50;
+
+    meshpay_app_currency_params_t params;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_currency_params_from_wizard(&wizard, &params));
+    TEST_ASSERT_TRUE(params.demurrage_enabled);
+    TEST_ASSERT_EQUAL_UINT16(50, params.demurrage_bps);
+}
+
+/* Garde d'arguments : NULL refusé des deux côtés. */
+TEST_CASE("params from wizard rejects null arguments", "[app_main][d6]")
+{
+    meshpay_ui_wizard_t wizard;
+    memset(&wizard, 0, sizeof(wizard));
+    meshpay_app_currency_params_t params;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_app_currency_params_from_wizard(NULL, &params));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_app_currency_params_from_wizard(&wizard, NULL));
+}

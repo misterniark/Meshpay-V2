@@ -73,8 +73,8 @@ static const char *s_radio_backend = "disabled";
 #define MESHPAY_UI_REFRESH_INTERVAL_MS 1000U
 #define MESHPAY_DAG_SUMMARY_INTERVAL_MS 15000U
 /* Intervalle de ré-émission de la REQUEST de descripteur tant que le device est
- * « armé » (rejointe en cours). Devient inerte une fois membre (Palier B5). */
-#define MESHPAY_JOIN_REQUEST_INTERVAL_MS 8000U
+ * « armé » (rejointe en cours). Devient inerte une fois membre (Palier B5).
+ * D6 : l'émission vit dans dag_summary_task (cadence = SUMMARY_INTERVAL). */
 #define MESHPAY_DAG_MONITOR_RENDER_POLL_MS 1000U
 #define MESHPAY_DAG_MONITOR_FULL_REFRESH_MS 300000U
 #define MESHPAY_DAG_MONITOR_RADIO_TASK_STACK_BYTES 8192
@@ -94,7 +94,6 @@ static meshpay_announce_reply_entry_t
 static size_t s_announce_replied_count;
 static TaskHandle_t s_boot_announce_task;
 static TaskHandle_t s_dag_summary_task;
-static TaskHandle_t s_join_request_task;
 #if CONFIG_MESHPAY_DAG_MONITOR_ONLY
 static meshpay_dag_monitor_t s_dag_monitor;
 static meshpay_ui_state_t s_dag_monitor_ui;
@@ -856,7 +855,15 @@ static waveshare_touch_intent_t waveshare_map_touch(
     return waveshare_map_soft_action(view, touch);
 }
 
-static esp_err_t waveshare_persist_pin_locked(void)
+#endif /* Waveshare — mapping tactile spécifique */
+
+/* ── Helpers wallet partagés Waveshare + T-Deck ──────────────────────────────
+ * PIN (pose + persistance), sélection de pair de paiement et envoi de paiement :
+ * logique de portefeuille commune aux deux cartes wallet, indépendante du mode
+ * d'entrée (tactile Waveshare / clavier+tactile T-Deck). Tous supposent le
+ * verrou s_runtime.lock déjà pris par l'appelant. */
+#if CONFIG_MESHPAY_BOARD_WAVESHARE_S3_TOUCH || CONFIG_MESHPAY_BOARD_LILYGO_TDECK
+static esp_err_t wallet_persist_pin_locked(void)
 {
     if (!s_runtime.has_storage) {
         return ESP_OK;
@@ -870,7 +877,7 @@ static esp_err_t waveshare_persist_pin_locked(void)
                                 &s_runtime.storage_record);
 }
 
-static esp_err_t waveshare_confirm_pin_locked(void)
+static esp_err_t wallet_confirm_pin_locked(void)
 {
     char pin[MESHPAY_UI_PIN_ENTRY_MAX + 1] = {0};
     size_t pin_len = 0;
@@ -882,7 +889,7 @@ static esp_err_t waveshare_confirm_pin_locked(void)
         err = meshpay_wallet_set_pin(&s_app.wallet, pin, pin_len);
     }
     if (err == ESP_OK) {
-        err = waveshare_persist_pin_locked();
+        err = wallet_persist_pin_locked();
     }
     rns_crypto_secure_zero(pin, sizeof(pin));
     (void)meshpay_ui_on_pin_result(&s_app.ui, err == ESP_OK, false);
@@ -892,7 +899,7 @@ static esp_err_t waveshare_confirm_pin_locked(void)
     return err;
 }
 
-static bool waveshare_known_is_local(
+static bool wallet_known_is_local(
     const rns_announce_known_destination_t *known)
 {
     return known == NULL ||
@@ -900,7 +907,7 @@ static bool waveshare_known_is_local(
                                       s_app.local_destination);
 }
 
-static void waveshare_peer_label_from_known(
+static void wallet_peer_label_from_known(
     const rns_announce_known_destination_t *known,
     char out[MESHPAY_UI_PEER_LABEL_MAX])
 {
@@ -932,7 +939,7 @@ static void waveshare_peer_label_from_known(
     }
 }
 
-static const rns_announce_known_destination_t *waveshare_peer_at_index(
+static const rns_announce_known_destination_t *wallet_peer_at_index(
     uint8_t selected_index,
     uint8_t *peer_count)
 {
@@ -942,7 +949,7 @@ static const rns_announce_known_destination_t *waveshare_peer_at_index(
     for (size_t i = 0; i < known_count; ++i) {
         const rns_announce_known_destination_t *known =
             rns_announce_known_get(i);
-        if (waveshare_known_is_local(known)) {
+        if (wallet_known_is_local(known)) {
             continue;
         }
         if (count == selected_index) {
@@ -956,38 +963,38 @@ static const rns_announce_known_destination_t *waveshare_peer_at_index(
     return selected;
 }
 
-static esp_err_t waveshare_refresh_payment_peer_locked(void)
+static esp_err_t wallet_refresh_payment_peer_locked(void)
 {
     uint8_t peer_count = 0;
     uint8_t selected_index = s_app.ui.selected_payment_peer;
     const rns_announce_known_destination_t *known =
-        waveshare_peer_at_index(selected_index, &peer_count);
+        wallet_peer_at_index(selected_index, &peer_count);
     if (peer_count == 0) {
         return meshpay_ui_set_payment_peer(&s_app.ui, "", 0, 0);
     }
     if (known == NULL) {
         selected_index = 0;
-        known = waveshare_peer_at_index(selected_index, NULL);
+        known = wallet_peer_at_index(selected_index, NULL);
     }
 
     char label[MESHPAY_UI_PEER_LABEL_MAX];
-    waveshare_peer_label_from_known(known, label);
+    wallet_peer_label_from_known(known, label);
     return meshpay_ui_set_payment_peer(&s_app.ui,
                                        label,
                                        selected_index,
                                        peer_count);
 }
 
-static const rns_announce_known_destination_t *waveshare_selected_peer_locked(void)
+static const rns_announce_known_destination_t *wallet_selected_peer_locked(void)
 {
-    if (waveshare_refresh_payment_peer_locked() != ESP_OK ||
+    if (wallet_refresh_payment_peer_locked() != ESP_OK ||
         s_app.ui.payment_peer_count == 0) {
         return NULL;
     }
-    return waveshare_peer_at_index(s_app.ui.selected_payment_peer, NULL);
+    return wallet_peer_at_index(s_app.ui.selected_payment_peer, NULL);
 }
 
-static esp_err_t waveshare_confirm_payment_locked(void)
+static esp_err_t wallet_confirm_payment_locked(void)
 {
     uint32_t amount = s_app.ui.draft_amount;
     if (amount == 0) {
@@ -995,7 +1002,7 @@ static esp_err_t waveshare_confirm_payment_locked(void)
     }
 
     const rns_announce_known_destination_t *peer =
-        waveshare_selected_peer_locked();
+        wallet_selected_peer_locked();
     if (peer == NULL) {
         (void)meshpay_ui_on_payment_feedback(&s_app.ui,
                                              MESHPAY_PAYMENT_FEEDBACK_REJECTED,
@@ -1026,7 +1033,9 @@ static esp_err_t waveshare_confirm_payment_locked(void)
     }
     return err;
 }
+#endif /* helpers wallet partagés Waveshare + T-Deck */
 
+#if CONFIG_MESHPAY_BOARD_WAVESHARE_S3_TOUCH
 static esp_err_t waveshare_apply_action_locked(meshpay_ui_action_t action)
 {
     switch (action) {
@@ -1037,7 +1046,7 @@ static esp_err_t waveshare_apply_action_locked(meshpay_ui_action_t action)
         if (s_app.ui.screen != MESHPAY_UI_SCREEN_PAY) {
             (void)meshpay_ui_clear_entry(&s_app.ui);
         }
-        (void)waveshare_refresh_payment_peer_locked();
+        (void)wallet_refresh_payment_peer_locked();
         return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_PAYEE);
     case MESHPAY_UI_ACTION_RECEIVE:
         return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_RECEIVE);
@@ -1047,7 +1056,7 @@ static esp_err_t waveshare_apply_action_locked(meshpay_ui_action_t action)
         return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_NETWORK);
     case MESHPAY_UI_ACTION_CONFIRM:
         if (s_app.ui.screen == MESHPAY_UI_SCREEN_SETUP_PIN) {
-            return waveshare_confirm_pin_locked();
+            return wallet_confirm_pin_locked();
         }
         if (s_app.ui.screen == MESHPAY_UI_SCREEN_PAYEE) {
             if (s_app.ui.payment_peer_count == 0) {
@@ -1056,7 +1065,7 @@ static esp_err_t waveshare_apply_action_locked(meshpay_ui_action_t action)
             return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_PAY);
         }
         if (s_app.ui.screen == MESHPAY_UI_SCREEN_PAY) {
-            return waveshare_confirm_payment_locked();
+            return wallet_confirm_payment_locked();
         }
         return ESP_OK;
     case MESHPAY_UI_ACTION_BACKSPACE:
@@ -1071,7 +1080,7 @@ static esp_err_t waveshare_apply_action_locked(meshpay_ui_action_t action)
         if (err != ESP_OK) {
             return err;
         }
-        return waveshare_refresh_payment_peer_locked();
+        return wallet_refresh_payment_peer_locked();
     }
     case MESHPAY_UI_ACTION_NONE:
     default:
@@ -1089,7 +1098,7 @@ static bool waveshare_handle_tap(const meshpay_touch_state_t *touch)
     }
 
     meshpay_ui_view_t view;
-    (void)waveshare_refresh_payment_peer_locked();
+    (void)wallet_refresh_payment_peer_locked();
     esp_err_t err = meshpay_ui_build_view(&s_app.ui, &view);
     waveshare_touch_intent_t intent = {0};
     if (err == ESP_OK) {
@@ -1126,7 +1135,7 @@ static void waveshare_render_current(bool force)
         return;
     }
     meshpay_ui_view_t view;
-    (void)waveshare_refresh_payment_peer_locked();
+    (void)wallet_refresh_payment_peer_locked();
     esp_err_t err = meshpay_ui_build_view(&s_app.ui, &view);
     xSemaphoreGive(s_runtime.lock);
     if (err != ESP_OK) {
@@ -1362,55 +1371,40 @@ static void render_tdeck_view(uint16_t *fb, const meshpay_ui_view_t *view)
     }
 }
 
-/* Persiste le hash du PIN sur la NVS chiffrée (si le stockage est présent).
- * Miroir de waveshare_persist_pin_locked (APIs storage agnostiques de la carte). */
-static esp_err_t tdeck_persist_pin_locked(void)
-{
-    if (!s_runtime.has_storage) {
-        return ESP_OK;
-    }
-    ESP_RETURN_ON_ERROR(meshpay_storage_record_set_pin_hash(
-                            &s_runtime.storage_record,
-                            s_app.wallet.pin_hash),
-                        TAG,
-                        "");
-    return meshpay_storage_save(&s_runtime.storage_backend,
-                                &s_runtime.storage_record);
-}
+/* Palier D6 — action différée hors verrou. Les API runtime (create_currency,
+ * arm_join, invite_code) prennent s_runtime.lock EN INTERNE : les appeler depuis
+ * un handler qui tient déjà ce verrou serait un deadlock (mutex non récursif).
+ * Le handler copie donc les données nécessaires SOUS verrou, le relâche, puis
+ * exécute l'action via tdeck_run_deferred. */
+typedef enum {
+    TDECK_DEFER_NONE = 0,
+    TDECK_DEFER_CREATE,    /* CONFIRM sur le wizard : créer la monnaie */
+    TDECK_DEFER_JOIN,      /* CONFIRM sur JOIN : armer la rejointe */
+    TDECK_DEFER_SHOW_CODE, /* afficher le code d'invitation détenu */
+} tdeck_defer_kind_t;
 
-/* Valide le PIN saisi à l'écran SETUP_PIN : le pose sur le wallet, le persiste,
- * puis notifie l'UI. Sans ce câblage, un T-Deck neuf resterait bloqué sur
- * SETUP_PIN (Entrée sans effet) — révélé par la revue adversariale D4. */
-static esp_err_t tdeck_confirm_pin_locked(void)
-{
-    char pin[MESHPAY_UI_PIN_ENTRY_MAX + 1] = {0};
-    size_t pin_len = 0;
-    esp_err_t err =
-        meshpay_ui_pin_entry(&s_app.ui, pin, sizeof(pin), &pin_len);
-    if (err == ESP_OK) {
-        err = meshpay_wallet_set_pin(&s_app.wallet, pin, pin_len);
-    }
-    if (err == ESP_OK) {
-        err = tdeck_persist_pin_locked();
-    }
-    rns_crypto_secure_zero(pin, sizeof(pin));
-    (void)meshpay_ui_on_pin_result(&s_app.ui, err == ESP_OK, false);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "T-Deck PIN setup failed: %s", esp_err_to_name(err));
-    }
-    return err;
-}
+typedef struct {
+    tdeck_defer_kind_t kind;
+    meshpay_ui_wizard_t wizard;      /* copie du wizard (CREATE) */
+    char code[MESHPAY_UI_TEXT_MAX];  /* copie du code saisi (JOIN) */
+} tdeck_deferred_action_t;
 
-/* Applique une action UI (navigation + écrans monnaie). Verrou s_runtime.lock
- * supposé déjà pris par l'appelant. Le submit runtime terminal (créer la monnaie,
- * armer la rejointe) est câblé en D6 ; ici on ne fait que la navigation. */
-static esp_err_t tdeck_apply_action_locked(meshpay_ui_action_t action)
+/* Applique une action UI. Verrou s_runtime.lock supposé déjà pris par
+ * l'appelant. Les actions qui doivent appeler le runtime (création, rejointe,
+ * code d'invitation) ne sont PAS exécutées ici : elles remplissent `defer`
+ * (jamais NULL) et l'appelant les lance après avoir relâché le verrou. */
+static esp_err_t tdeck_apply_action_locked(meshpay_ui_action_t action,
+                                           tdeck_deferred_action_t *defer)
 {
     switch (action) {
     case MESHPAY_UI_ACTION_HOME:
         (void)meshpay_ui_clear_entry(&s_app.ui);
         return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_HOME);
     case MESHPAY_UI_ACTION_PAY:
+        if (s_app.ui.screen != MESHPAY_UI_SCREEN_PAY) {
+            (void)meshpay_ui_clear_entry(&s_app.ui);
+        }
+        (void)wallet_refresh_payment_peer_locked();
         return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_PAYEE);
     case MESHPAY_UI_ACTION_RECEIVE:
         return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_RECEIVE);
@@ -1427,7 +1421,9 @@ static esp_err_t tdeck_apply_action_locked(meshpay_ui_action_t action)
         (void)meshpay_ui_clear_entry(&s_app.ui);
         return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_JOIN);
     case MESHPAY_UI_ACTION_SHOW_CODE:
-        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_FOUNDER_CODE);
+        /* Le code se lit via le runtime (verrou interne) : différé hors lock. */
+        defer->kind = TDECK_DEFER_SHOW_CODE;
+        return ESP_OK;
     case MESHPAY_UI_ACTION_NEXT_FIELD:
         return meshpay_ui_wizard_next_field(&s_app.ui);
     case MESHPAY_UI_ACTION_PREV_FIELD:
@@ -1439,17 +1435,116 @@ static esp_err_t tdeck_apply_action_locked(meshpay_ui_action_t action)
     case MESHPAY_UI_ACTION_CONFIRM:
         if (s_app.ui.screen == MESHPAY_UI_SCREEN_SETUP_PIN) {
             /* Setup wallet de base : indispensable pour atteindre HOME (et le
-             * wizard de création, qui exige has_pin). Pas du ressort de D6. */
-            return tdeck_confirm_pin_locked();
+             * wizard de création, qui exige has_pin). */
+            return wallet_confirm_pin_locked();
         }
         if (s_app.ui.screen == MESHPAY_UI_SCREEN_PAYEE) {
+            if (s_app.ui.payment_peer_count == 0) {
+                return ESP_OK;
+            }
             return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_PAY);
         }
-        /* CREATE/JOIN : le submit runtime réel est câblé en D6. */
+        if (s_app.ui.screen == MESHPAY_UI_SCREEN_PAY) {
+            return wallet_confirm_payment_locked();
+        }
+        if (s_app.ui.screen == MESHPAY_UI_SCREEN_CREATE) {
+            /* Copie du wizard sous verrou ; la création part hors verrou. */
+            defer->kind = TDECK_DEFER_CREATE;
+            memcpy(&defer->wizard, &s_app.ui.wizard, sizeof(defer->wizard));
+            return ESP_OK;
+        }
+        if (s_app.ui.screen == MESHPAY_UI_SCREEN_JOIN) {
+            defer->kind = TDECK_DEFER_JOIN;
+            return meshpay_ui_text_entry(&s_app.ui,
+                                         defer->code,
+                                         sizeof(defer->code));
+        }
         return ESP_OK;
     case MESHPAY_UI_ACTION_NONE:
     default:
         return ESP_OK;
+    }
+}
+
+/* Exécute une action différée, HORS verrou (les API runtime le prennent
+ * elles-mêmes), puis reprend le verrou pour pousser le résultat dans l'UI. */
+static void tdeck_run_deferred(const tdeck_deferred_action_t *d)
+{
+    if (d == NULL || d->kind == TDECK_DEFER_NONE) {
+        return;
+    }
+    const uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
+
+    switch (d->kind) {
+    case TDECK_DEFER_CREATE: {
+        meshpay_app_currency_params_t params;
+        esp_err_t err = meshpay_app_currency_params_from_wizard(&d->wizard,
+                                                                &params);
+        if (err == ESP_OK) {
+            err = meshpay_app_runtime_create_currency(&s_runtime,
+                                                      &params,
+                                                      now_ms);
+        }
+        if (err != ESP_OK) {
+            /* Refus (nom vide, crédit > offre, déjà membre, pas de storage) :
+             * l'UI reste sur le wizard, le motif part en série. */
+            ESP_LOGW(TAG, "creation monnaie refusee: %s", esp_err_to_name(err));
+            return;
+        }
+        char code[MESHPAY_CURRENCY_INVITE_CODE_BUF] = {0};
+        esp_err_t code_err =
+            meshpay_app_runtime_invite_code(&s_runtime, code, sizeof(code));
+        if (s_runtime.lock != NULL &&
+            xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+            (void)meshpay_ui_set_currency(&s_app.ui, params.name);
+            if (code_err == ESP_OK) {
+                (void)meshpay_ui_set_invite_code(&s_app.ui, code);
+            }
+            (void)meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_FOUNDER_CODE);
+            xSemaphoreGive(s_runtime.lock);
+        }
+        ESP_LOGI(TAG, "monnaie creee: %s (code %s)", params.name, code);
+        break;
+    }
+    case TDECK_DEFER_JOIN: {
+        esp_err_t err =
+            meshpay_app_runtime_arm_join(&s_runtime, d->code, now_ms);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "code d'invitation refuse: %s", esp_err_to_name(err));
+            return;
+        }
+        if (s_runtime.lock != NULL &&
+            xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+            (void)meshpay_ui_set_join_state(&s_app.ui, MESHPAY_UI_JOIN_ARMED);
+            (void)meshpay_ui_clear_entry(&s_app.ui);
+            /* Le menu monnaie affiche « Rejointe en cours ». */
+            (void)meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_CURRENCY_MENU);
+            xSemaphoreGive(s_runtime.lock);
+        }
+        ESP_LOGI(TAG, "rejointe armee (code %s)", d->code);
+        break;
+    }
+    case TDECK_DEFER_SHOW_CODE: {
+        char code[MESHPAY_CURRENCY_INVITE_CODE_BUF] = {0};
+        esp_err_t err =
+            meshpay_app_runtime_invite_code(&s_runtime, code, sizeof(code));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "code d'invitation indisponible: %s",
+                     esp_err_to_name(err));
+        }
+        if (s_runtime.lock != NULL &&
+            xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+            /* Code vide → l'écran affiche « Indisponible ». */
+            (void)meshpay_ui_set_invite_code(&s_app.ui,
+                                             err == ESP_OK ? code : "");
+            (void)meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_FOUNDER_CODE);
+            xSemaphoreGive(s_runtime.lock);
+        }
+        break;
+    }
+    case TDECK_DEFER_NONE:
+    default:
+        break;
     }
 }
 
@@ -1521,15 +1616,17 @@ static bool tdeck_handle_tap(int16_t raw_x, int16_t raw_y)
     }
     bool handled = false;
     esp_err_t err = ESP_OK;
+    tdeck_deferred_action_t defer = {0};
     meshpay_ui_view_t view;
     if (meshpay_ui_build_view(&s_app.ui, &view) == ESP_OK) {
         int idx = tdeck_touch_button_index(&view, x, y);
         if (idx >= 0) {
-            err = tdeck_apply_action_locked(view.actions[idx]);
+            err = tdeck_apply_action_locked(view.actions[idx], &defer);
             handled = true;
         }
     }
     xSemaphoreGive(s_runtime.lock);
+    tdeck_run_deferred(&defer);
     ESP_LOGI("tdeck_ui",
              "tap raw=(%d,%d) map=(%d,%d) -> %s (%s)",
              (int)raw_x,
@@ -1553,20 +1650,21 @@ static void tdeck_handle_key(char key)
 
     meshpay_ui_screen_t screen = s_app.ui.screen;
     esp_err_t err = ESP_OK;
+    tdeck_deferred_action_t defer = {0};
 
     if (key == '\r' || key == '\n') {
-        err = tdeck_apply_action_locked(MESHPAY_UI_ACTION_CONFIRM);
+        err = tdeck_apply_action_locked(MESHPAY_UI_ACTION_CONFIRM, &defer);
     } else if (key == '\b' || key == 0x7F) {
-        err = tdeck_apply_action_locked(MESHPAY_UI_ACTION_BACKSPACE);
+        err = tdeck_apply_action_locked(MESHPAY_UI_ACTION_BACKSPACE, &defer);
     } else if (key == '\t') {
-        err = tdeck_apply_action_locked(MESHPAY_UI_ACTION_NEXT_FIELD);
+        err = tdeck_apply_action_locked(MESHPAY_UI_ACTION_NEXT_FIELD, &defer);
     } else if (!tdeck_input_screen(screen) && key >= '1' && key <= '4') {
         /* Écran menu : la touche numérique choisit l'action à cet index. */
         meshpay_ui_view_t v;
         if (meshpay_ui_build_view(&s_app.ui, &v) == ESP_OK) {
             uint8_t idx = (uint8_t)(key - '1');
             if (idx < v.action_count) {
-                err = tdeck_apply_action_locked(v.actions[idx]);
+                err = tdeck_apply_action_locked(v.actions[idx], &defer);
             }
         }
     } else if (key >= 0x20 && key < 0x7F) {
@@ -1575,6 +1673,7 @@ static void tdeck_handle_key(char key)
     }
 
     xSemaphoreGive(s_runtime.lock);
+    tdeck_run_deferred(&defer);
 
     ESP_LOGI("tdeck_ui",
              "touche 0x%02x '%c' -> %s",
@@ -1635,8 +1734,19 @@ static void tdeck_ui_task(void *arg)
         /* Rendu si la vue a changé, ou au plus tard toutes les RENDER_MS. */
         int64_t now_us = esp_timer_get_time();
         if (now_us - last_render_us > (int64_t)TDECK_UI_RENDER_MS * 1000) {
+            /* Lecture sans verrou (join_state ne prend pas le lock) : l'état
+             * runtime est poussé dans l'UI pour que le menu Monnaie reflète la
+             * progression de la rejointe (IDLE → ARMED → MEMBER via radio). */
+            meshpay_app_join_state_t js =
+                meshpay_app_runtime_join_state(&s_runtime);
             if (s_runtime.lock != NULL &&
                 xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+                (void)wallet_refresh_payment_peer_locked();
+                (void)meshpay_ui_set_join_state(
+                    &s_app.ui,
+                    js == MESHPAY_APP_JOIN_MEMBER  ? MESHPAY_UI_JOIN_MEMBER
+                    : js == MESHPAY_APP_JOIN_ARMED ? MESHPAY_UI_JOIN_ARMED
+                                                   : MESHPAY_UI_JOIN_IDLE);
                 meshpay_ui_view_t view;
                 esp_err_t err = meshpay_ui_build_view(&s_app.ui, &view);
                 xSemaphoreGive(s_runtime.lock);
@@ -2198,32 +2308,26 @@ static void dag_summary_task(void *arg)
                          (unsigned)dag_n);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(MESHPAY_DAG_SUMMARY_INTERVAL_MS));
-    }
-}
 
-/*
- * Palier B5 — tant que le device est ARMÉ (code d'invitation saisi, pas encore
- * membre), redemande périodiquement le descripteur par radio. emit_join_request
- * renvoie ESP_ERR_INVALID_STATE quand il n'y a rien à demander (non armé, déjà
- * membre, pas d'émetteur) : c'est le cas nominal au repos, pas un warning. La
- * tâche devient donc inerte d'elle-même une fois la rejointe réussie.
- */
-static void join_request_task(void *arg)
-{
-    (void)arg;
-    /* Décalage initial : laisser la découverte (announce) s'établir. */
-    vTaskDelay(pdMS_TO_TICKS(2000U + dag_summary_jitter_ms()));
-
-    while (true) {
-        if (meshpay_app_runtime_join_state(&s_runtime) == MESHPAY_APP_JOIN_ARMED) {
+        /* Palier B5 (fusionné ici, D6) — tant que le device est ARMÉ (code
+         * d'invitation saisi, pas encore membre), redemande le descripteur par
+         * radio. emit_join_request renvoie ESP_ERR_INVALID_STATE quand il n'y a
+         * rien à demander (non armé, déjà membre) : cas nominal, pas un warning.
+         * Vivait dans une tâche dédiée de 8 Ko qui échouait à se créer en fin de
+         * boot (RAM interne épuisée, max_bloc < pile requise) : la cadence passe
+         * de 8 s à 15 s (celle du summary), sans conséquence — la rejointe
+         * re-demande simplement un peu moins souvent. */
+        if (meshpay_app_runtime_join_state(&s_runtime) ==
+            MESHPAY_APP_JOIN_ARMED) {
             uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
-            esp_err_t err = meshpay_app_runtime_emit_join_request(&s_runtime, now_ms);
-            if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-                ESP_LOGW(TAG, "join request emit failed: %s", esp_err_to_name(err));
+            esp_err_t jerr =
+                meshpay_app_runtime_emit_join_request(&s_runtime, now_ms);
+            if (jerr != ESP_OK && jerr != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "join request emit failed: %s",
+                         esp_err_to_name(jerr));
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(MESHPAY_JOIN_REQUEST_INTERVAL_MS));
+        vTaskDelay(pdMS_TO_TICKS(MESHPAY_DAG_SUMMARY_INTERVAL_MS));
     }
 }
 
@@ -3310,6 +3414,9 @@ void app_main(void)
                                    MESHPAY_APP_QUEUE_CORE,
                                    &dag_summary_event,
                                    0);
+    /* La tâche summary porte AUSSI l'émission périodique de rejointe (B5/D6) :
+     * une tâche dédiée de plus échouait à se créer en fin de boot (RAM interne
+     * épuisée). */
     if (radio_ready &&
         xTaskCreate(dag_summary_task,
                     "dag_summary_task",
@@ -3318,15 +3425,6 @@ void app_main(void)
                     MESHPAY_APP_TASK_PRIORITY,
                     &s_dag_summary_task) != pdPASS) {
         ESP_LOGW(TAG, "DAG summary task start failed");
-    }
-    if (radio_ready &&
-        xTaskCreate(join_request_task,
-                    "join_request_task",
-                    MESHPAY_APP_TASK_STACK_WORDS,
-                    NULL,
-                    MESHPAY_APP_TASK_PRIORITY,
-                    &s_join_request_task) != pdPASS) {
-        ESP_LOGW(TAG, "join request task start failed");
     }
 
     /* Diagnostic de dimensionnement : les piles de tâches vivent en RAM interne

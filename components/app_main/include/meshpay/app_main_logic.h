@@ -294,6 +294,17 @@ esp_err_t meshpay_app_runtime_create_currency(
     const meshpay_app_currency_params_t *params,
     uint64_t now_ms);
 
+/*
+ * Palier D6 — traduit l'état du wizard UI (D3) en paramètres fondateur (D1).
+ * Copie bornée des champs (les tailles UI et descripteur sont alignées : nom 24,
+ * symbole 8) ; décision documentée dans ui.h : demurrage_enabled ssi bps > 0.
+ * La validation métier (nom non vide, crédit ≤ offre) reste du ressort de
+ * meshpay_app_runtime_create_currency.
+ */
+esp_err_t meshpay_app_currency_params_from_wizard(
+    const meshpay_ui_wizard_t *wizard,
+    meshpay_app_currency_params_t *out);
+
 #ifdef __cplusplus
 }
 #endif
