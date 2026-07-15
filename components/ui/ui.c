@@ -64,6 +64,18 @@ static const char *feedback_text(meshpay_ui_feedback_t feedback)
         return "PIN invalide";
     case MESHPAY_UI_FEEDBACK_STORAGE_ERROR:
         return "Echec: stockage HS";
+    case MESHPAY_UI_FEEDBACK_BAD_INVITE_CODE:
+        return "Code invalide";
+    case MESHPAY_UI_FEEDBACK_ALREADY_MEMBER:
+        return "Deja membre d'une monnaie";
+    case MESHPAY_UI_FEEDBACK_CREATE_REFUSED:
+        return "Creation refusee";
+    case MESHPAY_UI_FEEDBACK_DISCOVERY_REFUSED:
+        return "Rejointe refusee";
+    case MESHPAY_UI_FEEDBACK_JOIN_EXPIRED:
+        return "Rejointe expiree (aucune reponse)";
+    case MESHPAY_UI_FEEDBACK_ACTION_FAILED:
+        return "Echec de l'action";
     case MESHPAY_UI_FEEDBACK_NONE:
     default:
         return "";
@@ -1162,6 +1174,29 @@ esp_err_t meshpay_ui_on_storage_write_failed(meshpay_ui_state_t *ui)
     }
     ui->feedback = MESHPAY_UI_FEEDBACK_STORAGE_ERROR;
     return ESP_OK;
+}
+
+esp_err_t meshpay_ui_on_action_failed(meshpay_ui_state_t *ui,
+                                      meshpay_ui_feedback_t cause)
+{
+    if (ui == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Seules les causes d'ÉCHEC sont admises ici : les feedbacks de succès
+     * (paiement envoyé/reçu…) ont leurs canaux dédiés et leur propre cycle. */
+    switch (cause) {
+    case MESHPAY_UI_FEEDBACK_STORAGE_ERROR:
+    case MESHPAY_UI_FEEDBACK_BAD_INVITE_CODE:
+    case MESHPAY_UI_FEEDBACK_ALREADY_MEMBER:
+    case MESHPAY_UI_FEEDBACK_CREATE_REFUSED:
+    case MESHPAY_UI_FEEDBACK_DISCOVERY_REFUSED:
+    case MESHPAY_UI_FEEDBACK_JOIN_EXPIRED:
+    case MESHPAY_UI_FEEDBACK_ACTION_FAILED:
+        ui->feedback = cause;
+        return ESP_OK;
+    default:
+        return ESP_ERR_INVALID_ARG;
+    }
 }
 
 esp_err_t meshpay_ui_storage_reset_request(meshpay_ui_state_t *ui,

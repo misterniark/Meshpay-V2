@@ -46,6 +46,13 @@ extern "C" {
  * rejoue après chaque batch ingéré, jusqu'au TTL. */
 #define MESHPAY_APP_HELD_PAYMENTS_MAX 2
 #define MESHPAY_APP_HELD_PAYMENT_TTL_MS 30000U
+/* Chantier erreurs UI invisibles (U3) : fenêtre d'armement de la rejointe.
+ * Le fondateur est à portée radio par définition (la rejointe exige la
+ * proximité) : sans OFFER en 60 s, il ne répondra pas — l'armement expire
+ * VISIBLEMENT (feedback « Rejointe expiree ») au lieu de laisser le menu
+ * afficher « Rejointe en cours » à vie. Durée : décision utilisateur
+ * 2026-07-15. */
+#define MESHPAY_APP_JOIN_WINDOW_MS 60000U
 
 typedef struct {
     bool used;
@@ -262,6 +269,25 @@ esp_err_t meshpay_app_bootstrap_identity(
     meshpay_storage_record_t *record,
     bool *created,
     meshpay_storage_probe_t *probe);
+/* Chantier erreurs UI invisibles (U2) — geste utilisateur à l'origine d'un
+ * échec, pour router le motif vers le bon feedback typé. */
+typedef enum {
+    MESHPAY_APP_UI_ACTION_CREATE = 0,     /* wizard de création de monnaie */
+    MESHPAY_APP_UI_ACTION_JOIN_CODE,      /* rejointe par code d'invitation */
+    MESHPAY_APP_UI_ACTION_ARM_DISCOVERY,  /* ouverture de la découverte */
+    MESHPAY_APP_UI_ACTION_JOIN_DISCOVERED,/* sélection dans la liste */
+} meshpay_app_ui_action_kind_t;
+
+/* Mappe l'esp_err d'un geste refusé vers la cause typée à afficher.
+ * `storage_ok` discrimine les ESP_ERR_INVALID_STATE ambigus : storage sain →
+ * « déjà membre » (mono-monnaie strict) ; storage HS → l'échec vient de
+ * l'écriture refusée (fix de la collision M4 : un membre qui re-saisit un
+ * code ne verra plus « stockage HS »). Table pure, testable au banc. */
+meshpay_ui_feedback_t meshpay_app_action_error_feedback(
+    meshpay_app_ui_action_kind_t kind,
+    esp_err_t err,
+    bool storage_ok);
+
 esp_err_t meshpay_app_generate_alias(char *out, size_t out_len);
 bool meshpay_app_alias_needs_generation(const char *alias);
 esp_err_t meshpay_app_ensure_record_alias(
@@ -308,13 +334,23 @@ UBaseType_t meshpay_app_runtime_queue_depth(const meshpay_app_runtime_t *runtime
  * toute autre longueur est rejetée (ESP_ERR_INVALID_ARG). Mono-monnaie STRICT :
  * rejette avec ESP_ERR_INVALID_STATE si le device est déjà membre
  * (has_descriptor). Sur succès, l'état passe à ARMED : le prochain OFFER matchant
- * l'ancre sera importé. now_ms horodate la fenêtre (désarmement sur timeout
- * différé).
+ * l'ancre sera importé. now_ms ouvre la fenêtre d'armement : sans OFFER dans
+ * MESHPAY_APP_JOIN_WINDOW_MS, meshpay_app_runtime_join_tick désarme et
+ * l'affiche (U3).
  */
 esp_err_t meshpay_app_runtime_arm_join_anchor(meshpay_app_runtime_t *runtime,
                                               const uint8_t *anchor,
                                               size_t anchor_len,
                                               uint64_t now_ms);
+
+/* Chantier erreurs UI invisibles (U3) — fait vivre la fenêtre d'armement :
+ * désarme une rejointe restée sans OFFER au-delà de l'échéance et pousse le
+ * feedback « Rejointe expiree » à l'UI. Prend le verrou (appel firmware
+ * périodique) ; no-op si rien n'est armé. Aussi appelé au fil de l'eau par le
+ * traitement des événements réseau (même pattern que le TTL des paiements
+ * retenus F1). */
+esp_err_t meshpay_app_runtime_join_tick(meshpay_app_runtime_t *runtime,
+                                        uint64_t now_ms);
 
 /*
  * Arme la rejointe depuis un CODE d'invitation (base32 Crockford). Décode le

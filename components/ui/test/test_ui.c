@@ -735,3 +735,67 @@ TEST_CASE("ui storage write failure feedback overrides footer", "[ui][m4]")
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
     TEST_ASSERT_NOT_NULL(strstr(view.footer, "Stockage HS"));
 }
+
+/* --- Chantier erreurs UI invisibles (U1) : causes typées d'échec --- */
+
+TEST_CASE("ui action failure causes show their label in footer", "[ui][u1]")
+{
+    struct {
+        meshpay_ui_feedback_t cause;
+        const char *label;
+    } cases[] = {
+        { MESHPAY_UI_FEEDBACK_BAD_INVITE_CODE, "Code invalide" },
+        { MESHPAY_UI_FEEDBACK_ALREADY_MEMBER, "Deja membre" },
+        { MESHPAY_UI_FEEDBACK_CREATE_REFUSED, "Creation refusee" },
+        { MESHPAY_UI_FEEDBACK_DISCOVERY_REFUSED, "Rejointe refusee" },
+        { MESHPAY_UI_FEEDBACK_JOIN_EXPIRED, "Rejointe expiree" },
+        { MESHPAY_UI_FEEDBACK_ACTION_FAILED, "Echec de l'action" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        meshpay_ui_state_t ui;
+        meshpay_ui_init(&ui, true);
+        TEST_ASSERT_EQUAL(ESP_OK,
+                          meshpay_ui_on_action_failed(&ui, cases[i].cause));
+        meshpay_ui_view_t view;
+        TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+        TEST_ASSERT_NOT_NULL(strstr(view.footer, cases[i].label));
+        /* Transient : la navigation efface le feedback. */
+        TEST_ASSERT_EQUAL(ESP_OK,
+                          meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_NETWORK));
+        TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+        TEST_ASSERT_NULL(strstr(view.footer, cases[i].label));
+    }
+}
+
+TEST_CASE("ui action failure rejects success feedback values", "[ui][u1]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    /* Les feedbacks de succès ne passent pas par ce canal. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_ui_on_action_failed(
+                          &ui, MESHPAY_UI_FEEDBACK_PAYMENT_SENT));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_ui_on_action_failed(&ui,
+                                                  MESHPAY_UI_FEEDBACK_NONE));
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_NONE, ui.feedback);
+}
+
+TEST_CASE("ui action failure has priority over storage alert", "[ui][u1]")
+{
+    /* Même règle que M4 : le transient (motif de l'échec du geste) prend le
+     * footer, l'alerte storage persistante revient après la nav. */
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_ui_set_storage_status(&ui,
+                                                    MESHPAY_UI_STORAGE_LEGACY));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_on_action_failed(
+                                  &ui, MESHPAY_UI_FEEDBACK_ALREADY_MEMBER));
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_NOT_NULL(strstr(view.footer, "Deja membre"));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_HOME));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_NOT_NULL(strstr(view.footer, "Stockage HS"));
+}

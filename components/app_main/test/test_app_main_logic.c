@@ -3614,3 +3614,129 @@ TEST_CASE("forged payment from a known member account rejects immediately",
 
     meshpay_app_runtime_destroy(&runtime_b);
 }
+
+/* --- Chantier erreurs UI invisibles (U2) : mapping esp_err -> feedback --- */
+
+TEST_CASE("action error feedback maps every cause honestly", "[app_main]")
+{
+    /* Succès : jamais de feedback d'échec. */
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_NONE,
+                      meshpay_app_action_error_feedback(
+                          MESHPAY_APP_UI_ACTION_CREATE, ESP_OK, true));
+
+    /* INVALID_STATE ambigu : l'état du stockage fait foi — le fix de la
+     * collision M4 (« déjà membre » n'affiche plus « stockage HS »). */
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_ALREADY_MEMBER,
+                      meshpay_app_action_error_feedback(
+                          MESHPAY_APP_UI_ACTION_JOIN_CODE,
+                          ESP_ERR_INVALID_STATE, true));
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_STORAGE_ERROR,
+                      meshpay_app_action_error_feedback(
+                          MESHPAY_APP_UI_ACTION_JOIN_CODE,
+                          ESP_ERR_INVALID_STATE, false));
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_ALREADY_MEMBER,
+                      meshpay_app_action_error_feedback(
+                          MESHPAY_APP_UI_ACTION_CREATE,
+                          ESP_ERR_INVALID_STATE, true));
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_ALREADY_MEMBER,
+                      meshpay_app_action_error_feedback(
+                          MESHPAY_APP_UI_ACTION_JOIN_DISCOVERED,
+                          ESP_ERR_INVALID_STATE, true));
+
+    /* La faute de frappe dans le code d'invitation : cas nominal du JOIN. */
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_BAD_INVITE_CODE,
+                      meshpay_app_action_error_feedback(
+                          MESHPAY_APP_UI_ACTION_JOIN_CODE,
+                          ESP_ERR_INVALID_CRC, true));
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_BAD_INVITE_CODE,
+                      meshpay_app_action_error_feedback(
+                          MESHPAY_APP_UI_ACTION_JOIN_CODE,
+                          ESP_ERR_INVALID_ARG, true));
+
+    /* Wizard refusé (nom vide, crédit > offre...). */
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_CREATE_REFUSED,
+                      meshpay_app_action_error_feedback(
+                          MESHPAY_APP_UI_ACTION_CREATE,
+                          ESP_ERR_INVALID_ARG, true));
+
+    /* Découverte : index périmé / liste désarmée. */
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_DISCOVERY_REFUSED,
+                      meshpay_app_action_error_feedback(
+                          MESHPAY_APP_UI_ACTION_JOIN_DISCOVERED,
+                          ESP_ERR_INVALID_ARG, true));
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_DISCOVERY_REFUSED,
+                      meshpay_app_action_error_feedback(
+                          MESHPAY_APP_UI_ACTION_ARM_DISCOVERY,
+                          ESP_ERR_NOT_FOUND, true));
+
+    /* Verrou : inclassable mais honnête. */
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_ACTION_FAILED,
+                      meshpay_app_action_error_feedback(
+                          MESHPAY_APP_UI_ACTION_CREATE,
+                          ESP_ERR_TIMEOUT, true));
+}
+
+/* --- Chantier erreurs UI invisibles (U3) : la fenêtre de rejointe expire --- */
+
+TEST_CASE("armed join expires visibly after the window", "[app_main][u3]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock);
+
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_min_descriptor(&founder, 0x30, &signed_desc);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_arm_join_anchor(
+                                  &runtime, signed_desc.genesis_hash,
+                                  MESHPAY_CURRENCY_INVITE_ANCHOR_LEN, 1000));
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_ARMED,
+                      meshpay_app_runtime_join_state(&runtime));
+
+    /* Juste avant l'échéance : toujours armé, pas de feedback. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_join_tick(
+                                  &runtime,
+                                  1000 + MESHPAY_APP_JOIN_WINDOW_MS - 1));
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_ARMED,
+                      meshpay_app_runtime_join_state(&runtime));
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_NONE, app->ui.feedback);
+
+    /* À l'échéance : désarmé ET le motif s'affiche — le menu cesse de mentir. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_join_tick(
+                                  &runtime,
+                                  1000 + MESHPAY_APP_JOIN_WINDOW_MS));
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_IDLE,
+                      meshpay_app_runtime_join_state(&runtime));
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_JOIN_EXPIRED, app->ui.feedback);
+
+    /* Idempotent : re-tick sans armement = no-op. */
+    app->ui.feedback = MESHPAY_UI_FEEDBACK_NONE;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_join_tick(
+                                  &runtime,
+                                  2000 + MESHPAY_APP_JOIN_WINDOW_MS));
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_NONE, app->ui.feedback);
+}
+
+TEST_CASE("offer arriving in time cancels the join deadline", "[app_main][u3]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    /* Armement + OFFER importé (helper nominal du Palier B). */
+    join_a_currency(&runtime, app, &mock, &founder, &signed_desc);
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_MEMBER,
+                      meshpay_app_runtime_join_state(&runtime));
+
+    /* Un tick bien après l'échéance ne doit PAS crier à l'expiration : la
+     * rejointe a réussi, l'armement est déjà retombé. */
+    app->ui.feedback = MESHPAY_UI_FEEDBACK_NONE;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_join_tick(
+                                  &runtime,
+                                  1000 + 10 * MESHPAY_APP_JOIN_WINDOW_MS));
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_NONE, app->ui.feedback);
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_MEMBER,
+                      meshpay_app_runtime_join_state(&runtime));
+}

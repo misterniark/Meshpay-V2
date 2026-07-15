@@ -47,6 +47,15 @@ typedef enum {
     /* Chantier migration NVS (M4) : une action d'ÉCRITURE a échoué parce que
      * le stockage persistant est indisponible — fini le « OK ne fait rien ». */
     MESHPAY_UI_FEEDBACK_STORAGE_ERROR,
+    /* Chantier erreurs UI invisibles (U1) : causes typées d'échec d'action —
+     * chaque geste utilisateur refusé s'affiche avec son motif réel. Les
+     * libellés (feedback_text) tiennent sur une ligne de footer Waveshare. */
+    MESHPAY_UI_FEEDBACK_BAD_INVITE_CODE, /* code d'invitation malformé */
+    MESHPAY_UI_FEEDBACK_ALREADY_MEMBER,  /* mono-monnaie : déjà membre */
+    MESHPAY_UI_FEEDBACK_CREATE_REFUSED,  /* wizard : paramètres refusés */
+    MESHPAY_UI_FEEDBACK_DISCOVERY_REFUSED, /* découverte/sélection refusée */
+    MESHPAY_UI_FEEDBACK_JOIN_EXPIRED,    /* fenêtre de rejointe expirée (U3) */
+    MESHPAY_UI_FEEDBACK_ACTION_FAILED,   /* repli honnête (motif inclassable) */
 } meshpay_ui_feedback_t;
 
 /* Chantier migration NVS (M4) — état du stockage persistant, poussé par le
@@ -309,6 +318,11 @@ esp_err_t meshpay_ui_set_storage_status(meshpay_ui_state_t *ui,
 /* Signale à l'écran l'échec d'une action d'écriture faute de stockage
  * (feedback transient, affiché en footer comme les feedbacks paiement). */
 esp_err_t meshpay_ui_on_storage_write_failed(meshpay_ui_state_t *ui);
+/* Chantier erreurs UI invisibles (U1) — pose le feedback transient d'échec
+ * d'action (une des causes typées ci-dessus). Refuse les valeurs qui ne sont
+ * pas des échecs (INVALID_ARG) : les succès passent par leurs canaux dédiés. */
+esp_err_t meshpay_ui_on_action_failed(meshpay_ui_state_t *ui,
+                                      meshpay_ui_feedback_t cause);
 /* Demande de réinitialisation en deux temps : 1er appel arme (*confirmed
  * faux, le bouton affiche « Confirmer ? »), 2e appel confirme (*confirmed
  * vrai, désarmé). Toute navigation désarme. INVALID_STATE si le stockage est

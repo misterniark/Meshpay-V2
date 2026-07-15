@@ -1195,6 +1195,23 @@ static esp_err_t wallet_apply_action_locked(meshpay_ui_action_t action,
 
 /* Exécute une action différée, HORS verrou (les API runtime le prennent
  * elles-mêmes), puis reprend le verrou pour pousser le résultat dans l'UI. */
+/* Chantier erreurs UI invisibles (U2) : pousse à l'écran le motif d'échec
+ * d'un geste utilisateur (feedback typé, verrou bref). L'état storage poussé
+ * au boot discrimine les INVALID_STATE ambigus — fix de la collision M4. */
+static void wallet_report_action_failure(meshpay_app_ui_action_kind_t kind,
+                                         esp_err_t err)
+{
+    if (s_runtime.lock == NULL ||
+        xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return;
+    }
+    bool storage_ok = (s_app.ui.storage_status == MESHPAY_UI_STORAGE_OK);
+    (void)meshpay_ui_on_action_failed(
+        &s_app.ui,
+        meshpay_app_action_error_feedback(kind, err, storage_ok));
+    xSemaphoreGive(s_runtime.lock);
+}
+
 static void wallet_run_deferred(const wallet_deferred_action_t *d)
 {
     if (d == NULL || d->kind == WALLET_DEFER_NONE) {
@@ -1214,8 +1231,10 @@ static void wallet_run_deferred(const wallet_deferred_action_t *d)
         }
         if (err != ESP_OK) {
             /* Refus (nom vide, crédit > offre, déjà membre, pas de storage) :
-             * l'UI reste sur le wizard, le motif part en série. */
+             * l'UI reste sur le wizard ET affiche le motif (U2 — fini le
+             * bouton « Creer » qui ne fait rien). */
             ESP_LOGW(TAG, "creation monnaie refusee: %s", esp_err_to_name(err));
+            wallet_report_action_failure(MESHPAY_APP_UI_ACTION_CREATE, err);
             return;
         }
         char code[MESHPAY_CURRENCY_INVITE_CODE_BUF] = {0};
@@ -1237,14 +1256,12 @@ static void wallet_run_deferred(const wallet_deferred_action_t *d)
         esp_err_t err =
             meshpay_app_runtime_arm_join(&s_runtime, d->code, now_ms);
         if (err != ESP_OK) {
+            /* U2 : motif typé — code malformé (faute de frappe : LE cas
+             * nominal), déjà membre, ou storage HS (discriminé par l'état
+             * poussé au boot ; fix de la collision M4 qui affichait
+             * « stockage HS » à un membre). */
             ESP_LOGW(TAG, "code d'invitation refuse: %s", esp_err_to_name(err));
-            /* M4 : l'échec devient visible à l'écran au lieu d'être avalé
-             * (INVALID_STATE = stockage indisponible, l'import est refusé). */
-            if (err == ESP_ERR_INVALID_STATE && s_runtime.lock != NULL &&
-                xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
-                (void)meshpay_ui_on_storage_write_failed(&s_app.ui);
-                xSemaphoreGive(s_runtime.lock);
-            }
+            wallet_report_action_failure(MESHPAY_APP_UI_ACTION_JOIN_CODE, err);
             return;
         }
         if (s_runtime.lock != NULL &&
@@ -1283,7 +1300,22 @@ static void wallet_run_deferred(const wallet_deferred_action_t *d)
         if (err == ESP_OK) {
             (void)meshpay_app_runtime_emit_discover(&s_runtime, now_ms);
         } else {
+            /* U2 : sans armement, l'écran liste serait une « Recherche... »
+             * FANTÔME — motif affiché et retour au menu monnaie. */
             ESP_LOGW(TAG, "découverte non armée: %s", esp_err_to_name(err));
+            if (s_runtime.lock != NULL &&
+                xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+                bool storage_ok =
+                    (s_app.ui.storage_status == MESHPAY_UI_STORAGE_OK);
+                (void)meshpay_ui_nav(&s_app.ui,
+                                     MESHPAY_UI_SCREEN_CURRENCY_MENU);
+                /* Après la nav (qui efface le feedback) : le motif tient. */
+                (void)meshpay_ui_on_action_failed(
+                    &s_app.ui,
+                    meshpay_app_action_error_feedback(
+                        MESHPAY_APP_UI_ACTION_ARM_DISCOVERY, err, storage_ok));
+                xSemaphoreGive(s_runtime.lock);
+            }
         }
         break;
     }
@@ -1297,15 +1329,12 @@ static void wallet_run_deferred(const wallet_deferred_action_t *d)
                                                             d->index,
                                                             now_ms);
         if (err != ESP_OK) {
+            /* U2 : c'était LE « OK ne fait rien » du Palier E — motif typé
+             * (sélection périmée, déjà membre, storage HS discriminé). */
             ESP_LOGW(TAG, "rejointe par découverte refusée: %s",
                      esp_err_to_name(err));
-            /* M4 : c'était LE « OK ne fait rien » du Palier E — l'échec
-             * s'affiche désormais (footer) au lieu de mourir dans le log. */
-            if (err == ESP_ERR_INVALID_STATE && s_runtime.lock != NULL &&
-                xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
-                (void)meshpay_ui_on_storage_write_failed(&s_app.ui);
-                xSemaphoreGive(s_runtime.lock);
-            }
+            wallet_report_action_failure(MESHPAY_APP_UI_ACTION_JOIN_DISCOVERED,
+                                         err);
             return;
         }
         if (s_runtime.lock != NULL &&
@@ -1358,6 +1387,10 @@ static void wallet_run_deferred(const wallet_deferred_action_t *d)
  */
 static void wallet_sync_currency_ui(int64_t now_us)
 {
+    /* U3 : fait expirer la fenêtre de rejointe même si le réseau est muet
+     * (le tick au fil de l'eau ne vit que s'il y a des événements radio). */
+    (void)meshpay_app_runtime_join_tick(&s_runtime,
+                                        (uint64_t)(now_us / 1000));
     meshpay_app_join_state_t js = meshpay_app_runtime_join_state(&s_runtime);
 
     /* Recopie la liste découverte : nom + empreinte courte anti-usurpation

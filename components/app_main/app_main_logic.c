@@ -253,6 +253,40 @@ static void runtime_refresh_known_peers(meshpay_app_runtime_t *runtime)
     runtime_refresh_payment_peer(runtime);
 }
 
+meshpay_ui_feedback_t meshpay_app_action_error_feedback(
+    meshpay_app_ui_action_kind_t kind,
+    esp_err_t err,
+    bool storage_ok)
+{
+    if (err == ESP_OK) {
+        return MESHPAY_UI_FEEDBACK_NONE;
+    }
+    /* INVALID_STATE est ambigu par construction (mono-monnaie ET storage) :
+     * l'état du stockage poussé au boot fait foi. Un import exotique peut
+     * s'afficher « Deja membre » au lieu d'un motif plus fin — toujours
+     * infiniment mieux qu'un écran muet. */
+    if (err == ESP_ERR_INVALID_STATE) {
+        return storage_ok ? MESHPAY_UI_FEEDBACK_ALREADY_MEMBER
+                          : MESHPAY_UI_FEEDBACK_STORAGE_ERROR;
+    }
+    if (err == ESP_ERR_TIMEOUT) {
+        return MESHPAY_UI_FEEDBACK_ACTION_FAILED; /* verrou : inclassable */
+    }
+    switch (kind) {
+    case MESHPAY_APP_UI_ACTION_CREATE:
+        return MESHPAY_UI_FEEDBACK_CREATE_REFUSED;
+    case MESHPAY_APP_UI_ACTION_JOIN_CODE:
+        /* Tout le reste vient du décodage du code (checksum, alphabet,
+         * longueur) : la faute de frappe est LE cas nominal. */
+        return MESHPAY_UI_FEEDBACK_BAD_INVITE_CODE;
+    case MESHPAY_APP_UI_ACTION_ARM_DISCOVERY:
+    case MESHPAY_APP_UI_ACTION_JOIN_DISCOVERED:
+        return MESHPAY_UI_FEEDBACK_DISCOVERY_REFUSED;
+    default:
+        return MESHPAY_UI_FEEDBACK_ACTION_FAILED;
+    }
+}
+
 esp_err_t meshpay_app_generate_alias(char *out, size_t out_len)
 {
     if (out == NULL || out_len == 0) {
@@ -712,7 +746,8 @@ esp_err_t meshpay_app_runtime_arm_join_anchor(meshpay_app_runtime_t *runtime,
         memcpy(runtime->pending_anchor, anchor, anchor_len);
         runtime->pending_anchor_len = anchor_len;
         runtime->join_armed = true;
-        runtime->join_armed_until_ms = now_ms; /* fenêtre : désarmement différé */
+        /* U3 : la fenêtre expire réellement — join_tick désarme et l'affiche. */
+        runtime->join_armed_until_ms = now_ms + MESHPAY_APP_JOIN_WINDOW_MS;
         /* Exclusif de la découverte (E2) : un seul mode de rejointe à la fois. */
         runtime->discovery_armed = false;
     }
@@ -734,6 +769,37 @@ esp_err_t meshpay_app_runtime_arm_join(meshpay_app_runtime_t *runtime,
                                                        sizeof(anchor), &anchor_len),
                         "app_runtime", "");
     return meshpay_app_runtime_arm_join_anchor(runtime, anchor, anchor_len, now_ms);
+}
+
+/* U3 — expiration de la fenêtre d'armement, verrou DÉJÀ tenu (même pattern
+ * que runtime_retry_held_payments). No-op si rien d'armé ou échéance future. */
+static void runtime_join_tick_locked(meshpay_app_runtime_t *runtime,
+                                     uint64_t now_ms)
+{
+    if (!runtime->join_armed || now_ms < runtime->join_armed_until_ms) {
+        return;
+    }
+    runtime->join_armed = false;
+    runtime->pending_anchor_len = 0;
+    (void)meshpay_ui_on_action_failed(&runtime->app->ui,
+                                      MESHPAY_UI_FEEDBACK_JOIN_EXPIRED);
+    ESP_LOGW(APP_RUNTIME_TAG,
+             "rejointe expiree sans OFFER (fenetre %u ms)",
+             (unsigned)MESHPAY_APP_JOIN_WINDOW_MS);
+}
+
+esp_err_t meshpay_app_runtime_join_tick(meshpay_app_runtime_t *runtime,
+                                        uint64_t now_ms)
+{
+    if (runtime == NULL || runtime->app == NULL || runtime->lock == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(runtime->lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    runtime_join_tick_locked(runtime, now_ms);
+    xSemaphoreGive(runtime->lock);
+    return ESP_OK;
 }
 
 esp_err_t meshpay_app_runtime_emit_join_request(meshpay_app_runtime_t *runtime,
@@ -1911,8 +1977,9 @@ static esp_err_t runtime_handle_join_offer(meshpay_app_runtime_t *runtime,
     if (!runtime->join_armed) {
         return ESP_OK;
     }
-    /* (Timeout de fenêtre : champ join_armed_until_ms posé, désarmement différé
-     * à un palier ultérieur — non évalué ici.) */
+    /* (Timeout de fenêtre : évalué par runtime_join_tick_locked — au fil de
+     * l'eau réseau et depuis la boucle UI firmware, U3. Un OFFER arrivé ici
+     * avant l'échéance importe et désarme normalement.) */
 
     meshpay_currency_descriptor_signed_t signed_desc;
     if (meshpay_descriptor_sync_parse_offer(packet, &signed_desc) != ESP_OK) {
@@ -2052,6 +2119,9 @@ static esp_err_t runtime_process_reticulum(meshpay_app_runtime_t *runtime,
      * (le retry post-batch couvre le cas nominal ; ceci couvre l'expiration
      * quand aucun batch n'arrive). No-op si aucun slot occupé. */
     runtime_retry_held_payments(runtime, event->now_ms);
+    /* U3 : fait vivre la fenêtre d'armement de la rejointe de la même façon
+     * (la boucle UI firmware la ticke aussi, indépendamment du réseau). */
+    runtime_join_tick_locked(runtime, event->now_ms);
     if (event->type == MESHPAY_APP_EVENT_RETICULUM_TX) {
         if (runtime->packet_tx != NULL) {
             ESP_RETURN_ON_ERROR(runtime->packet_tx(&event->packet,
