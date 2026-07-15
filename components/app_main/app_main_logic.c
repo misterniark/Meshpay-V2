@@ -454,15 +454,34 @@ esp_err_t meshpay_app_bootstrap_identity(
     const char *default_alias,
     rns_identity_t *identity,
     meshpay_storage_record_t *record,
-    bool *created)
+    bool *created,
+    meshpay_storage_probe_t *probe)
 {
+    if (probe != NULL) {
+        *probe = MESHPAY_STORAGE_PROBE_ERROR;
+    }
     if (backend == NULL || identity == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    /* Chantier migration NVS : le load migrateur remplace le load direct — un
+     * record v2 de la flotte est converti (backup d'abord), un record illisible
+     * est ARCHIVÉ et laissé en place. La génération d'identité n'a lieu QUE
+     * sur NVS vierge : c'est elle qui, avant, écrasait des identités
+     * récupérables. */
     meshpay_storage_record_t loaded;
-    esp_err_t err = meshpay_storage_load(backend, &loaded);
+    bool migrated = false;
+    meshpay_storage_probe_t verdict = MESHPAY_STORAGE_PROBE_ERROR;
+    esp_err_t err = meshpay_storage_migrate(backend, &loaded, &migrated,
+                                            &verdict);
+    if (probe != NULL) {
+        *probe = verdict;
+    }
     if (err == ESP_OK) {
+        if (migrated) {
+            ESP_LOGW("app_main",
+                     "record NVS migre v2 -> v3 (original archive)");
+        }
         if (!loaded.has_identity) {
             rns_crypto_secure_zero(&loaded, sizeof(loaded));
             return ESP_ERR_INVALID_STATE;
@@ -479,6 +498,9 @@ esp_err_t meshpay_app_bootstrap_identity(
     }
     if (err != ESP_ERR_NOT_FOUND) {
         return err;
+    }
+    if (probe != NULL) {
+        *probe = MESHPAY_STORAGE_PROBE_OK; /* vierge : le record va être créé */
     }
 
     meshpay_storage_record_t fresh;

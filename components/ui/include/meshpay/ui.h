@@ -44,7 +44,21 @@ typedef enum {
     MESHPAY_UI_FEEDBACK_PAYMENT_CONFIRMED,
     MESHPAY_UI_FEEDBACK_PAYMENT_REJECTED,
     MESHPAY_UI_FEEDBACK_PIN_ERROR,
+    /* Chantier migration NVS (M4) : une action d'ÉCRITURE a échoué parce que
+     * le stockage persistant est indisponible — fini le « OK ne fait rien ». */
+    MESHPAY_UI_FEEDBACK_STORAGE_ERROR,
 } meshpay_ui_feedback_t;
+
+/* Chantier migration NVS (M4) — état du stockage persistant, poussé par le
+ * firmware au boot (miroir sommaire de meshpay_storage_probe_t ; l'UI ne
+ * dépend pas de storage). Tout état ≠ OK rend l'alerte visible (footer HOME,
+ * détails + bouton « Réinitialiser » sur l'écran Réseau). */
+typedef enum {
+    MESHPAY_UI_STORAGE_OK = 0,
+    MESHPAY_UI_STORAGE_LEGACY,  /* record d'un autre schéma, préservé */
+    MESHPAY_UI_STORAGE_CORRUPT, /* record illisible, archivé */
+    MESHPAY_UI_STORAGE_ERROR,   /* erreur d'E/S NVS au boot */
+} meshpay_ui_storage_status_t;
 
 #define MESHPAY_UI_PIN_ENTRY_MAX 16
 #define MESHPAY_UI_TEXT_MAX 48
@@ -151,6 +165,10 @@ typedef enum {
     /* Palier E3 — rejointe par découverte. */
     MESHPAY_UI_ACTION_JOIN_CODE,       /* repli : saisie manuelle du code */
     MESHPAY_UI_ACTION_NEXT_DISCOVERED, /* liste : monnaie suivante */
+
+    /* Chantier migration NVS (M4) : réinitialisation du record storage
+     * (deux temps : armer puis confirmer ; le backup n'est jamais touché). */
+    MESHPAY_UI_ACTION_STORAGE_RESET,
 } meshpay_ui_action_t;
 
 /* Palier E3 — une monnaie découverte, vue UI : nom + empreinte courte (hex du
@@ -191,6 +209,11 @@ typedef struct {
     meshpay_ui_discovered_entry_t discovered[MESHPAY_UI_DISCOVERED_MAX];
     uint8_t discovered_count;
     uint8_t selected_discovered;
+    /* Chantier migration NVS (M4) — état du stockage + armement du reset
+     * (désarmé à chaque navigation : la confirmation exige deux taps
+     * consécutifs sur le même écran). */
+    meshpay_ui_storage_status_t storage_status;
+    bool storage_reset_armed;
 } meshpay_ui_state_t;
 
 typedef struct {
@@ -278,6 +301,20 @@ esp_err_t meshpay_ui_on_pin_result(meshpay_ui_state_t *ui,
 esp_err_t meshpay_ui_on_payment_feedback(meshpay_ui_state_t *ui,
                                          meshpay_payment_feedback_t feedback,
                                          uint32_t amount);
+
+/* Chantier migration NVS (M4) — état du stockage persistant (poussé une fois
+ * au boot par le firmware ; OK efface l'alerte et désarme le reset). */
+esp_err_t meshpay_ui_set_storage_status(meshpay_ui_state_t *ui,
+                                        meshpay_ui_storage_status_t status);
+/* Signale à l'écran l'échec d'une action d'écriture faute de stockage
+ * (feedback transient, affiché en footer comme les feedbacks paiement). */
+esp_err_t meshpay_ui_on_storage_write_failed(meshpay_ui_state_t *ui);
+/* Demande de réinitialisation en deux temps : 1er appel arme (*confirmed
+ * faux, le bouton affiche « Confirmer ? »), 2e appel confirme (*confirmed
+ * vrai, désarmé). Toute navigation désarme. INVALID_STATE si le stockage est
+ * sain (le bouton n'existe pas à l'écran dans ce cas). */
+esp_err_t meshpay_ui_storage_reset_request(meshpay_ui_state_t *ui,
+                                           bool *confirmed);
 
 #ifdef __cplusplus
 }

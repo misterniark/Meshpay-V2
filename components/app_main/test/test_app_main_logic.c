@@ -1477,7 +1477,7 @@ TEST_CASE("app bootstrap creates and reloads persistent identity", "[app_main]")
     bool created = false;
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_bootstrap_identity(
                                   &backend, "Alice", &first,
-                                  &first_record, &created));
+                                  &first_record, &created, NULL));
     TEST_ASSERT_TRUE(created);
     TEST_ASSERT_TRUE(first.has_private);
     TEST_ASSERT_TRUE(first_record.has_identity);
@@ -1494,7 +1494,7 @@ TEST_CASE("app bootstrap creates and reloads persistent identity", "[app_main]")
     created = true;
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_bootstrap_identity(
                                   &backend, "Ignored", &second,
-                                  &second_record, &created));
+                                  &second_record, &created, NULL));
     TEST_ASSERT_FALSE(created);
     TEST_ASSERT_EQUAL_UINT32(1, mock.write_count);
     TEST_ASSERT_EQUAL_STRING("Alice", second_record.alias);
@@ -1521,7 +1521,86 @@ TEST_CASE("app bootstrap rejects stored record without identity", "[app_main]")
     rns_identity_t identity;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
                       meshpay_app_bootstrap_identity(&backend, "Fallback",
-                                                     &identity, NULL, NULL));
+                                                     &identity, NULL, NULL, NULL));
+}
+
+/* --- Chantier migration NVS (M4) : bootstrap migrateur --- */
+
+TEST_CASE("app bootstrap migrates v2 record keeping identity", "[app_main]")
+{
+    meshpay_storage_mock_t mock;
+    meshpay_storage_mock_init(&mock);
+    meshpay_storage_backend_t backend = meshpay_storage_mock_backend(&mock);
+
+    /* Un device de la flotte : record v2-struct avec une identité réelle
+     * (la struct RAM courante est layout-identique au gel v2). */
+    rns_identity_t original;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(&original));
+    uint8_t original_private[RNS_IDENTITY_PRIVATE_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_identity_get_private_key(&original,
+                                                   original_private));
+    meshpay_storage_record_t v2;
+    meshpay_storage_record_init(&v2);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_storage_record_set_identity(&v2,
+                                                          original_private));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_storage_record_set_alias(&v2, "Mig"));
+    v2.next_seq = 9;
+    v2.version = 2;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      backend.write_blob(backend.ctx,
+                                         MESHPAY_STORAGE_STATE_KEY,
+                                         &v2, sizeof(v2)));
+
+    /* Boot : identité CONSERVÉE, record migré en v3, témoin v2 archivé. */
+    rns_identity_t booted;
+    meshpay_storage_record_t booted_record;
+    bool created = true;
+    meshpay_storage_probe_t probe;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_bootstrap_identity(
+                                  &backend, "Ignored", &booted,
+                                  &booted_record, &created, &probe));
+    TEST_ASSERT_FALSE(created);
+    TEST_ASSERT_EQUAL(MESHPAY_STORAGE_PROBE_OK, probe);
+    uint8_t booted_private[RNS_IDENTITY_PRIVATE_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_identity_get_private_key(&booted, booted_private));
+    TEST_ASSERT_EQUAL_MEMORY(original_private, booted_private,
+                             sizeof(original_private));
+    TEST_ASSERT_EQUAL_STRING("Mig", booted_record.alias);
+    TEST_ASSERT_EQUAL_UINT32(9, booted_record.next_seq);
+    TEST_ASSERT_TRUE(mock.bak_present);
+    TEST_ASSERT_EQUAL_UINT32(sizeof(v2), mock.bak_blob_len);
+    /* Le state persiste en v3 : plus petit que la struct brute. */
+    TEST_ASSERT_TRUE(mock.blob_len < sizeof(v2));
+}
+
+TEST_CASE("app bootstrap never overwrites unreadable record", "[app_main]")
+{
+    meshpay_storage_mock_t mock;
+    meshpay_storage_mock_init(&mock);
+    meshpay_storage_backend_t backend = meshpay_storage_mock_backend(&mock);
+
+    /* Blob au magic inconnu : le boot NE génère PAS d'identité par-dessus
+     * (c'est l'écrasement qui détruisait les identités récupérables) — il
+     * archive, échoue avec le motif, et laisse le blob en place. */
+    memset(mock.blob, 0x5A, 200);
+    mock.blob_len = 200;
+    mock.present = true;
+
+    rns_identity_t identity;
+    bool created = true;
+    meshpay_storage_probe_t probe;
+    TEST_ASSERT_NOT_EQUAL(ESP_OK, meshpay_app_bootstrap_identity(
+                                      &backend, "Fallback", &identity,
+                                      NULL, &created, &probe));
+    TEST_ASSERT_EQUAL(MESHPAY_STORAGE_PROBE_CORRUPT, probe);
+    TEST_ASSERT_TRUE(mock.present);
+    TEST_ASSERT_EQUAL_UINT32(200, mock.blob_len);
+    TEST_ASSERT_EQUAL_UINT32(0, mock.write_count);
+    TEST_ASSERT_TRUE(mock.bak_present);
+    TEST_ASSERT_EQUAL_UINT32(200, mock.bak_blob_len);
 }
 
 /* --- Palier A5 : config monnaie au boot depuis le record (repli sûr) --- *

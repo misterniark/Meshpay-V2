@@ -644,3 +644,94 @@ TEST_CASE("ui set discovered truncates above capacity", "[ui][e3]")
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
     TEST_ASSERT_NOT_NULL(strstr(view.secondary, "1/4"));
 }
+
+/* --- Chantier migration NVS (M4) : stockage HS visible + reset 2 temps --- */
+
+TEST_CASE("ui storage alert shows in footer and network screen", "[ui][m4]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_ui_set_storage_status(&ui,
+                                                    MESHPAY_UI_STORAGE_CORRUPT));
+
+    /* HOME : l'alerte persiste dans le footer de tous les écrans. */
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_NOT_NULL(strstr(view.footer, "Stockage HS"));
+
+    /* Réseau : motif détaillé + bouton de réinitialisation. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_NETWORK));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_NOT_NULL(strstr(view.detail_lines[0], "illisibles"));
+    TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_STORAGE_RESET));
+
+    /* Retour à un stockage sain : alerte et bouton disparaissent. */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_ui_set_storage_status(&ui,
+                                                    MESHPAY_UI_STORAGE_OK));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_EQUAL_STRING("", view.footer);
+    TEST_ASSERT_FALSE(view_has_action(&view, MESHPAY_UI_ACTION_STORAGE_RESET));
+}
+
+TEST_CASE("ui storage reset needs two taps and nav disarms", "[ui][m4]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+
+    /* Stockage sain : le reset est refusé (pas de bouton à l'écran). */
+    bool confirmed = true;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_ui_storage_reset_request(&ui, &confirmed));
+    TEST_ASSERT_FALSE(confirmed);
+
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_ui_set_storage_status(&ui,
+                                                    MESHPAY_UI_STORAGE_LEGACY));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_NETWORK));
+
+    /* 1er tap : armé, pas confirmé — le bouton passe à « Confirmer? ». */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_storage_reset_request(&ui, &confirmed));
+    TEST_ASSERT_FALSE(confirmed);
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    bool armed_label = false;
+    for (uint8_t i = 0; i < view.action_count; ++i) {
+        if (view.actions[i] == MESHPAY_UI_ACTION_STORAGE_RESET &&
+            strcmp(view.action_labels[i], "Confirmer?") == 0) {
+            armed_label = true;
+        }
+    }
+    TEST_ASSERT_TRUE(armed_label);
+
+    /* Naviguer désarme : le tap suivant re-arme au lieu de confirmer. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_HOME));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_NETWORK));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_storage_reset_request(&ui, &confirmed));
+    TEST_ASSERT_FALSE(confirmed);
+
+    /* 2e tap consécutif : confirmé et désarmé. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_storage_reset_request(&ui, &confirmed));
+    TEST_ASSERT_TRUE(confirmed);
+    TEST_ASSERT_FALSE(ui.storage_reset_armed);
+}
+
+TEST_CASE("ui storage write failure feedback overrides footer", "[ui][m4]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_ui_set_storage_status(&ui,
+                                                    MESHPAY_UI_STORAGE_LEGACY));
+    /* Une écriture vient d'échouer (rejointe refusée) : le feedback transient
+     * prend le footer, l'alerte persistante reviendra à la prochaine nav. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_on_storage_write_failed(&ui));
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_EQUAL_STRING("Echec: stockage HS", view.footer);
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_NETWORK));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_NOT_NULL(strstr(view.footer, "Stockage HS"));
+}

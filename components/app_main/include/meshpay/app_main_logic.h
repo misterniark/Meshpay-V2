@@ -246,12 +246,22 @@ esp_err_t meshpay_app_pay(meshpay_app_t *sender,
                           meshpay_app_t *receiver,
                           uint32_t amount,
                           uint64_t now_ms);
+/* Chantier migration NVS (M4) — amorçage de l'identité persistée :
+ *  - record v3 lisible -> chargé ; record v2 de la flotte -> MIGRÉ sur place
+ *    (archive du blob original puis réécriture v3, loggé) ;
+ *  - NVS vierge -> identité générée + record créé (*created=true) ;
+ *  - record LEGACY non migrable / CORRUPT / erreur d'E/S -> échec SANS
+ *    générer ni écraser quoi que ce soit (le blob est préservé, archivé par
+ *    la couche storage) — l'appelant passe en identité éphémère et POUSSE
+ *    l'état à l'UI via *probe (NULL toléré). Plus jamais de « OK ne fait
+ *    rien » silencieux (leçon P1 du Palier E). */
 esp_err_t meshpay_app_bootstrap_identity(
     const meshpay_storage_backend_t *backend,
     const char *default_alias,
     rns_identity_t *identity,
     meshpay_storage_record_t *record,
-    bool *created);
+    bool *created,
+    meshpay_storage_probe_t *probe);
 esp_err_t meshpay_app_generate_alias(char *out, size_t out_len);
 bool meshpay_app_alias_needs_generation(const char *alias);
 esp_err_t meshpay_app_ensure_record_alias(

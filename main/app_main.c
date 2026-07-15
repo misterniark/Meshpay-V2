@@ -97,6 +97,10 @@ static rns_node_t s_node;
 static meshpay_app_t *s_app_ptr;
 #define s_app (*s_app_ptr)
 static meshpay_app_runtime_t s_runtime;
+/* Chantier migration NVS (M4) : backend storage accessible aux handlers UI
+ * (bouton « Réinitialiser » de l'écran Réseau) — rempli au boot, backend nul
+ * (write_blob==NULL) tant que la NVS n'est pas initialisée. */
+static meshpay_storage_backend_t s_storage_backend;
 static char s_device_alias[MESHPAY_STORAGE_ALIAS_MAX];
 static meshpay_announce_reply_entry_t
     s_announce_replied[MESHPAY_ANNOUNCE_REPLY_CACHE_MAX];
@@ -1062,6 +1066,7 @@ typedef enum {
     WALLET_DEFER_SHOW_CODE,       /* afficher le code d'invitation détenu */
     WALLET_DEFER_ARM_DISCOVERY,   /* ouvrir l'écran liste : armer la découverte */
     WALLET_DEFER_JOIN_DISCOVERED, /* CONFIRM sur la liste : rejoindre l'index */
+    WALLET_DEFER_STORAGE_RESET,   /* M4 : reset confirmé du record storage */
 } wallet_defer_kind_t;
 
 typedef struct {
@@ -1126,6 +1131,17 @@ static esp_err_t wallet_apply_action_locked(meshpay_ui_action_t action,
         /* Le code se lit via le runtime (verrou interne) : différé hors lock. */
         defer->kind = WALLET_DEFER_SHOW_CODE;
         return ESP_OK;
+    case MESHPAY_UI_ACTION_STORAGE_RESET: {
+        /* M4 : deux temps gérés par l'UI (armer puis confirmer) ; l'effacement
+         * lui-même (flash + reboot) part hors verrou. Le backup meshpay_bak
+         * n'est jamais touché. */
+        bool confirmed = false;
+        esp_err_t err = meshpay_ui_storage_reset_request(&s_app.ui, &confirmed);
+        if (err == ESP_OK && confirmed) {
+            defer->kind = WALLET_DEFER_STORAGE_RESET;
+        }
+        return err;
+    }
     case MESHPAY_UI_ACTION_NEXT_FIELD:
         return meshpay_ui_wizard_next_field(&s_app.ui);
     case MESHPAY_UI_ACTION_PREV_FIELD:
@@ -1222,6 +1238,13 @@ static void wallet_run_deferred(const wallet_deferred_action_t *d)
             meshpay_app_runtime_arm_join(&s_runtime, d->code, now_ms);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "code d'invitation refuse: %s", esp_err_to_name(err));
+            /* M4 : l'échec devient visible à l'écran au lieu d'être avalé
+             * (INVALID_STATE = stockage indisponible, l'import est refusé). */
+            if (err == ESP_ERR_INVALID_STATE && s_runtime.lock != NULL &&
+                xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+                (void)meshpay_ui_on_storage_write_failed(&s_app.ui);
+                xSemaphoreGive(s_runtime.lock);
+            }
             return;
         }
         if (s_runtime.lock != NULL &&
@@ -1276,6 +1299,13 @@ static void wallet_run_deferred(const wallet_deferred_action_t *d)
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "rejointe par découverte refusée: %s",
                      esp_err_to_name(err));
+            /* M4 : c'était LE « OK ne fait rien » du Palier E — l'échec
+             * s'affiche désormais (footer) au lieu de mourir dans le log. */
+            if (err == ESP_ERR_INVALID_STATE && s_runtime.lock != NULL &&
+                xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+                (void)meshpay_ui_on_storage_write_failed(&s_app.ui);
+                xSemaphoreGive(s_runtime.lock);
+            }
             return;
         }
         if (s_runtime.lock != NULL &&
@@ -1291,6 +1321,24 @@ static void wallet_run_deferred(const wallet_deferred_action_t *d)
         }
         ESP_LOGI(TAG, "membre par découverte: %s",
                  has_name ? chosen.body.name : "?");
+        break;
+    }
+    case WALLET_DEFER_STORAGE_RESET: {
+        /* M4 : efface UNIQUEMENT le record (le backup meshpay_bak survit —
+         * geste réversible par USB) puis reboote : le boot suivant part sur
+         * une NVS vierge et régénère une identité persistée saine. */
+        esp_err_t err = meshpay_storage_erase(&s_storage_backend);
+        ESP_LOGW(TAG, "reset stockage demande a l'ecran: erase=%s, reboot",
+                 esp_err_to_name(err));
+        if (err == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(250)); /* laisse partir le log */
+            esp_restart();
+        }
+        if (s_runtime.lock != NULL &&
+            xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+            (void)meshpay_ui_on_storage_write_failed(&s_app.ui);
+            xSemaphoreGive(s_runtime.lock);
+        }
         break;
     }
     case WALLET_DEFER_NONE:
@@ -3258,13 +3306,18 @@ void app_main(void)
 
     esp_err_t storage_err = meshpay_storage_nvs_init();
     esp_err_t err = storage_err;
+    /* M4 : le motif d'indisponibilité du stockage est conservé pour l'UI
+     * (footer d'alerte + écran Réseau avec bouton de réinitialisation). */
+    meshpay_storage_probe_t storage_probe = MESHPAY_STORAGE_PROBE_ERROR;
     if (storage_err == ESP_OK) {
         storage_backend = meshpay_storage_nvs_backend();
+        s_storage_backend = storage_backend;
         err = meshpay_app_bootstrap_identity(&storage_backend,
                                              default_alias,
                                              &identity,
                                              &boot_record,
-                                             &identity_created);
+                                             &identity_created,
+                                             &storage_probe);
         if (err == ESP_OK) {
             esp_err_t alias_err = meshpay_app_ensure_record_alias(
                 &storage_backend,
@@ -3287,9 +3340,13 @@ void app_main(void)
         }
     }
     if (storage_err != ESP_OK || err != ESP_OK) {
-        ESP_LOGW(TAG, "persistent identity unavailable: nvs=%s boot=%s",
+        /* Identité de secours ÉPHÉMÈRE (le node doit tourner pour le mesh),
+         * mais plus jamais en silence : l'état passe à l'UI plus bas, et le
+         * record en cause reste préservé/archivé côté flash (M1/M3). */
+        ESP_LOGW(TAG, "persistent identity unavailable: nvs=%s boot=%s probe=%d",
                  esp_err_to_name(storage_err),
-                 esp_err_to_name(err));
+                 esp_err_to_name(err),
+                 (int)storage_probe);
         err = rns_identity_generate(&identity);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "identity generation failed: %s",
@@ -3368,6 +3425,18 @@ void app_main(void)
     (void)meshpay_ui_set_local_identity(&s_app.ui,
                                         s_device_alias,
                                         local_id);
+    /* M4 : l'état du stockage devient VISIBLE — footer d'alerte sur tous les
+     * écrans et bouton « Réinitialiser » sur l'écran Réseau quand il est HS
+     * (fini le « OK ne fait rien » de la leçon P1 Palier E). */
+    if (!storage_ready) {
+        meshpay_ui_storage_status_t ui_status = MESHPAY_UI_STORAGE_ERROR;
+        if (storage_probe == MESHPAY_STORAGE_PROBE_LEGACY) {
+            ui_status = MESHPAY_UI_STORAGE_LEGACY;
+        } else if (storage_probe == MESHPAY_STORAGE_PROBE_CORRUPT) {
+            ui_status = MESHPAY_UI_STORAGE_CORRUPT;
+        }
+        (void)meshpay_ui_set_storage_status(&s_app.ui, ui_status);
+    }
     if (storage_ready && boot_record.has_pin_hash) {
         err = meshpay_wallet_load_pin_hash(&s_app.wallet,
                                            boot_record.pin_hash);

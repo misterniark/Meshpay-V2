@@ -32,7 +32,9 @@ static esp_err_t nvs_read_blob(void *ctx,
                                size_t *len)
 {
     const char *ns = (const char *)ctx;
-    if (ns == NULL || key == NULL || data == NULL || len == NULL) {
+    /* data == NULL est la sonde de taille du contrat backend : nvs_get_blob
+     * remplit alors *len avec la taille stockée sans rien lire. */
+    if (ns == NULL || key == NULL || len == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 

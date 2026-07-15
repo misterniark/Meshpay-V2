@@ -62,7 +62,25 @@ static const char *feedback_text(meshpay_ui_feedback_t feedback)
         return "Paiement refuse";
     case MESHPAY_UI_FEEDBACK_PIN_ERROR:
         return "PIN invalide";
+    case MESHPAY_UI_FEEDBACK_STORAGE_ERROR:
+        return "Echec: stockage HS";
     case MESHPAY_UI_FEEDBACK_NONE:
+    default:
+        return "";
+    }
+}
+
+/* Libellé sommaire de l'état du stockage (alerte persistante, M4). */
+static const char *storage_status_text(meshpay_ui_storage_status_t status)
+{
+    switch (status) {
+    case MESHPAY_UI_STORAGE_LEGACY:
+        return "ancien format preserve";
+    case MESHPAY_UI_STORAGE_CORRUPT:
+        return "donnees illisibles";
+    case MESHPAY_UI_STORAGE_ERROR:
+        return "erreur d'acces";
+    case MESHPAY_UI_STORAGE_OK:
     default:
         return "";
     }
@@ -349,6 +367,8 @@ esp_err_t meshpay_ui_nav(meshpay_ui_state_t *ui, meshpay_ui_screen_t screen)
     }
     ui->screen = screen;
     ui->feedback = MESHPAY_UI_FEEDBACK_NONE;
+    /* M4 : quitter l'écran désarme la confirmation du reset stockage. */
+    ui->storage_reset_armed = false;
     return ESP_OK;
 }
 
@@ -791,6 +811,22 @@ esp_err_t meshpay_ui_build_view(const meshpay_ui_state_t *ui,
         view_text(view->secondary, ui->network_peers == 0
                                        ? "En attente"
                                        : "Reticulum actif");
+        /* M4 : stockage dégradé -> motif détaillé + bouton de réinitialisation
+         * en deux temps (l'identité de secours est éphémère tant que le record
+         * n'est pas réinitialisé ; le backup survit au reset). */
+        if (ui->storage_status != MESHPAY_UI_STORAGE_OK) {
+            char line[MESHPAY_UI_TEXT_MAX];
+            (void)snprintf(line, sizeof(line), "Stockage HS: %s",
+                           storage_status_text(ui->storage_status));
+            add_detail(view, line);
+            add_detail(view, "Identite temporaire, rien");
+            add_detail(view, "n'est enregistre.");
+            add_detail(view, ui->storage_reset_armed
+                                 ? "Reinit: appuyer encore"
+                                 : "Reinit: efface le record");
+            add_action(view, MESHPAY_UI_ACTION_STORAGE_RESET,
+                       ui->storage_reset_armed ? "Confirmer?" : "Reinit.");
+        }
         add_action(view, MESHPAY_UI_ACTION_HOME, "Accueil");
         add_action(view, MESHPAY_UI_ACTION_CURRENCY, "Monnaie");
         break;
@@ -1097,6 +1133,55 @@ esp_err_t meshpay_ui_build_view(const meshpay_ui_state_t *ui,
     if (view->footer[0] == '\0') {
         view_text(view->footer, feedback_text(ui->feedback));
     }
+    /* M4 : alerte stockage persistante — derrière le feedback transient (qui
+     * a priorité le temps de s'afficher), sur tous les écrans du wallet. */
+    if (view->footer[0] == '\0' &&
+        ui->storage_status != MESHPAY_UI_STORAGE_OK) {
+        view_text(view->footer, "! Stockage HS - voir Reseau");
+    }
+    return ESP_OK;
+}
+
+esp_err_t meshpay_ui_set_storage_status(meshpay_ui_state_t *ui,
+                                        meshpay_ui_storage_status_t status)
+{
+    if (ui == NULL || status > MESHPAY_UI_STORAGE_ERROR) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ui->storage_status = status;
+    if (status == MESHPAY_UI_STORAGE_OK) {
+        ui->storage_reset_armed = false;
+    }
+    return ESP_OK;
+}
+
+esp_err_t meshpay_ui_on_storage_write_failed(meshpay_ui_state_t *ui)
+{
+    if (ui == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ui->feedback = MESHPAY_UI_FEEDBACK_STORAGE_ERROR;
+    return ESP_OK;
+}
+
+esp_err_t meshpay_ui_storage_reset_request(meshpay_ui_state_t *ui,
+                                           bool *confirmed)
+{
+    if (ui == NULL || confirmed == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *confirmed = false;
+    /* Le bouton n'existe que sous alerte : refuser hors de ce contexte évite
+     * qu'un déclenchement parasite efface un record SAIN. */
+    if (ui->storage_status == MESHPAY_UI_STORAGE_OK) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!ui->storage_reset_armed) {
+        ui->storage_reset_armed = true;
+        return ESP_OK;
+    }
+    ui->storage_reset_armed = false;
+    *confirmed = true;
     return ESP_OK;
 }
 
