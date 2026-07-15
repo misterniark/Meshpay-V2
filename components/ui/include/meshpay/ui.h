@@ -22,9 +22,10 @@ typedef enum {
     MESHPAY_UI_SCREEN_LOCKED,
     /* Palier D — création/rejointe de monnaie. */
     MESHPAY_UI_SCREEN_CURRENCY_MENU, /* sous-menu Creer / Rejoindre / Code */
-    MESHPAY_UI_SCREEN_JOIN,          /* saisie du code d'invitation */
+    MESHPAY_UI_SCREEN_JOIN,          /* liste des monnaies decouvertes (E3) */
     MESHPAY_UI_SCREEN_FOUNDER_CODE,  /* affiche le code a dicter */
     MESHPAY_UI_SCREEN_CREATE,        /* wizard de creation de monnaie (D3) */
+    MESHPAY_UI_SCREEN_JOIN_CODE,     /* repli : saisie manuelle du code (E3) */
 } meshpay_ui_screen_t;
 
 /* Palier D — appartenance à une monnaie, poussée depuis l'app (miroir headless
@@ -55,6 +56,11 @@ typedef enum {
 /* Wizard de création (D3) : symbole borné, 6 champs éditables. */
 #define MESHPAY_UI_WIZARD_SYMBOL_MAX 8
 #define MESHPAY_UI_WIZARD_FIELD_COUNT 6
+/* Découverte (E3) : capacité de la liste UI (alignée sur
+ * MESHPAY_APP_DISCOVERED_MAX sans dépendre d'app_main) et taille de
+ * l'empreinte courte affichée (8 hex du genesis + NUL, arrondie). */
+#define MESHPAY_UI_DISCOVERED_MAX 4
+#define MESHPAY_UI_FINGERPRINT_MAX 12
 #define MESHPAY_UI_ACTION_LABEL_MAX 12
 #define MESHPAY_UI_PEER_LABEL_MAX 32
 #define MESHPAY_UI_ID_LABEL_MAX 16
@@ -141,7 +147,18 @@ typedef enum {
     MESHPAY_UI_ACTION_SHOW_CODE,  /* affiche le code d'invitation détenu */
     MESHPAY_UI_ACTION_NEXT_FIELD, /* wizard : champ suivant */
     MESHPAY_UI_ACTION_PREV_FIELD, /* wizard : champ précédent */
+
+    /* Palier E3 — rejointe par découverte. */
+    MESHPAY_UI_ACTION_JOIN_CODE,       /* repli : saisie manuelle du code */
+    MESHPAY_UI_ACTION_NEXT_DISCOVERED, /* liste : monnaie suivante */
 } meshpay_ui_action_t;
+
+/* Palier E3 — une monnaie découverte, vue UI : nom + empreinte courte (hex du
+ * genesis). L'app pousse la liste depuis le runtime (set_discovered). */
+typedef struct {
+    char name[MESHPAY_UI_CURRENCY_NAME_MAX];
+    char fingerprint[MESHPAY_UI_FINGERPRINT_MAX];
+} meshpay_ui_discovered_entry_t;
 
 typedef struct {
     meshpay_ui_screen_t screen;
@@ -170,6 +187,10 @@ typedef struct {
     char invite_code[MESHPAY_UI_INVITE_CODE_MAX];       /* code à afficher (fondateur/membre) */
     char currency_name[MESHPAY_UI_CURRENCY_NAME_MAX];   /* nom de la monnaie détenue */
     meshpay_ui_wizard_t wizard;                         /* wizard de création (D3) */
+    /* Palier E3 — monnaies découvertes à portée (poussées par l'app). */
+    meshpay_ui_discovered_entry_t discovered[MESHPAY_UI_DISCOVERED_MAX];
+    uint8_t discovered_count;
+    uint8_t selected_discovered;
 } meshpay_ui_state_t;
 
 typedef struct {
@@ -219,6 +240,19 @@ esp_err_t meshpay_ui_set_join_state(meshpay_ui_state_t *ui,
                                     meshpay_ui_join_state_t state);
 esp_err_t meshpay_ui_set_invite_code(meshpay_ui_state_t *ui, const char *code);
 esp_err_t meshpay_ui_set_currency(meshpay_ui_state_t *ui, const char *name);
+
+/*
+ * Palier E3 — remplace la liste des monnaies découvertes (copie bornée à
+ * MESHPAY_UI_DISCOVERED_MAX ; count > MAX est tronqué). La sélection courante
+ * est clampée si la liste rétrécit. entries peut être NULL si count == 0.
+ */
+esp_err_t meshpay_ui_set_discovered(meshpay_ui_state_t *ui,
+                                    const meshpay_ui_discovered_entry_t *entries,
+                                    uint8_t count);
+
+/* Palier E3 — sélectionne la monnaie découverte suivante (cyclique).
+ * ESP_ERR_NOT_FOUND si la liste est vide. */
+esp_err_t meshpay_ui_next_discovered(meshpay_ui_state_t *ui);
 /* Palier D — lit la saisie texte courante (p.ex. le code à passer à arm_join). */
 esp_err_t meshpay_ui_text_entry(const meshpay_ui_state_t *ui,
                                 char *out,

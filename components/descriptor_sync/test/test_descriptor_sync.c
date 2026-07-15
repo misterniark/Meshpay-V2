@@ -179,3 +179,68 @@ TEST_CASE("descriptor sync rejette source/destination nuls et arguments NULL", "
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
                       meshpay_descriptor_sync_parse_offer(NULL, &decoded));
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Palier E1 — message DISCOVER (découverte des monnaies à portée)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+TEST_CASE("descriptor sync discover round-trip", "[descriptor_sync][e1]")
+{
+    uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_hash(source, 0x60);
+
+    rns_packet_t packet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_descriptor_sync_build_discover(source, &packet));
+    /* Type + taille exacte + diffusion PLAIN broadcast (donnée publique). */
+    TEST_ASSERT_EQUAL_HEX8(MESHPAY_DESCRIPTOR_SYNC_MSG_DISCOVER, packet.data[0]);
+    TEST_ASSERT_EQUAL_size_t(MESHPAY_DESCRIPTOR_SYNC_DISCOVER_SIZE,
+                             packet.data_len);
+    TEST_ASSERT_EQUAL(RNS_PACKET_PROPAGATION_BROADCAST, packet.propagation_type);
+    TEST_ASSERT_EQUAL(RNS_DESTINATION_TYPE_PLAIN, packet.destination_type);
+
+    uint8_t decoded_source[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_descriptor_sync_parse_discover(&packet,
+                                                             decoded_source));
+    TEST_ASSERT_EQUAL_MEMORY(source, decoded_source, sizeof(source));
+}
+
+TEST_CASE("descriptor sync parse_discover rejette type, taille et args",
+          "[descriptor_sync][e1]")
+{
+    uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_hash(source, 0x61);
+
+    rns_packet_t packet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_descriptor_sync_build_discover(source, &packet));
+
+    /* Mauvais type (un REQUEST n'est pas un DISCOVER). */
+    rns_packet_t wrong = packet;
+    wrong.data[0] = MESHPAY_DESCRIPTOR_SYNC_MSG_REQUEST;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_descriptor_sync_parse_discover(&wrong, NULL));
+
+    /* Taille tronquée / rallongée. */
+    rns_packet_t truncated = packet;
+    truncated.data_len -= 1;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_descriptor_sync_parse_discover(&truncated, NULL));
+    rns_packet_t inflated = packet;
+    inflated.data_len += 1;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_descriptor_sync_parse_discover(&inflated, NULL));
+
+    /* Arguments invalides côté build : source NULL, source nulle, packet NULL. */
+    uint8_t zero_source[MESHPAY_TX_DESTINATION_HASH_SIZE] = {0};
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_descriptor_sync_build_discover(NULL, &packet));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_descriptor_sync_build_discover(zero_source,
+                                                             &packet));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_descriptor_sync_build_discover(source, NULL));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_descriptor_sync_parse_discover(NULL, NULL));
+}

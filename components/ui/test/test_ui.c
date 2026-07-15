@@ -326,11 +326,13 @@ static bool view_has_action(const meshpay_ui_view_t *view,
 
 /* L'écran JOIN accumule un code texte (input_char), gère backspace/clear et
  * n'active la confirmation que si la saisie est non vide. */
-TEST_CASE("ui join screen accumulates invite code text", "[ui][d2]")
+TEST_CASE("ui join code screen accumulates invite code text", "[ui][d2]")
 {
+    /* E3 : la saisie manuelle vit sur l'ecran de repli JOIN_CODE (JOIN est
+     * devenu la liste des monnaies decouvertes). */
     meshpay_ui_state_t ui;
     meshpay_ui_init(&ui, true);
-    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_JOIN));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_JOIN_CODE));
     TEST_ASSERT_FALSE(meshpay_ui_confirm_enabled(&ui));
 
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_input_char(&ui, 'A'));
@@ -536,4 +538,109 @@ TEST_CASE("ui wizard confirm requires a name and holds all values", "[ui][d3]")
     TEST_ASSERT_TRUE(view.confirm_enabled);
     TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_CONFIRM));
     TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_NEXT_FIELD));
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Palier E3 — écran Rejoindre = liste des monnaies découvertes
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Petit constructeur local d'entrée découverte. */
+static void make_discovered(meshpay_ui_discovered_entry_t *e,
+                            const char *name, const char *fingerprint)
+{
+    memset(e, 0, sizeof(*e));
+    (void)snprintf(e->name, sizeof(e->name), "%s", name);
+    (void)snprintf(e->fingerprint, sizeof(e->fingerprint), "%s", fingerprint);
+}
+
+TEST_CASE("ui join screen lists discovered currencies", "[ui][e3]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    meshpay_ui_discovered_entry_t list[2];
+    make_discovered(&list[0], "Alpha", "A1B2C3D4");
+    make_discovered(&list[1], "Beta", "0BADF00D");
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_set_discovered(&ui, list, 2));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_JOIN));
+    TEST_ASSERT_TRUE(meshpay_ui_confirm_enabled(&ui));
+
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_EQUAL_STRING("Rejoindre", view.title);
+    /* Sélection courante en primary : nom + empreinte anti-usurpation. */
+    TEST_ASSERT_NOT_NULL(strstr(view.primary, "Alpha"));
+    TEST_ASSERT_NOT_NULL(strstr(view.primary, "A1B2C3D4"));
+    TEST_ASSERT_NOT_NULL(strstr(view.secondary, "1/2"));
+    /* Les deux monnaies listées en détail, marqueur sur la sélection. */
+    TEST_ASSERT_NOT_NULL(strstr(view.detail_lines[0], "Alpha"));
+    TEST_ASSERT_EQUAL('>', view.detail_lines[0][0]);
+    TEST_ASSERT_NOT_NULL(strstr(view.detail_lines[1], "Beta"));
+    TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_CONFIRM));
+    TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_NEXT_DISCOVERED));
+    TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_JOIN_CODE));
+    TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_HOME));
+}
+
+TEST_CASE("ui join screen without discovery shows search state", "[ui][e3]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_JOIN));
+    TEST_ASSERT_FALSE(meshpay_ui_confirm_enabled(&ui));
+
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_EQUAL_STRING("Recherche...", view.primary);
+    TEST_ASSERT_FALSE(view_has_action(&view, MESHPAY_UI_ACTION_CONFIRM));
+    /* Le repli saisie manuelle reste proposé. */
+    TEST_ASSERT_TRUE(view_has_action(&view, MESHPAY_UI_ACTION_JOIN_CODE));
+}
+
+TEST_CASE("ui next discovered cycles selection and clamps on shrink",
+          "[ui][e3]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    meshpay_ui_discovered_entry_t list[2];
+    make_discovered(&list[0], "Alpha", "A1B2C3D4");
+    make_discovered(&list[1], "Beta", "0BADF00D");
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_set_discovered(&ui, list, 2));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_JOIN));
+
+    /* Cycle : Alpha -> Beta -> Alpha. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_next_discovered(&ui));
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_NOT_NULL(strstr(view.primary, "Beta"));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_next_discovered(&ui));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_NOT_NULL(strstr(view.primary, "Alpha"));
+
+    /* La liste rétrécit sous la sélection : clamp sans débordement. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_next_discovered(&ui)); /* sel = 1 */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_set_discovered(&ui, list, 1));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_NOT_NULL(strstr(view.primary, "Alpha"));
+
+    /* Liste vide : next refuse. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_set_discovered(&ui, NULL, 0));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND, meshpay_ui_next_discovered(&ui));
+}
+
+TEST_CASE("ui set discovered truncates above capacity", "[ui][e3]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    meshpay_ui_discovered_entry_t list[MESHPAY_UI_DISCOVERED_MAX + 1];
+    for (uint8_t i = 0; i < MESHPAY_UI_DISCOVERED_MAX + 1; ++i) {
+        char name[MESHPAY_UI_CURRENCY_NAME_MAX];
+        (void)snprintf(name, sizeof(name), "M%u", (unsigned)i);
+        make_discovered(&list[i], name, "00000000");
+    }
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_set_discovered(
+                                  &ui, list, MESHPAY_UI_DISCOVERED_MAX + 1));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_JOIN));
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_NOT_NULL(strstr(view.secondary, "1/4"));
 }

@@ -88,6 +88,42 @@ esp_err_t meshpay_descriptor_sync_parse_request(
     return ESP_OK;
 }
 
+esp_err_t meshpay_descriptor_sync_build_discover(
+    const uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    rns_packet_t *packet)
+{
+    if (source == NULL || packet == NULL ||
+        bytes_zero(source, MESHPAY_TX_DESTINATION_HASH_SIZE)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Diffusé : on ne sait pas qui détient une monnaie — précisément l'objet
+     * de la découverte. destination = adresse de réponse, comme REQUEST. */
+    packet_base(packet, source);
+    packet->propagation_type = RNS_PACKET_PROPAGATION_BROADCAST;
+    packet->destination_type = RNS_DESTINATION_TYPE_PLAIN;
+
+    packet->data[0] = MESHPAY_DESCRIPTOR_SYNC_MSG_DISCOVER;
+    memcpy(packet->data + 1, source, MESHPAY_TX_DESTINATION_HASH_SIZE);
+    packet->data_len = MESHPAY_DESCRIPTOR_SYNC_DISCOVER_SIZE;
+    return ESP_OK;
+}
+
+esp_err_t meshpay_descriptor_sync_parse_discover(
+    const rns_packet_t *packet,
+    uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE])
+{
+    if (packet == NULL ||
+        packet->data_len != MESHPAY_DESCRIPTOR_SYNC_DISCOVER_SIZE ||
+        packet->data[0] != MESHPAY_DESCRIPTOR_SYNC_MSG_DISCOVER) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (source != NULL) {
+        memcpy(source, packet->data + 1, MESHPAY_TX_DESTINATION_HASH_SIZE);
+    }
+    return ESP_OK;
+}
+
 esp_err_t meshpay_descriptor_sync_build_offer(
     const meshpay_currency_descriptor_signed_t *signed_desc,
     const uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE],

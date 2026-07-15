@@ -344,7 +344,7 @@ esp_err_t meshpay_ui_nav(meshpay_ui_state_t *ui, meshpay_ui_screen_t screen)
     if (!ui->has_pin && screen != MESHPAY_UI_SCREEN_SETUP_PIN) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (screen > MESHPAY_UI_SCREEN_CREATE) {
+    if (screen > MESHPAY_UI_SCREEN_JOIN_CODE) {
         return ESP_ERR_INVALID_ARG;
     }
     ui->screen = screen;
@@ -382,8 +382,8 @@ esp_err_t meshpay_ui_input_char(meshpay_ui_state_t *ui, char c)
         return ESP_ERR_INVALID_STATE;
     }
     switch (ui->screen) {
-    case MESHPAY_UI_SCREEN_JOIN:
-        return append_text_char(ui, c); /* saisie texte du code */
+    case MESHPAY_UI_SCREEN_JOIN_CODE:
+        return append_text_char(ui, c); /* saisie texte du code (repli E3) */
     case MESHPAY_UI_SCREEN_CREATE:
         return wizard_input(ui, c); /* routé vers le champ courant du wizard */
     case MESHPAY_UI_SCREEN_SETUP_PIN:
@@ -415,6 +415,46 @@ esp_err_t meshpay_ui_set_invite_code(meshpay_ui_state_t *ui, const char *code)
     }
     (void)snprintf(ui->invite_code, sizeof(ui->invite_code), "%s",
                    code == NULL ? "" : code);
+    return ESP_OK;
+}
+
+esp_err_t meshpay_ui_set_discovered(meshpay_ui_state_t *ui,
+                                    const meshpay_ui_discovered_entry_t *entries,
+                                    uint8_t count)
+{
+    if (ui == NULL || (entries == NULL && count > 0)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (count > MESHPAY_UI_DISCOVERED_MAX) {
+        count = MESHPAY_UI_DISCOVERED_MAX; /* le runtime a le même plafond */
+    }
+    for (uint8_t i = 0; i < count; ++i) {
+        (void)snprintf(ui->discovered[i].name, sizeof(ui->discovered[i].name),
+                       "%s", entries[i].name);
+        (void)snprintf(ui->discovered[i].fingerprint,
+                       sizeof(ui->discovered[i].fingerprint), "%s",
+                       entries[i].fingerprint);
+    }
+    ui->discovered_count = count;
+    /* Clamp de la sélection si la liste a rétréci (ou s'est vidée). */
+    if (count == 0) {
+        ui->selected_discovered = 0;
+    } else if (ui->selected_discovered >= count) {
+        ui->selected_discovered = (uint8_t)(count - 1U);
+    }
+    return ESP_OK;
+}
+
+esp_err_t meshpay_ui_next_discovered(meshpay_ui_state_t *ui)
+{
+    if (ui == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (ui->discovered_count == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    ui->selected_discovered = (uint8_t)((ui->selected_discovered + 1U) %
+                                        ui->discovered_count);
     return ESP_OK;
 }
 
@@ -509,7 +549,8 @@ esp_err_t meshpay_ui_backspace(meshpay_ui_state_t *ui)
     case MESHPAY_UI_SCREEN_PAY:
         ui->draft_amount /= 10U;
         return ESP_OK;
-    case MESHPAY_UI_SCREEN_JOIN:
+    case MESHPAY_UI_SCREEN_JOIN_CODE:
+        /* E3 : la saisie du code vit sur l'écran de repli (JOIN = liste). */
         if (ui->text_entry_len > 0) {
             ui->text_entry[--ui->text_entry_len] = '\0';
         }
@@ -572,6 +613,10 @@ bool meshpay_ui_confirm_enabled(const meshpay_ui_state_t *ui)
         return ui->draft_amount > 0 && ui->payment_peer_count > 0;
     }
     if (ui->screen == MESHPAY_UI_SCREEN_JOIN) {
+        /* E3 : on ne peut rejoindre que s'il y a une monnaie découverte. */
+        return ui->discovered_count > 0;
+    }
+    if (ui->screen == MESHPAY_UI_SCREEN_JOIN_CODE) {
         return ui->text_entry_len > 0;
     }
     if (ui->screen == MESHPAY_UI_SCREEN_CREATE) {
@@ -953,6 +998,37 @@ esp_err_t meshpay_ui_build_view(const meshpay_ui_state_t *ui,
         }
         break;
     case MESHPAY_UI_SCREEN_JOIN:
+        /* E3 : liste des monnaies découvertes à portée radio. La sélection
+         * courante est en primary (nom + empreinte anti-usurpation), les autres
+         * en lignes de détail. Le repli saisie manuelle reste accessible. */
+        view_text(view->title, "Rejoindre");
+        if (ui->discovered_count == 0) {
+            view_text(view->primary, "Recherche...");
+            view_text(view->secondary, "Approcher un membre");
+        } else {
+            uint8_t sel = ui->selected_discovered;
+            (void)snprintf(view->primary, sizeof(view->primary), "%s %s",
+                           ui->discovered[sel].name,
+                           ui->discovered[sel].fingerprint);
+            (void)snprintf(view->secondary, sizeof(view->secondary),
+                           "Monnaie %u/%u", (unsigned)(sel + 1U),
+                           (unsigned)ui->discovered_count);
+            for (uint8_t i = 0; i < ui->discovered_count; ++i) {
+                char line[MESHPAY_UI_TEXT_MAX];
+                (void)snprintf(line, sizeof(line), "%c %s %s",
+                               i == sel ? '>' : ' ',
+                               ui->discovered[i].name,
+                               ui->discovered[i].fingerprint);
+                add_detail(view, line);
+            }
+            add_action(view, MESHPAY_UI_ACTION_CONFIRM, "OK");
+            add_action(view, MESHPAY_UI_ACTION_NEXT_DISCOVERED, "Suiv.");
+        }
+        add_action(view, MESHPAY_UI_ACTION_JOIN_CODE, "Code");
+        add_action(view, MESHPAY_UI_ACTION_HOME, "Accueil");
+        break;
+    case MESHPAY_UI_SCREEN_JOIN_CODE:
+        /* Repli E3 : l'ancienne saisie manuelle du code d'invitation. */
         view_text(view->title, "Rejoindre");
         view_text(view->primary, "Code d'invitation");
         view_text(view->secondary,

@@ -37,10 +37,18 @@ extern "C" {
 /* Octets de type (data[0]). 0x31/0x32 = dag_sync, 0x01-0x03 = payment. */
 #define MESHPAY_DESCRIPTOR_SYNC_MSG_REQUEST 0x33
 #define MESHPAY_DESCRIPTOR_SYNC_MSG_OFFER 0x34
+/* Palier E1 : découverte — « quiconque est membre d'une monnaie répond OFFER ».
+ * Distinct de REQUEST (pas de currency_id : on ne cherche pas UNE monnaie mais
+ * toutes celles à portée) pour ne pas créer de valeur « joker » ambiguë. */
+#define MESHPAY_DESCRIPTOR_SYNC_MSG_DISCOVER 0x35
 
 /* Taille exacte du payload REQUEST : type(1) + currency_id(4) + source(16). */
 #define MESHPAY_DESCRIPTOR_SYNC_REQUEST_SIZE \
     (1U + 4U + MESHPAY_TX_DESTINATION_HASH_SIZE)
+
+/* Taille exacte du payload DISCOVER : type(1) + source(16). */
+#define MESHPAY_DESCRIPTOR_SYNC_DISCOVER_SIZE \
+    (1U + MESHPAY_TX_DESTINATION_HASH_SIZE)
 
 /*
  * Construit un paquet REQUEST diffusé (PLAIN broadcast) : demande le descripteur
@@ -61,6 +69,24 @@ esp_err_t meshpay_descriptor_sync_build_request(
 esp_err_t meshpay_descriptor_sync_parse_request(
     const rns_packet_t *packet,
     uint32_t *currency_id,
+    uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE]);
+
+/*
+ * Palier E1 — construit un paquet DISCOVER diffusé (PLAIN broadcast) : « que
+ * chaque membre d'une monnaie réponde son OFFER ». `source` = adresse de
+ * réponse du découvreur (non nulle). Le récepteur membre répond par le même
+ * OFFER que pour un REQUEST ciblé.
+ */
+esp_err_t meshpay_descriptor_sync_build_discover(
+    const uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    rns_packet_t *packet);
+
+/*
+ * Décode un paquet DISCOVER -> adresse de réponse `source` (NULL ignoré).
+ * Rejette si data[0] != MSG_DISCOVER ou taille != DISCOVER_SIZE.
+ */
+esp_err_t meshpay_descriptor_sync_parse_discover(
+    const rns_packet_t *packet,
     uint8_t source[MESHPAY_TX_DESTINATION_HASH_SIZE]);
 
 /*

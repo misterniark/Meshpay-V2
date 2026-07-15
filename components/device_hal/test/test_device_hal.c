@@ -386,12 +386,26 @@ TEST_CASE("waveshare s3 touch driver rejects invalid handles",
     meshpay_hal_t hal;
     meshpay_hal_waveshare_s3_touch_driver_t driver;
 
+#if defined(CONFIG_IDF_TARGET_ESP32S3) && CONFIG_MESHPAY_BOARD_WAVESHARE_S3_TOUCH
+    /* Sur la carte Waveshare : validation d'arguments réelle. */
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
                       meshpay_hal_waveshare_s3_touch_driver_init(NULL,
                                                                  &hal));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
                       meshpay_hal_waveshare_s3_touch_driver_init(&driver,
                                                                  NULL));
+#else
+    /* Depuis c347eb1 les drivers board sont gardés par leur Kconfig : sur les
+     * autres cartes (dont le banc, board UNKNOWN) l'init est un STUB qui
+     * renvoie NOT_SUPPORTED sans valider les arguments. */
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_SUPPORTED,
+                      meshpay_hal_waveshare_s3_touch_driver_init(NULL,
+                                                                 &hal));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_SUPPORTED,
+                      meshpay_hal_waveshare_s3_touch_driver_init(&driver,
+                                                                 NULL));
+#endif
+    /* Le deinit valide son argument sur toutes les cartes. */
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
                       meshpay_hal_waveshare_s3_touch_driver_deinit(NULL));
 }

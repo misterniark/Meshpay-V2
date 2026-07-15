@@ -2820,3 +2820,290 @@ TEST_CASE("params from wizard rejects null arguments", "[app_main][d6]")
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
                       meshpay_app_currency_params_from_wizard(&wizard, NULL));
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Palier E1 — répondeur DISCOVER (découverte des monnaies à portée)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Un membre reçoit un DISCOVER -> il sert son OFFER (comme pour un REQUEST
+ * ciblé, mais sans filtre currency_id : c'est le principe de la découverte). */
+TEST_CASE("member serves an offer when discovered", "[app_main][e1]")
+{
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_min_descriptor(&founder, 0x30, &signed_desc);
+
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    founder_runtime_init(&runtime, app, &mock, &signed_desc, 0x30);
+    packet_tx_probe_t probe = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
+                                  &runtime, packet_tx_probe_cb, &probe));
+
+    uint8_t discoverer[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(discoverer, sizeof(discoverer), 0x66);
+    rns_packet_t discover;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_descriptor_sync_build_discover(
+                                  discoverer, &discover));
+    inject_reticulum_packet(&runtime, &discover, 1000);
+
+    /* Exactement un OFFER, décodable et vérifiable. */
+    TEST_ASSERT_EQUAL_UINT32(1, probe.count);
+    TEST_ASSERT_EQUAL_HEX8(MESHPAY_DESCRIPTOR_SYNC_MSG_OFFER,
+                           probe.last_packet.data[0]);
+    meshpay_currency_descriptor_signed_t served;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_descriptor_sync_parse_offer(
+                                  &probe.last_packet, &served));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_descriptor_verify(&served));
+    TEST_ASSERT_EQUAL_UINT32(signed_desc.currency_id, served.currency_id);
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* Un non-membre (config de repli) n'a rien à annoncer. */
+TEST_CASE("non-member stays silent on discover", "[app_main][e1]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock);
+    packet_tx_probe_t probe = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
+                                  &runtime, packet_tx_probe_cb, &probe));
+
+    uint8_t discoverer[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(discoverer, sizeof(discoverer), 0x66);
+    rns_packet_t discover;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_descriptor_sync_build_discover(
+                                  discoverer, &discover));
+    inject_reticulum_packet(&runtime, &discover, 1000);
+    TEST_ASSERT_EQUAL_UINT32(0, probe.count);
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* Anti-tempête : un DISCOVER touche TOUS les membres à portée (contrairement au
+ * REQUEST filtré par currency_id) ; chaque membre limite donc sa cadence de
+ * réponse à MESHPAY_APP_DISCOVER_THROTTLE_MS. */
+TEST_CASE("discover offers are throttled", "[app_main][e1]")
+{
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_min_descriptor(&founder, 0x30, &signed_desc);
+
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    founder_runtime_init(&runtime, app, &mock, &signed_desc, 0x30);
+    packet_tx_probe_t probe = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
+                                  &runtime, packet_tx_probe_cb, &probe));
+
+    uint8_t discoverer[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(discoverer, sizeof(discoverer), 0x66);
+    rns_packet_t discover;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_descriptor_sync_build_discover(
+                                  discoverer, &discover));
+
+    /* t=1000 : servi. t=1000+throttle-1 : étouffé. t=1000+2*throttle : servi. */
+    inject_reticulum_packet(&runtime, &discover, 1000);
+    inject_reticulum_packet(&runtime, &discover,
+                            1000 + MESHPAY_APP_DISCOVER_THROTTLE_MS - 1);
+    TEST_ASSERT_EQUAL_UINT32(1, probe.count);
+    inject_reticulum_packet(&runtime, &discover,
+                            1000 + 2 * MESHPAY_APP_DISCOVER_THROTTLE_MS);
+    TEST_ASSERT_EQUAL_UINT32(2, probe.count);
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Palier E2 — découverte côté demandeur : fenêtre, collecte, sélection
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Forge un descripteur signé nommé avec crédit initial (variante locale de
+ * sign_min_descriptor pour distinguer plusieurs monnaies découvertes). */
+static void sign_named_descriptor(rns_identity_t *founder, uint8_t founder_seed,
+                                  const char *name, uint32_t initial_credit,
+                                  meshpay_currency_descriptor_signed_t *out)
+{
+    load_identity(founder, founder_seed);
+    meshpay_currency_descriptor_t body;
+    meshpay_currency_descriptor_init(&body);
+    strncpy(body.name, name, sizeof(body.name) - 1);
+    strncpy(body.symbol, "DSC", sizeof(body.symbol) - 1);
+    body.max_supply = 100000;
+    body.initial_credit = initial_credit;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_sign(out, &body, founder));
+}
+
+/* La collecte vérifie, déduplique par currency_id et borne la liste. */
+TEST_CASE("discovery collects verified offers and dedupes", "[app_main][e2]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock); /* non-membre */
+
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_arm_discovery(&runtime, 1000));
+
+    rns_identity_t founder_a, founder_b;
+    meshpay_currency_descriptor_signed_t desc_a, desc_b;
+    sign_named_descriptor(&founder_a, 0x30, "Alpha", 100, &desc_a);
+    sign_named_descriptor(&founder_b, 0x31, "Beta", 50, &desc_b);
+    uint8_t offerer[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(offerer, sizeof(offerer), 0x30);
+
+    rns_packet_t offer_a, offer_b;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_descriptor_sync_build_offer(
+                                  &desc_a, offerer, &offer_a));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_descriptor_sync_build_offer(
+                                  &desc_b, offerer, &offer_b));
+
+    inject_reticulum_packet(&runtime, &offer_a, 2000);
+    inject_reticulum_packet(&runtime, &offer_b, 3000);
+    inject_reticulum_packet(&runtime, &offer_a, 4000); /* doublon ignoré */
+
+    TEST_ASSERT_EQUAL_size_t(2, meshpay_app_runtime_discovered_count(&runtime));
+    meshpay_currency_descriptor_signed_t got;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_discovered_get(&runtime, 0, &got));
+    TEST_ASSERT_EQUAL_UINT32(desc_a.currency_id, got.currency_id);
+    TEST_ASSERT_EQUAL_STRING("Alpha", got.body.name);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_discovered_get(&runtime, 1, &got));
+    TEST_ASSERT_EQUAL_UINT32(desc_b.currency_id, got.currency_id);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_app_runtime_discovered_get(&runtime, 2, &got));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* Signature invalide ignorée ; fenêtre expirée -> collecte close + désarmée. */
+TEST_CASE("discovery rejects bad signature and closes its window",
+          "[app_main][e2]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock);
+
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_arm_discovery(&runtime, 1000));
+
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t desc;
+    sign_named_descriptor(&founder, 0x30, "Alpha", 100, &desc);
+    uint8_t offerer[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(offerer, sizeof(offerer), 0x30);
+
+    /* Signature corrompue -> rejet silencieux, rien collecté. */
+    meshpay_currency_descriptor_signed_t forged = desc;
+    forged.founder_signature[0] ^= 0x01;
+    rns_packet_t bad_offer;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_descriptor_sync_build_offer(
+                                  &forged, offerer, &bad_offer));
+    inject_reticulum_packet(&runtime, &bad_offer, 2000);
+    TEST_ASSERT_EQUAL_size_t(0, meshpay_app_runtime_discovered_count(&runtime));
+
+    /* OFFER valide mais APRÈS la fenêtre : ignoré et découverte désarmée. */
+    rns_packet_t offer;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_descriptor_sync_build_offer(
+                                  &desc, offerer, &offer));
+    inject_reticulum_packet(&runtime, &offer,
+                            1000 + MESHPAY_APP_DISCOVERY_WINDOW_MS + 1);
+    TEST_ASSERT_EQUAL_size_t(0, meshpay_app_runtime_discovered_count(&runtime));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_app_runtime_emit_discover(
+                          &runtime, 1000 + MESHPAY_APP_DISCOVERY_WINDOW_MS + 2));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* La sélection importe la monnaie choisie : membre + CLAIM du crédit initial. */
+TEST_CASE("join discovered imports selected currency and claims",
+          "[app_main][e2]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock);
+
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_arm_discovery(&runtime, 1000));
+
+    rns_identity_t founder_a, founder_b;
+    meshpay_currency_descriptor_signed_t desc_a, desc_b;
+    sign_named_descriptor(&founder_a, 0x30, "Alpha", 100, &desc_a);
+    sign_named_descriptor(&founder_b, 0x31, "Beta", 50, &desc_b);
+    uint8_t offerer[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(offerer, sizeof(offerer), 0x30);
+    rns_packet_t offer_a, offer_b;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_descriptor_sync_build_offer(
+                                  &desc_a, offerer, &offer_a));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_descriptor_sync_build_offer(
+                                  &desc_b, offerer, &offer_b));
+    inject_reticulum_packet(&runtime, &offer_a, 2000);
+    inject_reticulum_packet(&runtime, &offer_b, 3000);
+
+    /* Choisit la 2e (Beta) : import + membre + auto-CLAIM de 50. */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_join_discovered(&runtime, 1, 5000));
+    TEST_ASSERT_TRUE(app->currency.has_descriptor);
+    TEST_ASSERT_EQUAL_UINT32(desc_b.currency_id, app->currency.currency_id);
+    TEST_ASSERT_EQUAL(MESHPAY_APP_JOIN_MEMBER,
+                      meshpay_app_runtime_join_state(&runtime));
+    uint32_t balance = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_get_balance(&app->currency, &app->dag,
+                                                   app->local_destination,
+                                                   &balance));
+    TEST_ASSERT_EQUAL_UINT32(50, balance);
+    /* Découverte close : plus d'émission possible. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_app_runtime_emit_discover(&runtime, 6000));
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* Gardes : arm refusé si déjà membre ; emit émet un DISCOVER pendant la
+ * fenêtre ; index hors borne refusé. */
+TEST_CASE("discovery guards: member arm refused, emit sends discover",
+          "[app_main][e2]")
+{
+    /* Cas 1 : déjà membre -> arm refusé (mono-monnaie). */
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t signed_desc;
+    sign_min_descriptor(&founder, 0x30, &signed_desc);
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    founder_runtime_init(&runtime, app, &mock, &signed_desc, 0x30);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_app_runtime_arm_discovery(&runtime, 1000));
+    meshpay_app_runtime_destroy(&runtime);
+
+    /* Cas 2 : non-membre armé -> emit émet un paquet DISCOVER 0x35. */
+    meshpay_app_t *app2 = test_pool_app(1);
+    meshpay_storage_mock_t mock2;
+    meshpay_app_runtime_t runtime2;
+    member_runtime_init(&runtime2, app2, &mock2);
+    packet_tx_probe_t probe = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
+                                  &runtime2, packet_tx_probe_cb, &probe));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_arm_discovery(&runtime2, 1000));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_emit_discover(&runtime2, 2000));
+    TEST_ASSERT_EQUAL_UINT32(1, probe.count);
+    TEST_ASSERT_EQUAL_HEX8(MESHPAY_DESCRIPTOR_SYNC_MSG_DISCOVER,
+                           probe.last_packet.data[0]);
+    /* Index hors borne (rien collecté). */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_app_runtime_join_discovered(&runtime2, 0, 3000));
+
+    meshpay_app_runtime_destroy(&runtime2);
+}

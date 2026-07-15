@@ -662,6 +662,8 @@ esp_err_t meshpay_app_runtime_arm_join_anchor(meshpay_app_runtime_t *runtime,
         runtime->pending_anchor_len = anchor_len;
         runtime->join_armed = true;
         runtime->join_armed_until_ms = now_ms; /* fenêtre : désarmement différé */
+        /* Exclusif de la découverte (E2) : un seul mode de rejointe à la fois. */
+        runtime->discovery_armed = false;
     }
     xSemaphoreGive(runtime->lock);
     return err;
@@ -711,6 +713,92 @@ esp_err_t meshpay_app_runtime_emit_join_request(meshpay_app_runtime_t *runtime,
         if (err == ESP_OK) {
             err = runtime->packet_tx(&request, runtime->packet_tx_ctx);
         }
+    }
+    xSemaphoreGive(runtime->lock);
+    return err;
+}
+
+esp_err_t meshpay_app_runtime_arm_discovery(meshpay_app_runtime_t *runtime,
+                                            uint64_t now_ms)
+{
+    if (runtime == NULL || runtime->app == NULL || runtime->lock == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(runtime->lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = ESP_OK;
+    /* Mono-monnaie STRICT : un membre ne découvre pas d'autre monnaie. */
+    if (runtime->app->currency.has_descriptor) {
+        err = ESP_ERR_INVALID_STATE;
+    } else {
+        runtime->discovery_armed = true;
+        runtime->discovery_until_ms = now_ms + MESHPAY_APP_DISCOVERY_WINDOW_MS;
+        runtime->discovered_count = 0;
+        /* Exclusif de la rejointe par code : un seul mode à la fois. */
+        runtime->join_armed = false;
+    }
+    xSemaphoreGive(runtime->lock);
+    return err;
+}
+
+esp_err_t meshpay_app_runtime_emit_discover(meshpay_app_runtime_t *runtime,
+                                            uint64_t now_ms)
+{
+    if (runtime == NULL || runtime->app == NULL || runtime->lock == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(runtime->lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = ESP_OK;
+    if (!runtime->discovery_armed || runtime->packet_tx == NULL) {
+        err = ESP_ERR_INVALID_STATE;
+    } else if (now_ms >= runtime->discovery_until_ms) {
+        /* Fenêtre expirée : auto-désarmement (la liste reste consultable). */
+        runtime->discovery_armed = false;
+        err = ESP_ERR_INVALID_STATE;
+    } else {
+        rns_packet_t discover;
+        err = meshpay_descriptor_sync_build_discover(
+            runtime->app->local_destination, &discover);
+        if (err == ESP_OK) {
+            err = runtime->packet_tx(&discover, runtime->packet_tx_ctx);
+        }
+    }
+    xSemaphoreGive(runtime->lock);
+    return err;
+}
+
+size_t meshpay_app_runtime_discovered_count(meshpay_app_runtime_t *runtime)
+{
+    if (runtime == NULL || runtime->lock == NULL) {
+        return 0;
+    }
+    if (xSemaphoreTake(runtime->lock, portMAX_DELAY) != pdTRUE) {
+        return 0;
+    }
+    size_t count = runtime->discovered_count;
+    xSemaphoreGive(runtime->lock);
+    return count;
+}
+
+esp_err_t meshpay_app_runtime_discovered_get(
+    meshpay_app_runtime_t *runtime,
+    size_t index,
+    meshpay_currency_descriptor_signed_t *out)
+{
+    if (runtime == NULL || runtime->lock == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(runtime->lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = ESP_OK;
+    if (index >= runtime->discovered_count) {
+        err = ESP_ERR_INVALID_ARG;
+    } else {
+        memcpy(out, &runtime->discovered[index], sizeof(*out));
     }
     xSemaphoreGive(runtime->lock);
     return err;
@@ -1294,6 +1382,33 @@ static esp_err_t runtime_import_currency_descriptor(
 }
 
 /*
+ * Sert MON descripteur stocké en OFFER (PLAIN broadcast) : brique commune au
+ * répondeur REQUEST (B5) et au répondeur DISCOVER (E1). Pré-requis vérifiés par
+ * l'appelant : membre + storage + packet_tx présents ; lock déjà tenu.
+ */
+static esp_err_t runtime_serve_offer_locked(meshpay_app_runtime_t *runtime)
+{
+    /* Décode MON descripteur stocké et le ressert tel quel en OFFER broadcast. */
+    meshpay_currency_descriptor_signed_t signed_desc;
+    if (meshpay_currency_descriptor_decode(
+            runtime->storage_record.currency_descriptor,
+            runtime->storage_record.currency_descriptor_len,
+            &signed_desc) != ESP_OK) {
+        ESP_LOGW("app_runtime", "descripteur stocké illisible -> pas d'OFFER");
+        return ESP_OK;
+    }
+    rns_packet_t offer;
+    if (meshpay_descriptor_sync_build_offer(
+            &signed_desc, runtime->app->local_destination, &offer) != ESP_OK) {
+        return ESP_OK;
+    }
+    (void)runtime->packet_tx(&offer, runtime->packet_tx_ctx);
+    ESP_LOGI("app_runtime", "OFFER descripteur servi pour currency_id=%08x",
+             (unsigned)signed_desc.currency_id);
+    return ESP_OK;
+}
+
+/*
  * Palier B5 — répond à une REQUEST de descripteur reçue (data[0] == 0x33). Tout
  * MEMBRE d'une monnaie peut servir son descripteur (pas seulement le fondateur) :
  * on décode le blob stocké et on le rediffuse en OFFER (PLAIN broadcast). Ne sert
@@ -1319,25 +1434,38 @@ static esp_err_t runtime_handle_join_request(meshpay_app_runtime_t *runtime,
     if (runtime->packet_tx == NULL) {
         return ESP_OK; /* pas d'émetteur radio câblé */
     }
+    return runtime_serve_offer_locked(runtime);
+}
 
-    /* Décode MON descripteur stocké et le ressert tel quel en OFFER broadcast. */
-    meshpay_currency_descriptor_signed_t signed_desc;
-    if (meshpay_currency_descriptor_decode(
-            runtime->storage_record.currency_descriptor,
-            runtime->storage_record.currency_descriptor_len,
-            &signed_desc) != ESP_OK) {
-        ESP_LOGW("app_runtime", "descripteur stocké illisible -> pas d'OFFER");
+/*
+ * Palier E1 — répond à un DISCOVER (data[0] == 0x35) : « quiconque est membre
+ * d'une monnaie répond son OFFER ». Mêmes conditions de service que le REQUEST
+ * mais SANS filtre currency_id (c'est le principe de la découverte), et avec un
+ * throttle : un DISCOVER touche tous les membres à portée, on limite la cadence
+ * de réponse à MESHPAY_APP_DISCOVER_THROTTLE_MS. Exécuté sous le lock.
+ */
+static esp_err_t runtime_handle_discover(meshpay_app_runtime_t *runtime,
+                                         const rns_packet_t *packet,
+                                         uint64_t now_ms)
+{
+    if (!runtime->app->currency.has_descriptor || !runtime->has_storage ||
+        !runtime->storage_record.has_currency_descriptor ||
+        runtime->packet_tx == NULL) {
         return ESP_OK;
     }
-    rns_packet_t offer;
-    if (meshpay_descriptor_sync_build_offer(
-            &signed_desc, runtime->app->local_destination, &offer) != ESP_OK) {
-        return ESP_OK;
+    if (meshpay_descriptor_sync_parse_discover(packet, NULL) != ESP_OK) {
+        return ESP_OK; /* paquet illisible ignoré */
     }
-    (void)runtime->packet_tx(&offer, runtime->packet_tx_ctx);
-    ESP_LOGI("app_runtime", "OFFER descripteur servi pour currency_id=%08x",
-             (unsigned)wanted);
-    return ESP_OK;
+    if (runtime->last_discover_offer_ms != 0 &&
+        now_ms - runtime->last_discover_offer_ms <
+            MESHPAY_APP_DISCOVER_THROTTLE_MS) {
+        return ESP_OK; /* throttle anti-tempête */
+    }
+    esp_err_t err = runtime_serve_offer_locked(runtime);
+    if (err == ESP_OK) {
+        runtime->last_discover_offer_ms = now_ms;
+    }
+    return err;
 }
 
 /*
@@ -1613,6 +1741,96 @@ static esp_err_t runtime_handle_join_offer(meshpay_app_runtime_t *runtime,
     return ESP_OK;
 }
 
+/*
+ * Palier E2 — collecte un OFFER reçu pendant la fenêtre de découverte : parse,
+ * VÉRIFIE (signature fondateur + genesis), déduplique par currency_id et borne
+ * la liste. N'importe RIEN (la sélection humaine décide via join_discovered).
+ * Tout rejet est silencieux (ESP_OK) pour ne pas figer la tâche reticulum.
+ * Exécuté sous le lock.
+ */
+static esp_err_t runtime_handle_discovery_offer(meshpay_app_runtime_t *runtime,
+                                                const rns_packet_t *packet,
+                                                uint64_t now_ms)
+{
+    /* Déjà membre : plus rien à découvrir (mono-monnaie). */
+    if (runtime->app->currency.has_descriptor || !runtime->discovery_armed) {
+        return ESP_OK;
+    }
+    if (now_ms >= runtime->discovery_until_ms) {
+        /* Fenêtre expirée : clore (la liste déjà collectée reste consultable). */
+        runtime->discovery_armed = false;
+        return ESP_OK;
+    }
+
+    meshpay_currency_descriptor_signed_t signed_desc;
+    if (meshpay_descriptor_sync_parse_offer(packet, &signed_desc) != ESP_OK) {
+        return ESP_OK; /* OFFER illisible ignoré */
+    }
+    if (meshpay_currency_descriptor_verify(&signed_desc) != ESP_OK) {
+        ESP_LOGW("app_runtime", "OFFER découverte: signature invalide, ignoré");
+        return ESP_OK;
+    }
+    /* Dédup : une monnaie déjà collectée n'est pas dupliquée. */
+    for (size_t i = 0; i < runtime->discovered_count; ++i) {
+        if (runtime->discovered[i].currency_id == signed_desc.currency_id) {
+            return ESP_OK;
+        }
+    }
+    if (runtime->discovered_count >= MESHPAY_APP_DISCOVERED_MAX) {
+        ESP_LOGW("app_runtime", "découverte: liste pleine (%u), OFFER ignoré",
+                 (unsigned)MESHPAY_APP_DISCOVERED_MAX);
+        return ESP_OK;
+    }
+    memcpy(&runtime->discovered[runtime->discovered_count], &signed_desc,
+           sizeof(signed_desc));
+    runtime->discovered_count++;
+    ESP_LOGI("app_runtime", "monnaie découverte: %s (currency_id=%08x, %u/%u)",
+             signed_desc.body.name, (unsigned)signed_desc.currency_id,
+             (unsigned)runtime->discovered_count,
+             (unsigned)MESHPAY_APP_DISCOVERED_MAX);
+    return ESP_OK;
+}
+
+esp_err_t meshpay_app_runtime_join_discovered(meshpay_app_runtime_t *runtime,
+                                              size_t index,
+                                              uint64_t now_ms)
+{
+    if (runtime == NULL || runtime->app == NULL || runtime->lock == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(runtime->lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = ESP_OK;
+    if (runtime->app->currency.has_descriptor) {
+        err = ESP_ERR_INVALID_STATE; /* mono-monnaie */
+    } else if (index >= runtime->discovered_count) {
+        err = ESP_ERR_INVALID_ARG;
+    } else {
+        /* Copie locale : l'import réinitialise l'état runtime. Re-vérification
+         * par défense en profondeur (déjà vérifié à la collecte). */
+        meshpay_currency_descriptor_signed_t chosen;
+        memcpy(&chosen, &runtime->discovered[index], sizeof(chosen));
+        err = meshpay_currency_descriptor_verify(&chosen);
+        if (err == ESP_OK) {
+            err = runtime_import_currency_descriptor(runtime, &chosen);
+        }
+        if (err == ESP_OK) {
+            runtime->discovery_armed = false;
+            runtime->discovered_count = 0; /* liste close (membre désormais) */
+            /* Nouveau membre : auto-crédit initial + solde UI (comme la
+             * rejointe par code — best-effort, garde = DAG). */
+            (void)runtime_claim_initial_credit_locked(runtime, now_ms);
+            (void)runtime_refresh_balance(runtime, now_ms);
+            ESP_LOGI("app_runtime",
+                     "rejointe par découverte réussie: %s (currency_id=%08x)",
+                     chosen.body.name, (unsigned)chosen.currency_id);
+        }
+    }
+    xSemaphoreGive(runtime->lock);
+    return err;
+}
+
 static esp_err_t runtime_process_reticulum(meshpay_app_runtime_t *runtime,
                                            const meshpay_app_event_t *event)
 {
@@ -1744,11 +1962,23 @@ static esp_err_t runtime_process_reticulum(meshpay_app_runtime_t *runtime,
         } else if (event->packet.data[0] == MESHPAY_DESCRIPTOR_SYNC_MSG_REQUEST) {
             /* Palier B5 — REQUEST de descripteur : servir l'OFFER si membre. */
             err = runtime_handle_join_request(runtime, &event->packet);
+        } else if (event->packet.data[0] ==
+                   MESHPAY_DESCRIPTOR_SYNC_MSG_DISCOVER) {
+            /* Palier E1 — DISCOVER : servir l'OFFER si membre (throttlé). */
+            err = runtime_handle_discover(runtime, &event->packet,
+                                          event->now_ms);
         } else if (event->packet.data[0] == MESHPAY_DESCRIPTOR_SYNC_MSG_OFFER) {
-            /* Palier B4 — OFFER de descripteur de monnaie (rejointe). Le handler
-             * neutralise déjà tous ses rejets (retourne ESP_OK). */
-            err = runtime_handle_join_offer(runtime, &event->packet,
-                                            event->now_ms);
+            if (runtime->discovery_armed) {
+                /* Palier E2 — fenêtre de découverte : collecter sans importer
+                 * (la sélection humaine décidera). Exclusif de join_armed. */
+                err = runtime_handle_discovery_offer(runtime, &event->packet,
+                                                     event->now_ms);
+            } else {
+                /* Palier B4 — OFFER de descripteur (rejointe par code). Le
+                 * handler neutralise déjà tous ses rejets (retourne ESP_OK). */
+                err = runtime_handle_join_offer(runtime, &event->packet,
+                                                event->now_ms);
+            }
         }
     }
     if (err == ESP_OK) {

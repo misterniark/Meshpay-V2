@@ -22,6 +22,10 @@ extern "C" {
 
 #define MESHPAY_APP_QUEUE_DEFAULT_LENGTH 16
 #define MESHPAY_APP_TASK_STACK_WORDS 8192
+
+/* Palier E2 — capacité de la liste des monnaies découvertes (voir la zone
+ * « Découverte » de meshpay_app_runtime_t et les API arm/emit/get/join). */
+#define MESHPAY_APP_DISCOVERED_MAX 4
 #define MESHPAY_APP_TASK_PRIORITY 5
 #define MESHPAY_APP_LEGACY_ALIAS "MeshPayV2"
 
@@ -122,10 +126,70 @@ typedef struct {
     uint8_t pending_anchor[MESHPAY_CURRENCY_INVITE_ANCHOR_LEN];
     size_t pending_anchor_len;
     uint64_t join_armed_until_ms;
+    /* --- Découverte (Palier E1) : horodatage du dernier OFFER servi en réponse
+     * à un DISCOVER (anti-tempête ; 0 = jamais servi). */
+    uint64_t last_discover_offer_ms;
+    /* --- Découverte (Palier E2) : côté demandeur. Fenêtre temporelle + liste
+     * des monnaies collectées (descripteurs signés VÉRIFIÉS, dédupliqués par
+     * currency_id). Exclusif de join_armed : armer l'un désarme l'autre. */
+    bool discovery_armed;
+    uint64_t discovery_until_ms;
+    size_t discovered_count;
+    meshpay_currency_descriptor_signed_t
+        discovered[MESHPAY_APP_DISCOVERED_MAX];
     uint32_t processed_ui;
     uint32_t processed_reticulum;
     uint32_t processed_core;
 } meshpay_app_runtime_t;
+
+/* Palier E1 — cadence minimale entre deux OFFER servis en réponse à des
+ * DISCOVER : un DISCOVER touche TOUS les membres à portée, le throttle évite
+ * la tempête de réponses quand le découvreur ré-émet pendant sa fenêtre. */
+#define MESHPAY_APP_DISCOVER_THROTTLE_MS 2000U
+
+/* Palier E2 — durée de la fenêtre de découverte. */
+#define MESHPAY_APP_DISCOVERY_WINDOW_MS 60000U
+
+/*
+ * Arme la fenêtre de découverte (MESHPAY_APP_DISCOVERY_WINDOW_MS) et vide la
+ * liste des monnaies collectées. Refuse (ESP_ERR_INVALID_STATE) si déjà membre
+ * (mono-monnaie). Désarme une éventuelle rejointe par code (exclusivité).
+ * Ré-armer relance la fenêtre et repart d'une liste vide.
+ */
+esp_err_t meshpay_app_runtime_arm_discovery(meshpay_app_runtime_t *runtime,
+                                            uint64_t now_ms);
+
+/*
+ * Émet un DISCOVER broadcast (via packet_tx). ESP_ERR_INVALID_STATE si la
+ * découverte n'est pas armée, si la fenêtre est expirée (auto-désarmement) ou
+ * sans émetteur. À appeler périodiquement (~3 s) pendant l'écran de découverte.
+ */
+esp_err_t meshpay_app_runtime_emit_discover(meshpay_app_runtime_t *runtime,
+                                            uint64_t now_ms);
+
+/* Nombre de monnaies découvertes (0 si non armé). */
+size_t meshpay_app_runtime_discovered_count(meshpay_app_runtime_t *runtime);
+
+/*
+ * Copie le descripteur signé découvert d'index `index` (0..count-1) dans `out`
+ * (déjà vérifié à la collecte : signature fondateur + genesis). L'UI en tire le
+ * nom, le symbole et l'empreinte (genesis_hash[0..3]). ESP_ERR_INVALID_ARG si
+ * index hors borne.
+ */
+esp_err_t meshpay_app_runtime_discovered_get(
+    meshpay_app_runtime_t *runtime,
+    size_t index,
+    meshpay_currency_descriptor_signed_t *out);
+
+/*
+ * Rejoint la monnaie découverte d'index `index` : re-vérifie, importe le
+ * descripteur (persistance + config en place, comme la rejointe par code),
+ * auto-réclame le crédit initial (CLAIM, best-effort) et clôt la découverte.
+ * ESP_ERR_INVALID_ARG si index hors borne ; propage les erreurs d'import.
+ */
+esp_err_t meshpay_app_runtime_join_discovered(meshpay_app_runtime_t *runtime,
+                                              size_t index,
+                                              uint64_t now_ms);
 
 esp_err_t meshpay_app_init(meshpay_app_t *app,
                            const uint8_t owner[MESHPAY_TX_DESTINATION_HASH_SIZE],

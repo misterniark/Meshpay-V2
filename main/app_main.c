@@ -1033,10 +1033,33 @@ static esp_err_t wallet_confirm_payment_locked(void)
     }
     return err;
 }
-#endif /* helpers wallet partagés Waveshare + T-Deck */
+/* Palier D6 — action différée hors verrou. Les API runtime (create_currency,
+ * arm_join, invite_code) prennent s_runtime.lock EN INTERNE : les appeler depuis
+ * un handler qui tient déjà ce verrou serait un deadlock (mutex non récursif).
+ * Le handler copie donc les données nécessaires SOUS verrou, le relâche, puis
+ * exécute l'action via wallet_run_deferred. */
+typedef enum {
+    WALLET_DEFER_NONE = 0,
+    WALLET_DEFER_CREATE,          /* CONFIRM sur le wizard : créer la monnaie */
+    WALLET_DEFER_JOIN,            /* CONFIRM sur JOIN_CODE : armer par code */
+    WALLET_DEFER_SHOW_CODE,       /* afficher le code d'invitation détenu */
+    WALLET_DEFER_ARM_DISCOVERY,   /* ouvrir l'écran liste : armer la découverte */
+    WALLET_DEFER_JOIN_DISCOVERED, /* CONFIRM sur la liste : rejoindre l'index */
+} wallet_defer_kind_t;
 
-#if CONFIG_MESHPAY_BOARD_WAVESHARE_S3_TOUCH
-static esp_err_t waveshare_apply_action_locked(meshpay_ui_action_t action)
+typedef struct {
+    wallet_defer_kind_t kind;
+    meshpay_ui_wizard_t wizard;      /* copie du wizard (CREATE) */
+    char code[MESHPAY_UI_TEXT_MAX];  /* copie du code saisi (JOIN) */
+    uint8_t index;                   /* sélection (JOIN_DISCOVERED) */
+} wallet_deferred_action_t;
+
+/* Applique une action UI. Verrou s_runtime.lock supposé déjà pris par
+ * l'appelant. Les actions qui doivent appeler le runtime (création, rejointe,
+ * code d'invitation) ne sont PAS exécutées ici : elles remplissent `defer`
+ * (jamais NULL) et l'appelant les lance après avoir relâché le verrou. */
+static esp_err_t wallet_apply_action_locked(meshpay_ui_action_t action,
+                                           wallet_deferred_action_t *defer)
 {
     switch (action) {
     case MESHPAY_UI_ACTION_HOME:
@@ -1054,8 +1077,50 @@ static esp_err_t waveshare_apply_action_locked(meshpay_ui_action_t action)
         return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_HISTORY);
     case MESHPAY_UI_ACTION_NETWORK:
         return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_NETWORK);
+    case MESHPAY_UI_ACTION_CURRENCY:
+        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_CURRENCY_MENU);
+    case MESHPAY_UI_ACTION_CREATE:
+        /* wizard_begin pré-remplit les défauts ET navigue vers l'écran CREATE. */
+        return meshpay_ui_wizard_begin(&s_app.ui);
+    case MESHPAY_UI_ACTION_JOIN:
+        /* E4 : ouvre la liste des monnaies à portée et arme la découverte
+         * (l'armement runtime prend le verrou : différé hors lock). */
+        defer->kind = WALLET_DEFER_ARM_DISCOVERY;
+        (void)meshpay_ui_set_discovered(&s_app.ui, NULL, 0);
+        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_JOIN);
+    case MESHPAY_UI_ACTION_JOIN_CODE:
+        /* Repli : saisie manuelle du code d'invitation. */
+        (void)meshpay_ui_clear_entry(&s_app.ui);
+        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_JOIN_CODE);
+    case MESHPAY_UI_ACTION_NEXT_DISCOVERED:
+        return meshpay_ui_next_discovered(&s_app.ui);
+    case MESHPAY_UI_ACTION_NEXT_PEER: {
+        /* Sélection cyclique du pair de paiement (écran PAYEE). */
+        esp_err_t err = meshpay_ui_next_payment_peer(&s_app.ui);
+        if (err == ESP_ERR_NOT_FOUND) {
+            return ESP_OK;
+        }
+        if (err != ESP_OK) {
+            return err;
+        }
+        return wallet_refresh_payment_peer_locked();
+    }
+    case MESHPAY_UI_ACTION_SHOW_CODE:
+        /* Le code se lit via le runtime (verrou interne) : différé hors lock. */
+        defer->kind = WALLET_DEFER_SHOW_CODE;
+        return ESP_OK;
+    case MESHPAY_UI_ACTION_NEXT_FIELD:
+        return meshpay_ui_wizard_next_field(&s_app.ui);
+    case MESHPAY_UI_ACTION_PREV_FIELD:
+        return meshpay_ui_wizard_prev_field(&s_app.ui);
+    case MESHPAY_UI_ACTION_BACKSPACE:
+        return meshpay_ui_backspace(&s_app.ui);
+    case MESHPAY_UI_ACTION_CLEAR:
+        return meshpay_ui_clear_entry(&s_app.ui);
     case MESHPAY_UI_ACTION_CONFIRM:
         if (s_app.ui.screen == MESHPAY_UI_SCREEN_SETUP_PIN) {
+            /* Setup wallet de base : indispensable pour atteindre HOME (et le
+             * wizard de création, qui exige has_pin). */
             return wallet_confirm_pin_locked();
         }
         if (s_app.ui.screen == MESHPAY_UI_SCREEN_PAYEE) {
@@ -1067,25 +1132,238 @@ static esp_err_t waveshare_apply_action_locked(meshpay_ui_action_t action)
         if (s_app.ui.screen == MESHPAY_UI_SCREEN_PAY) {
             return wallet_confirm_payment_locked();
         }
-        return ESP_OK;
-    case MESHPAY_UI_ACTION_BACKSPACE:
-        return meshpay_ui_backspace(&s_app.ui);
-    case MESHPAY_UI_ACTION_CLEAR:
-        return meshpay_ui_clear_entry(&s_app.ui);
-    case MESHPAY_UI_ACTION_NEXT_PEER: {
-        esp_err_t err = meshpay_ui_next_payment_peer(&s_app.ui);
-        if (err == ESP_ERR_NOT_FOUND) {
+        if (s_app.ui.screen == MESHPAY_UI_SCREEN_CREATE) {
+            /* Copie du wizard sous verrou ; la création part hors verrou. */
+            defer->kind = WALLET_DEFER_CREATE;
+            memcpy(&defer->wizard, &s_app.ui.wizard, sizeof(defer->wizard));
             return ESP_OK;
         }
-        if (err != ESP_OK) {
-            return err;
+        if (s_app.ui.screen == MESHPAY_UI_SCREEN_JOIN) {
+            /* E4 : rejoindre la monnaie sélectionnée dans la liste. */
+            if (s_app.ui.discovered_count == 0) {
+                return ESP_OK;
+            }
+            defer->kind = WALLET_DEFER_JOIN_DISCOVERED;
+            defer->index = s_app.ui.selected_discovered;
+            return ESP_OK;
         }
-        return wallet_refresh_payment_peer_locked();
-    }
+        if (s_app.ui.screen == MESHPAY_UI_SCREEN_JOIN_CODE) {
+            defer->kind = WALLET_DEFER_JOIN;
+            return meshpay_ui_text_entry(&s_app.ui,
+                                         defer->code,
+                                         sizeof(defer->code));
+        }
+        return ESP_OK;
     case MESHPAY_UI_ACTION_NONE:
     default:
         return ESP_OK;
     }
+}
+
+/* Exécute une action différée, HORS verrou (les API runtime le prennent
+ * elles-mêmes), puis reprend le verrou pour pousser le résultat dans l'UI. */
+static void wallet_run_deferred(const wallet_deferred_action_t *d)
+{
+    if (d == NULL || d->kind == WALLET_DEFER_NONE) {
+        return;
+    }
+    const uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
+
+    switch (d->kind) {
+    case WALLET_DEFER_CREATE: {
+        meshpay_app_currency_params_t params;
+        esp_err_t err = meshpay_app_currency_params_from_wizard(&d->wizard,
+                                                                &params);
+        if (err == ESP_OK) {
+            err = meshpay_app_runtime_create_currency(&s_runtime,
+                                                      &params,
+                                                      now_ms);
+        }
+        if (err != ESP_OK) {
+            /* Refus (nom vide, crédit > offre, déjà membre, pas de storage) :
+             * l'UI reste sur le wizard, le motif part en série. */
+            ESP_LOGW(TAG, "creation monnaie refusee: %s", esp_err_to_name(err));
+            return;
+        }
+        char code[MESHPAY_CURRENCY_INVITE_CODE_BUF] = {0};
+        esp_err_t code_err =
+            meshpay_app_runtime_invite_code(&s_runtime, code, sizeof(code));
+        if (s_runtime.lock != NULL &&
+            xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+            (void)meshpay_ui_set_currency(&s_app.ui, params.name);
+            if (code_err == ESP_OK) {
+                (void)meshpay_ui_set_invite_code(&s_app.ui, code);
+            }
+            (void)meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_FOUNDER_CODE);
+            xSemaphoreGive(s_runtime.lock);
+        }
+        ESP_LOGI(TAG, "monnaie creee: %s (code %s)", params.name, code);
+        break;
+    }
+    case WALLET_DEFER_JOIN: {
+        esp_err_t err =
+            meshpay_app_runtime_arm_join(&s_runtime, d->code, now_ms);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "code d'invitation refuse: %s", esp_err_to_name(err));
+            return;
+        }
+        if (s_runtime.lock != NULL &&
+            xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+            (void)meshpay_ui_set_join_state(&s_app.ui, MESHPAY_UI_JOIN_ARMED);
+            (void)meshpay_ui_clear_entry(&s_app.ui);
+            /* Le menu monnaie affiche « Rejointe en cours ». */
+            (void)meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_CURRENCY_MENU);
+            xSemaphoreGive(s_runtime.lock);
+        }
+        ESP_LOGI(TAG, "rejointe armee (code %s)", d->code);
+        break;
+    }
+    case WALLET_DEFER_SHOW_CODE: {
+        char code[MESHPAY_CURRENCY_INVITE_CODE_BUF] = {0};
+        esp_err_t err =
+            meshpay_app_runtime_invite_code(&s_runtime, code, sizeof(code));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "code d'invitation indisponible: %s",
+                     esp_err_to_name(err));
+        }
+        if (s_runtime.lock != NULL &&
+            xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+            /* Code vide → l'écran affiche « Indisponible ». */
+            (void)meshpay_ui_set_invite_code(&s_app.ui,
+                                             err == ESP_OK ? code : "");
+            (void)meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_FOUNDER_CODE);
+            xSemaphoreGive(s_runtime.lock);
+        }
+        break;
+    }
+    case WALLET_DEFER_ARM_DISCOVERY: {
+        /* Arme la fenêtre puis émet un premier DISCOVER immédiat (la boucle UI
+         * ré-émet ensuite périodiquement tant que l'écran liste est ouvert). */
+        esp_err_t err = meshpay_app_runtime_arm_discovery(&s_runtime, now_ms);
+        if (err == ESP_OK) {
+            (void)meshpay_app_runtime_emit_discover(&s_runtime, now_ms);
+        } else {
+            ESP_LOGW(TAG, "découverte non armée: %s", esp_err_to_name(err));
+        }
+        break;
+    }
+    case WALLET_DEFER_JOIN_DISCOVERED: {
+        /* Le nom sert au retour UI : lu AVANT l'import (après, la liste est
+         * close). Échec de lecture toléré (nom vide). */
+        meshpay_currency_descriptor_signed_t chosen;
+        bool has_name = meshpay_app_runtime_discovered_get(
+                            &s_runtime, d->index, &chosen) == ESP_OK;
+        esp_err_t err = meshpay_app_runtime_join_discovered(&s_runtime,
+                                                            d->index,
+                                                            now_ms);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "rejointe par découverte refusée: %s",
+                     esp_err_to_name(err));
+            return;
+        }
+        if (s_runtime.lock != NULL &&
+            xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+            if (has_name) {
+                (void)meshpay_ui_set_currency(&s_app.ui, chosen.body.name);
+            }
+            (void)meshpay_ui_set_join_state(&s_app.ui, MESHPAY_UI_JOIN_MEMBER);
+            (void)meshpay_ui_set_discovered(&s_app.ui, NULL, 0);
+            /* Le menu monnaie affiche « Monnaie active » + solde. */
+            (void)meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_CURRENCY_MENU);
+            xSemaphoreGive(s_runtime.lock);
+        }
+        ESP_LOGI(TAG, "membre par découverte: %s",
+                 has_name ? chosen.body.name : "?");
+        break;
+    }
+    case WALLET_DEFER_NONE:
+    default:
+        break;
+    }
+}
+
+
+/*
+ * Palier E4/E5 — synchronise l'état monnaie/découverte du runtime vers l'UI et
+ * émet le DISCOVER périodique (~3 s) tant que la fenêtre de découverte est
+ * armée (emit renvoie INVALID_STATE fenêtre close : silencieux, zéro coût
+ * radio). À appeler HORS verrou : les accesseurs runtime prennent le verrou
+ * eux-mêmes, puis on le prend brièvement pour pousser l'état dans l'UI.
+ * Partagé par les boucles de rendu T-Deck (clavier/tactile) et Waveshare.
+ */
+static void wallet_sync_currency_ui(int64_t now_us)
+{
+    meshpay_app_join_state_t js = meshpay_app_runtime_join_state(&s_runtime);
+
+    /* Recopie la liste découverte : nom + empreinte courte anti-usurpation
+     * (4 premiers octets hex du genesis, affichée à côté du nom). */
+    meshpay_ui_discovered_entry_t found[MESHPAY_UI_DISCOVERED_MAX];
+    uint8_t found_count = 0;
+    size_t rt_count = meshpay_app_runtime_discovered_count(&s_runtime);
+    for (size_t i = 0; i < rt_count && found_count < MESHPAY_UI_DISCOVERED_MAX;
+         ++i) {
+        meshpay_currency_descriptor_signed_t desc;
+        if (meshpay_app_runtime_discovered_get(&s_runtime, i, &desc) != ESP_OK) {
+            continue;
+        }
+        (void)snprintf(found[found_count].name,
+                       sizeof(found[found_count].name),
+                       "%s",
+                       desc.body.name);
+        (void)snprintf(found[found_count].fingerprint,
+                       sizeof(found[found_count].fingerprint),
+                       "%02X%02X%02X%02X",
+                       desc.genesis_hash[0],
+                       desc.genesis_hash[1],
+                       desc.genesis_hash[2],
+                       desc.genesis_hash[3]);
+        found_count++;
+    }
+
+    static int64_t s_last_discover_us = 0;
+    if (now_us - s_last_discover_us > 3000000) {
+        (void)meshpay_app_runtime_emit_discover(&s_runtime,
+                                                (uint64_t)(now_us / 1000));
+        s_last_discover_us = now_us;
+    }
+
+    if (s_runtime.lock != NULL &&
+        xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+        (void)meshpay_ui_set_discovered(&s_app.ui, found, found_count);
+        (void)meshpay_ui_set_join_state(
+            &s_app.ui,
+            js == MESHPAY_APP_JOIN_MEMBER  ? MESHPAY_UI_JOIN_MEMBER
+            : js == MESHPAY_APP_JOIN_ARMED ? MESHPAY_UI_JOIN_ARMED
+                                           : MESHPAY_UI_JOIN_IDLE);
+        xSemaphoreGive(s_runtime.lock);
+    }
+}
+#endif /* helpers wallet partagés Waveshare + T-Deck */
+
+#if CONFIG_MESHPAY_BOARD_WAVESHARE_S3_TOUCH
+/*
+ * Palier E5 — retire de la vue les actions sans support Waveshare : la carte
+ * n'a PAS de clavier texte, donc ni la saisie manuelle du code (JOIN_CODE) ni
+ * le wizard de création (CREATE, champ nom obligatoire) ne sont utilisables.
+ * Décision chantier E : la création reste sur T-Deck ; la rejointe Waveshare
+ * passe par la découverte. Appliqué au RENDU et au MAPPING tactile (les deux
+ * construisent la vue indépendamment : même filtre → mêmes indices de boutons).
+ */
+static void waveshare_strip_unsupported_actions(meshpay_ui_view_t *view)
+{
+    uint8_t kept = 0;
+    for (uint8_t i = 0; i < view->action_count; ++i) {
+        if (view->actions[i] == MESHPAY_UI_ACTION_JOIN_CODE ||
+            view->actions[i] == MESHPAY_UI_ACTION_CREATE) {
+            continue;
+        }
+        view->actions[kept] = view->actions[i];
+        memcpy(view->action_labels[kept],
+               view->action_labels[i],
+               sizeof(view->action_labels[kept]));
+        kept++;
+    }
+    view->action_count = kept;
 }
 
 static bool waveshare_handle_tap(const meshpay_touch_state_t *touch)
@@ -1101,15 +1379,18 @@ static bool waveshare_handle_tap(const meshpay_touch_state_t *touch)
     (void)wallet_refresh_payment_peer_locked();
     esp_err_t err = meshpay_ui_build_view(&s_app.ui, &view);
     waveshare_touch_intent_t intent = {0};
+    wallet_deferred_action_t defer = {0};
     if (err == ESP_OK) {
+        waveshare_strip_unsupported_actions(&view);
         intent = waveshare_map_touch(&view, touch);
         if (intent.has_digit) {
             err = meshpay_ui_input_digit(&s_app.ui, intent.digit);
         } else if (intent.action != MESHPAY_UI_ACTION_NONE) {
-            err = waveshare_apply_action_locked(intent.action);
+            err = wallet_apply_action_locked(intent.action, &defer);
         }
     }
     xSemaphoreGive(s_runtime.lock);
+    wallet_run_deferred(&defer);
 
     if (intent.handled) {
         ESP_LOGI(TAG,
@@ -1131,6 +1412,9 @@ static void waveshare_render_current(bool force)
     if (s_runtime.lock == NULL) {
         return;
     }
+    /* E5 : synchronise monnaie/découverte → UI avant de construire la vue
+     * (helper partagé, hors verrou : il prend le sien). */
+    wallet_sync_currency_ui(esp_timer_get_time());
     if (xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) != pdTRUE) {
         return;
     }
@@ -1141,6 +1425,7 @@ static void waveshare_render_current(bool force)
     if (err != ESP_OK) {
         return;
     }
+    waveshare_strip_unsupported_actions(&view);
     if (!force && last_valid &&
         memcmp(&view, &last_view, sizeof(view)) == 0) {
         return;
@@ -1283,9 +1568,11 @@ static void tdeck_fb_button(uint16_t *fb,
  * raccourcis numériques d'action). Miroir de waveshare_input_screen. */
 static bool tdeck_input_screen(meshpay_ui_screen_t screen)
 {
+    /* E4 : JOIN est devenu la LISTE des monnaies découvertes (menu, raccourcis
+     * 1-4) ; la saisie du code vit sur JOIN_CODE (repli). */
     return screen == MESHPAY_UI_SCREEN_SETUP_PIN ||
            screen == MESHPAY_UI_SCREEN_PAY ||
-           screen == MESHPAY_UI_SCREEN_JOIN ||
+           screen == MESHPAY_UI_SCREEN_JOIN_CODE ||
            screen == MESHPAY_UI_SCREEN_CREATE;
 }
 
@@ -1371,183 +1658,6 @@ static void render_tdeck_view(uint16_t *fb, const meshpay_ui_view_t *view)
     }
 }
 
-/* Palier D6 — action différée hors verrou. Les API runtime (create_currency,
- * arm_join, invite_code) prennent s_runtime.lock EN INTERNE : les appeler depuis
- * un handler qui tient déjà ce verrou serait un deadlock (mutex non récursif).
- * Le handler copie donc les données nécessaires SOUS verrou, le relâche, puis
- * exécute l'action via tdeck_run_deferred. */
-typedef enum {
-    TDECK_DEFER_NONE = 0,
-    TDECK_DEFER_CREATE,    /* CONFIRM sur le wizard : créer la monnaie */
-    TDECK_DEFER_JOIN,      /* CONFIRM sur JOIN : armer la rejointe */
-    TDECK_DEFER_SHOW_CODE, /* afficher le code d'invitation détenu */
-} tdeck_defer_kind_t;
-
-typedef struct {
-    tdeck_defer_kind_t kind;
-    meshpay_ui_wizard_t wizard;      /* copie du wizard (CREATE) */
-    char code[MESHPAY_UI_TEXT_MAX];  /* copie du code saisi (JOIN) */
-} tdeck_deferred_action_t;
-
-/* Applique une action UI. Verrou s_runtime.lock supposé déjà pris par
- * l'appelant. Les actions qui doivent appeler le runtime (création, rejointe,
- * code d'invitation) ne sont PAS exécutées ici : elles remplissent `defer`
- * (jamais NULL) et l'appelant les lance après avoir relâché le verrou. */
-static esp_err_t tdeck_apply_action_locked(meshpay_ui_action_t action,
-                                           tdeck_deferred_action_t *defer)
-{
-    switch (action) {
-    case MESHPAY_UI_ACTION_HOME:
-        (void)meshpay_ui_clear_entry(&s_app.ui);
-        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_HOME);
-    case MESHPAY_UI_ACTION_PAY:
-        if (s_app.ui.screen != MESHPAY_UI_SCREEN_PAY) {
-            (void)meshpay_ui_clear_entry(&s_app.ui);
-        }
-        (void)wallet_refresh_payment_peer_locked();
-        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_PAYEE);
-    case MESHPAY_UI_ACTION_RECEIVE:
-        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_RECEIVE);
-    case MESHPAY_UI_ACTION_HISTORY:
-        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_HISTORY);
-    case MESHPAY_UI_ACTION_NETWORK:
-        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_NETWORK);
-    case MESHPAY_UI_ACTION_CURRENCY:
-        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_CURRENCY_MENU);
-    case MESHPAY_UI_ACTION_CREATE:
-        /* wizard_begin pré-remplit les défauts ET navigue vers l'écran CREATE. */
-        return meshpay_ui_wizard_begin(&s_app.ui);
-    case MESHPAY_UI_ACTION_JOIN:
-        (void)meshpay_ui_clear_entry(&s_app.ui);
-        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_JOIN);
-    case MESHPAY_UI_ACTION_SHOW_CODE:
-        /* Le code se lit via le runtime (verrou interne) : différé hors lock. */
-        defer->kind = TDECK_DEFER_SHOW_CODE;
-        return ESP_OK;
-    case MESHPAY_UI_ACTION_NEXT_FIELD:
-        return meshpay_ui_wizard_next_field(&s_app.ui);
-    case MESHPAY_UI_ACTION_PREV_FIELD:
-        return meshpay_ui_wizard_prev_field(&s_app.ui);
-    case MESHPAY_UI_ACTION_BACKSPACE:
-        return meshpay_ui_backspace(&s_app.ui);
-    case MESHPAY_UI_ACTION_CLEAR:
-        return meshpay_ui_clear_entry(&s_app.ui);
-    case MESHPAY_UI_ACTION_CONFIRM:
-        if (s_app.ui.screen == MESHPAY_UI_SCREEN_SETUP_PIN) {
-            /* Setup wallet de base : indispensable pour atteindre HOME (et le
-             * wizard de création, qui exige has_pin). */
-            return wallet_confirm_pin_locked();
-        }
-        if (s_app.ui.screen == MESHPAY_UI_SCREEN_PAYEE) {
-            if (s_app.ui.payment_peer_count == 0) {
-                return ESP_OK;
-            }
-            return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_PAY);
-        }
-        if (s_app.ui.screen == MESHPAY_UI_SCREEN_PAY) {
-            return wallet_confirm_payment_locked();
-        }
-        if (s_app.ui.screen == MESHPAY_UI_SCREEN_CREATE) {
-            /* Copie du wizard sous verrou ; la création part hors verrou. */
-            defer->kind = TDECK_DEFER_CREATE;
-            memcpy(&defer->wizard, &s_app.ui.wizard, sizeof(defer->wizard));
-            return ESP_OK;
-        }
-        if (s_app.ui.screen == MESHPAY_UI_SCREEN_JOIN) {
-            defer->kind = TDECK_DEFER_JOIN;
-            return meshpay_ui_text_entry(&s_app.ui,
-                                         defer->code,
-                                         sizeof(defer->code));
-        }
-        return ESP_OK;
-    case MESHPAY_UI_ACTION_NONE:
-    default:
-        return ESP_OK;
-    }
-}
-
-/* Exécute une action différée, HORS verrou (les API runtime le prennent
- * elles-mêmes), puis reprend le verrou pour pousser le résultat dans l'UI. */
-static void tdeck_run_deferred(const tdeck_deferred_action_t *d)
-{
-    if (d == NULL || d->kind == TDECK_DEFER_NONE) {
-        return;
-    }
-    const uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
-
-    switch (d->kind) {
-    case TDECK_DEFER_CREATE: {
-        meshpay_app_currency_params_t params;
-        esp_err_t err = meshpay_app_currency_params_from_wizard(&d->wizard,
-                                                                &params);
-        if (err == ESP_OK) {
-            err = meshpay_app_runtime_create_currency(&s_runtime,
-                                                      &params,
-                                                      now_ms);
-        }
-        if (err != ESP_OK) {
-            /* Refus (nom vide, crédit > offre, déjà membre, pas de storage) :
-             * l'UI reste sur le wizard, le motif part en série. */
-            ESP_LOGW(TAG, "creation monnaie refusee: %s", esp_err_to_name(err));
-            return;
-        }
-        char code[MESHPAY_CURRENCY_INVITE_CODE_BUF] = {0};
-        esp_err_t code_err =
-            meshpay_app_runtime_invite_code(&s_runtime, code, sizeof(code));
-        if (s_runtime.lock != NULL &&
-            xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
-            (void)meshpay_ui_set_currency(&s_app.ui, params.name);
-            if (code_err == ESP_OK) {
-                (void)meshpay_ui_set_invite_code(&s_app.ui, code);
-            }
-            (void)meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_FOUNDER_CODE);
-            xSemaphoreGive(s_runtime.lock);
-        }
-        ESP_LOGI(TAG, "monnaie creee: %s (code %s)", params.name, code);
-        break;
-    }
-    case TDECK_DEFER_JOIN: {
-        esp_err_t err =
-            meshpay_app_runtime_arm_join(&s_runtime, d->code, now_ms);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "code d'invitation refuse: %s", esp_err_to_name(err));
-            return;
-        }
-        if (s_runtime.lock != NULL &&
-            xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
-            (void)meshpay_ui_set_join_state(&s_app.ui, MESHPAY_UI_JOIN_ARMED);
-            (void)meshpay_ui_clear_entry(&s_app.ui);
-            /* Le menu monnaie affiche « Rejointe en cours ». */
-            (void)meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_CURRENCY_MENU);
-            xSemaphoreGive(s_runtime.lock);
-        }
-        ESP_LOGI(TAG, "rejointe armee (code %s)", d->code);
-        break;
-    }
-    case TDECK_DEFER_SHOW_CODE: {
-        char code[MESHPAY_CURRENCY_INVITE_CODE_BUF] = {0};
-        esp_err_t err =
-            meshpay_app_runtime_invite_code(&s_runtime, code, sizeof(code));
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "code d'invitation indisponible: %s",
-                     esp_err_to_name(err));
-        }
-        if (s_runtime.lock != NULL &&
-            xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
-            /* Code vide → l'écran affiche « Indisponible ». */
-            (void)meshpay_ui_set_invite_code(&s_app.ui,
-                                             err == ESP_OK ? code : "");
-            (void)meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_FOUNDER_CODE);
-            xSemaphoreGive(s_runtime.lock);
-        }
-        break;
-    }
-    case TDECK_DEFER_NONE:
-    default:
-        break;
-    }
-}
-
 /* Convertit un point tactile (coordonnées écran paysage 320×240) en index de
  * bouton de la barre d'actions du bas. Doit rester STRICTEMENT aligné sur la
  * géométrie de render_tdeck_view (mêmes constantes TDECK_ACT_*).
@@ -1616,17 +1726,17 @@ static bool tdeck_handle_tap(int16_t raw_x, int16_t raw_y)
     }
     bool handled = false;
     esp_err_t err = ESP_OK;
-    tdeck_deferred_action_t defer = {0};
+    wallet_deferred_action_t defer = {0};
     meshpay_ui_view_t view;
     if (meshpay_ui_build_view(&s_app.ui, &view) == ESP_OK) {
         int idx = tdeck_touch_button_index(&view, x, y);
         if (idx >= 0) {
-            err = tdeck_apply_action_locked(view.actions[idx], &defer);
+            err = wallet_apply_action_locked(view.actions[idx], &defer);
             handled = true;
         }
     }
     xSemaphoreGive(s_runtime.lock);
-    tdeck_run_deferred(&defer);
+    wallet_run_deferred(&defer);
     ESP_LOGI("tdeck_ui",
              "tap raw=(%d,%d) map=(%d,%d) -> %s (%s)",
              (int)raw_x,
@@ -1650,21 +1760,21 @@ static void tdeck_handle_key(char key)
 
     meshpay_ui_screen_t screen = s_app.ui.screen;
     esp_err_t err = ESP_OK;
-    tdeck_deferred_action_t defer = {0};
+    wallet_deferred_action_t defer = {0};
 
     if (key == '\r' || key == '\n') {
-        err = tdeck_apply_action_locked(MESHPAY_UI_ACTION_CONFIRM, &defer);
+        err = wallet_apply_action_locked(MESHPAY_UI_ACTION_CONFIRM, &defer);
     } else if (key == '\b' || key == 0x7F) {
-        err = tdeck_apply_action_locked(MESHPAY_UI_ACTION_BACKSPACE, &defer);
+        err = wallet_apply_action_locked(MESHPAY_UI_ACTION_BACKSPACE, &defer);
     } else if (key == '\t') {
-        err = tdeck_apply_action_locked(MESHPAY_UI_ACTION_NEXT_FIELD, &defer);
+        err = wallet_apply_action_locked(MESHPAY_UI_ACTION_NEXT_FIELD, &defer);
     } else if (!tdeck_input_screen(screen) && key >= '1' && key <= '4') {
         /* Écran menu : la touche numérique choisit l'action à cet index. */
         meshpay_ui_view_t v;
         if (meshpay_ui_build_view(&s_app.ui, &v) == ESP_OK) {
             uint8_t idx = (uint8_t)(key - '1');
             if (idx < v.action_count) {
-                err = tdeck_apply_action_locked(v.actions[idx], &defer);
+                err = wallet_apply_action_locked(v.actions[idx], &defer);
             }
         }
     } else if (key >= 0x20 && key < 0x7F) {
@@ -1673,7 +1783,7 @@ static void tdeck_handle_key(char key)
     }
 
     xSemaphoreGive(s_runtime.lock);
-    tdeck_run_deferred(&defer);
+    wallet_run_deferred(&defer);
 
     ESP_LOGI("tdeck_ui",
              "touche 0x%02x '%c' -> %s",
@@ -1734,19 +1844,12 @@ static void tdeck_ui_task(void *arg)
         /* Rendu si la vue a changé, ou au plus tard toutes les RENDER_MS. */
         int64_t now_us = esp_timer_get_time();
         if (now_us - last_render_us > (int64_t)TDECK_UI_RENDER_MS * 1000) {
-            /* Lecture sans verrou (join_state ne prend pas le lock) : l'état
-             * runtime est poussé dans l'UI pour que le menu Monnaie reflète la
-             * progression de la rejointe (IDLE → ARMED → MEMBER via radio). */
-            meshpay_app_join_state_t js =
-                meshpay_app_runtime_join_state(&s_runtime);
+            /* Synchronise monnaie/découverte → UI (helper partagé, hors
+             * verrou : il prend le sien) puis construit la vue sous verrou. */
+            wallet_sync_currency_ui(now_us);
             if (s_runtime.lock != NULL &&
                 xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
                 (void)wallet_refresh_payment_peer_locked();
-                (void)meshpay_ui_set_join_state(
-                    &s_app.ui,
-                    js == MESHPAY_APP_JOIN_MEMBER  ? MESHPAY_UI_JOIN_MEMBER
-                    : js == MESHPAY_APP_JOIN_ARMED ? MESHPAY_UI_JOIN_ARMED
-                                                   : MESHPAY_UI_JOIN_IDLE);
                 meshpay_ui_view_t view;
                 esp_err_t err = meshpay_ui_build_view(&s_app.ui, &view);
                 xSemaphoreGive(s_runtime.lock);

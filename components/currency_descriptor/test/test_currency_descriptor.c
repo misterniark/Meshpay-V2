@@ -1,4 +1,5 @@
 #include "meshpay/currency_descriptor.h"
+#include "meshpay/rns/rns_destination.h"
 #include "meshpay/rns/rns_identity.h"
 #include "unity.h"
 #include <string.h>
@@ -189,7 +190,7 @@ TEST_CASE("currency descriptor encode decode round-trip", "[currency_descriptor]
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_descriptor_verify(&decoded));
 }
 
-TEST_CASE("currency descriptor founder_hash egale hash identite", "[currency_descriptor]")
+TEST_CASE("currency descriptor founder_hash egale hash destination wallet", "[currency_descriptor]")
 {
     rns_identity_t founder;
     TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(&founder));
@@ -201,14 +202,26 @@ TEST_CASE("currency descriptor founder_hash egale hash identite", "[currency_des
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_currency_descriptor_sign(&signed_desc, &body,
                                                                &founder));
 
+    /* Invariant depuis la revue Palier D (e964b71) : l'autorité MINT est le
+     * COMPTE transactionnel du fondateur = hash de sa destination
+     * meshpay.wallet (dérivable de founder_public seul), PAS son hash
+     * d'identité — sinon les frais de transfert seraient routés vers un compte
+     * inaccessible et la frappe fondateur future inautorisable. */
     uint8_t hash_from_desc[RNS_IDENTITY_HASH_SIZE];
-    uint8_t hash_from_identity[RNS_IDENTITY_HASH_SIZE];
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_currency_descriptor_founder_hash(&signed_desc,
                                                                hash_from_desc));
-    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_get_hash(&founder, hash_from_identity));
-    TEST_ASSERT_EQUAL_MEMORY(hash_from_identity, hash_from_desc,
-                             sizeof(hash_from_identity));
+    rns_destination_t founder_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_destination_create_meshpay_wallet(
+                                  &founder, &founder_wallet));
+    TEST_ASSERT_EQUAL_MEMORY(founder_wallet.hash, hash_from_desc,
+                             RNS_IDENTITY_HASH_SIZE);
+
+    /* Et ce n'est PAS le hash d'identité (l'ancien invariant, corrigé). */
+    uint8_t identity_hash[RNS_IDENTITY_HASH_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_get_hash(&founder, identity_hash));
+    TEST_ASSERT_TRUE(memcmp(identity_hash, hash_from_desc,
+                            sizeof(identity_hash)) != 0);
 }
 
 TEST_CASE("currency descriptor taille wire bornee", "[currency_descriptor]")

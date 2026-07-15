@@ -1,8 +1,17 @@
 # Chantier Palier E — Rejointe par découverte radio (zéro saisie)
 
-> **Statut : proposé** (2026-07-15). Suite du Palier D (UI création/rejointe).
+> **Statut : VALIDÉ au banc croisé** (2026-07-15). E1-E5 implémentés ; banc
+> Unity complet 279 tests / 0 échec ; validation à l'œil croisée réussie :
+> T-Deck fondateur (« minimes ») + 3 Waveshare membres par découverte radio,
+> zéro saisie, CLAIM persistés (dag_store saved reason=claim ×3). Incident de
+> banc résolu en route : les NVS des Waveshare portaient un enregistrement à
+> l'ANCIEN schéma (INVALID_SIZE au load → storage absent → import refusé
+> INVALID_STATE) ; remède : erase complet + reflash chiffré. Leçon produit à
+> traiter : migration/reset propre du record NVS quand le schéma change.
 > Décision utilisateur : option A — « Rejoindre » liste les monnaies à portée
-> radio, on sélectionne, zéro saisie. Le code long (18 symboles) reste un repli.
+> radio, on sélectionne, zéro saisie. Le code long (18 symboles) reste un repli
+> (T-Deck seulement ; sur Waveshare, sans clavier texte, les actions CREATE et
+> JOIN_CODE sont masquées au rendu et au tactile).
 
 ## Constat qui motive le chantier
 
