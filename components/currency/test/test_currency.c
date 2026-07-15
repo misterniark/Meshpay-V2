@@ -556,3 +556,69 @@ TEST_CASE("currency accepts claim from non founder without founder check", "[cur
     TEST_ASSERT_EQUAL(MESHPAY_CURRENCY_OK,
                       meshpay_currency_validate_tx(&config, dag, &claim));
 }
+
+/* --- Palier F2 : appartenance dérivée de la DAG (is_member / member_count) --- */
+
+/* Une CLAIM valide confère l'appartenance ; une CLAIM forgée (mauvais montant)
+ * non ; l'autorité MINT est membre même sans CLAIM ; un inconnu non. */
+TEST_CASE("currency membership follows valid claims and mint authority",
+          "[currency][f2]")
+{
+    rns_identity_t founder;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(&founder));
+    meshpay_currency_descriptor_t body;
+    fill_descriptor_body(&body); /* initial_credit = 100 */
+    meshpay_currency_descriptor_signed_t desc;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_sign(&desc, &body, &founder));
+    meshpay_currency_config_t config;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_config_from_descriptor(&config, &desc));
+
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t forger[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t stranger[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(member, sizeof(member), 0x40);
+    fill_sequence(forger, sizeof(forger), 0x41);
+    fill_sequence(stranger, sizeof(stranger), 0x42);
+
+    meshpay_dag_t *dag = test_pool_dag(0);
+
+    /* CLAIM valide du membre + CLAIM forgée (montant 5000 != 100) du forgeur
+     * arrivée par sync (le merge ne valide pas — P0 connu). */
+    meshpay_tx_t claim;
+    make_tx(&claim, MESHPAY_TX_TYPE_CLAIM, 0x60,
+            member, member, 100, 0, 0, config.currency_id, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &claim));
+    meshpay_tx_t forged;
+    make_tx(&forged, MESHPAY_TX_TYPE_CLAIM, 0x61,
+            forger, forger, 5000, 0, 0, config.currency_id, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &forged));
+
+    TEST_ASSERT_TRUE(meshpay_currency_is_member(&config, dag, member));
+    TEST_ASSERT_FALSE(meshpay_currency_is_member(&config, dag, forger));
+    TEST_ASSERT_FALSE(meshpay_currency_is_member(&config, dag, stranger));
+    /* Le fondateur (autorité MINT = hash de sa destination wallet) est membre
+     * même sans CLAIM dans la DAG. */
+    TEST_ASSERT_TRUE(config.mint_authority_count > 0);
+    TEST_ASSERT_TRUE(meshpay_currency_is_member(&config, dag,
+                                                config.mint_authorities[0]));
+
+    /* member_count : 1 CLAIM valide + 1 autorité sans CLAIM = 2 (la CLAIM
+     * forgée ne compte pas). */
+    TEST_ASSERT_EQUAL_size_t(2, meshpay_currency_member_count(&config, dag));
+
+    /* Le fondateur réclame son crédit : sa CLAIM remplace son « siège »
+     * d'autorité sans le double-compter. */
+    meshpay_tx_t founder_claim;
+    make_tx(&founder_claim, MESHPAY_TX_TYPE_CLAIM, 0x62,
+            config.mint_authorities[0], config.mint_authorities[0],
+            100, 0, 0, config.currency_id, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
+                      meshpay_dag_merge_tx(dag, &founder_claim));
+    TEST_ASSERT_EQUAL_size_t(2, meshpay_currency_member_count(&config, dag));
+
+    /* Arguments NULL : jamais membre, jamais de compte. */
+    TEST_ASSERT_FALSE(meshpay_currency_is_member(NULL, dag, member));
+    TEST_ASSERT_EQUAL_size_t(0, meshpay_currency_member_count(&config, NULL));
+}

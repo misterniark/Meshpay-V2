@@ -952,6 +952,14 @@ static const rns_announce_known_destination_t *wallet_peer_at_index(
         if (wallet_known_is_local(known)) {
             continue;
         }
+        /* Palier F2 : sous une monnaie à descripteur, seuls les MEMBRES
+         * (CLAIM valide dans la DAG, ou fondateur) sont proposés comme cibles
+         * de paiement. Config de repli : maillage ouvert (inchangé). */
+        if (s_app.currency.has_descriptor &&
+            !meshpay_currency_is_member(&s_app.currency, &s_app.dag,
+                                        known->destination_hash)) {
+            continue;
+        }
         if (count == selected_index) {
             selected = known;
         }

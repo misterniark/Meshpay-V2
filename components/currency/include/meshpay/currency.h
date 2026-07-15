@@ -82,6 +82,28 @@ uint32_t meshpay_currency_apply_demurrage(
     uint32_t balance,
     uint32_t ticks);
 
+/*
+ * Palier F2 — appartenance à la monnaie, dérivée de la DAG (vérité durable,
+ * indépendante des announces radio) : un compte est MEMBRE s'il détient une
+ * CLAIM valide (crédit initial réclamé à la rejointe/création) OU s'il est
+ * autorité MINT (le fondateur d'une monnaie à crédit nul n'émet pas de CLAIM).
+ * Une CLAIM forgée (montant != initial_credit) ne confère PAS l'appartenance,
+ * exactement comme elle ne crédite rien (défense en profondeur du Palier C).
+ */
+bool meshpay_currency_is_member(
+    const meshpay_currency_config_t *config,
+    const meshpay_dag_t *dag,
+    const uint8_t account[MESHPAY_TX_DESTINATION_HASH_SIZE]);
+
+/*
+ * Palier F2 — nombre de membres de la monnaie : une CLAIM valide par compte
+ * (garanti par l'unicité (from, seq==0) scopée par monnaie, cf. Palier C) +
+ * les autorités MINT sans CLAIM. 0 si arguments NULL.
+ */
+size_t meshpay_currency_member_count(
+    const meshpay_currency_config_t *config,
+    const meshpay_dag_t *dag);
+
 #ifdef __cplusplus
 }
 #endif

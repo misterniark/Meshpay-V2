@@ -30,6 +30,11 @@ static const char *const ALIAS_QUALITIES[] = {
 
 static const char *APP_RUNTIME_TAG = "app_runtime";
 
+/* Palier F1 — revalidation des paiements retenus (définie plus bas, appelée
+ * dès l'ingestion d'un batch, avant sa définition). */
+static void runtime_retry_held_payments(meshpay_app_runtime_t *runtime,
+                                        uint64_t now_ms);
+
 #define ALIAS_ANIMAL_COUNT (sizeof(ALIAS_ANIMALS) / sizeof(ALIAS_ANIMALS[0]))
 #define ALIAS_QUALITY_COUNT \
     (sizeof(ALIAS_QUALITIES) / sizeof(ALIAS_QUALITIES[0]))
@@ -135,6 +140,15 @@ static const rns_announce_known_destination_t *runtime_known_peer_at(
         if (runtime_known_is_local(app, known)) {
             continue;
         }
+        /* Palier F2 : sous une monnaie à descripteur, seuls les MEMBRES (CLAIM
+         * valide dans la DAG, ou fondateur) sont des cibles de paiement — les
+         * identités annoncées non-membres (fantômes de reflash, curieux hors
+         * monnaie) n'apparaissent plus. Config de repli : maillage ouvert. */
+        if (app->currency.has_descriptor &&
+            !meshpay_currency_is_member(&app->currency, &app->dag,
+                                        known->destination_hash)) {
+            continue;
+        }
         if (count == selected_index) {
             selected = known;
         }
@@ -218,6 +232,21 @@ static void runtime_refresh_known_peers(meshpay_app_runtime_t *runtime)
                     known->destination_hash);
             }
         }
+    }
+    /* Palier F2 : sous une monnaie à descripteur, le compteur affiché est le
+     * nombre de MEMBRES de la monnaie (CLAIM dans la DAG — vérité durable, y
+     * compris membres éteints), moi exclu — pas le nombre d'identités radio
+     * entendues (qui gonfle avec les identités fantômes). Repli : announces. */
+    if (runtime->app->currency.has_descriptor) {
+        size_t members = meshpay_currency_member_count(
+            &runtime->app->currency, &runtime->app->dag);
+        if (members > 0 &&
+            meshpay_currency_is_member(&runtime->app->currency,
+                                       &runtime->app->dag,
+                                       runtime->app->local_destination)) {
+            members--; /* « peers » = les AUTRES membres */
+        }
+        peers = members;
     }
     runtime->app->ui.network_peers =
         peers > UINT8_MAX ? UINT8_MAX : (uint8_t)peers;
@@ -1267,6 +1296,9 @@ static esp_err_t runtime_handle_dag_resource(meshpay_app_runtime_t *runtime,
     runtime->dag_sync_merged += (uint32_t)merged;
     if (merged > 0) {
         runtime_dag_mark_dirty(runtime); /* persisté au prochain tick (débounce) */
+        /* Palier F1 : de nouvelles tx viennent d'arriver (peut-être le crédit
+         * d'un payeur) — rejoue immédiatement les paiements retenus. */
+        runtime_retry_held_payments(runtime, now_ms);
     }
     ESP_LOGI(APP_RUNTIME_TAG,
              "dag resource merged=%u total=%u",
@@ -1287,6 +1319,104 @@ static bool runtime_packet_is_local_payment_status(
            packet->data_len == 1U + MESHPAY_TX_ID_SIZE &&
            (packet->data[0] == MESHPAY_PAYMENT_MSG_ACK ||
             packet->data[0] == MESHPAY_PAYMENT_MSG_REJECT);
+}
+
+/* ── Palier F1 : rétention/revalidation des paiements entrants ────────────
+ * Un paiement direct peut précéder la livraison (par sync) du crédit de son
+ * payeur : la validation échoue alors en ERR_INSUFFICIENT transitoire. On
+ * retient le paquet, on demande la sync au payeur SANS attendre son prochain
+ * summary, et on rejoue après chaque batch — reject définitif au TTL. */
+
+/* Retient un paiement (slot libre requis, sinon ESP_ERR_NO_MEM → l'appelant
+ * rejette comme avant) et émet un DAG REQUEST ciblé vers le payeur. Le request
+ * ne consulte PAS le backoff dag_sync_quiet_until_ms : ce trou de sync est
+ * précisément ce qu'on comble ; on POSE en revanche le backoff pour que les
+ * summaries suivants ne dupliquent pas la demande. Lock déjà tenu. */
+static esp_err_t runtime_hold_payment(
+    meshpay_app_runtime_t *runtime,
+    const rns_packet_t *packet,
+    const uint8_t payer[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    uint64_t now_ms)
+{
+    meshpay_app_held_payment_t *slot = NULL;
+    for (size_t i = 0; i < MESHPAY_APP_HELD_PAYMENTS_MAX; ++i) {
+        if (!runtime->held_payments[i].used) {
+            slot = &runtime->held_payments[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    slot->used = true;
+    memcpy(&slot->packet, packet, sizeof(slot->packet));
+    slot->deadline_ms = now_ms + MESHPAY_APP_HELD_PAYMENT_TTL_MS;
+
+    if (runtime->packet_tx != NULL) {
+        rns_packet_t request;
+        if (meshpay_dag_sync_build_request_from_count(
+                0, payer, runtime->app->local_destination, &request) ==
+            ESP_OK) {
+            (void)runtime->packet_tx(&request, runtime->packet_tx_ctx);
+            runtime->dag_sync_quiet_until_ms = now_ms + 3000U;
+        }
+    }
+    ESP_LOGI(APP_RUNTIME_TAG,
+             "paiement retenu (insuffisance transitoire?) payeur=%02x%02x%02x%02x",
+             payer[0], payer[1], payer[2], payer[3]);
+    return ESP_OK;
+}
+
+/* Rejoue les paiements retenus : succès → ACK + livraison normale (solde,
+ * historique, feedback UI) ; encore insuffisant → attend jusqu'au TTL ; TTL
+ * dépassé ou motif non transitoire → reject définitif. Lock déjà tenu. */
+static void runtime_retry_held_payments(meshpay_app_runtime_t *runtime,
+                                        uint64_t now_ms)
+{
+    for (size_t i = 0; i < MESHPAY_APP_HELD_PAYMENTS_MAX; ++i) {
+        meshpay_app_held_payment_t *slot = &runtime->held_payments[i];
+        if (!slot->used) {
+            continue;
+        }
+        rns_packet_t ack;
+        rns_packet_clear(&ack);
+        esp_err_t err = meshpay_payment_engine_receive_payment(
+            &runtime->app->payments, &slot->packet, now_ms, &ack);
+        if (err == ESP_OK) {
+            slot->used = false;
+            if (runtime->packet_tx != NULL) {
+                (void)runtime->packet_tx(&ack, runtime->packet_tx_ctx);
+            }
+            (void)runtime_refresh_balance(runtime, now_ms);
+            runtime_dag_mark_dirty(runtime);
+            if (runtime->app->payments.has_last_received) {
+                runtime_set_history_peer(
+                    runtime, runtime->app->payments.last_received_tx.from);
+                (void)meshpay_ui_on_payment_feedback(
+                    &runtime->app->ui,
+                    runtime->app->payments.feedback,
+                    runtime->app->payments.last_received_tx.amount);
+            }
+            ESP_LOGI(APP_RUNTIME_TAG, "paiement retenu livré après sync");
+            continue;
+        }
+        const bool still_insufficient =
+            err == ESP_ERR_INVALID_STATE &&
+            runtime->app->payments.last_currency_result ==
+                MESHPAY_CURRENCY_ERR_INSUFFICIENT;
+        if (still_insufficient && now_ms < slot->deadline_ms) {
+            continue; /* la sync peut encore livrer le crédit manquant */
+        }
+        slot->used = false;
+        if (runtime->packet_tx != NULL && ack.data_len > 0 &&
+            ack.data[0] == MESHPAY_PAYMENT_MSG_REJECT) {
+            (void)runtime->packet_tx(&ack, runtime->packet_tx_ctx);
+        }
+        ESP_LOGW(APP_RUNTIME_TAG,
+                 "paiement retenu rejeté définitivement (%s%s)",
+                 esp_err_to_name(err),
+                 now_ms >= slot->deadline_ms ? ", ttl dépassé" : "");
+    }
 }
 
 static bool runtime_packet_is_local_single_data(
@@ -1837,6 +1967,10 @@ static esp_err_t runtime_process_reticulum(meshpay_app_runtime_t *runtime,
     if (event->type == MESHPAY_APP_EVENT_STOP) {
         return ESP_ERR_INVALID_STATE;
     }
+    /* Palier F1 : fait vivre les TTL des paiements retenus au fil de l'eau
+     * (le retry post-batch couvre le cas nominal ; ceci couvre l'expiration
+     * quand aucun batch n'arrive). No-op si aucun slot occupé. */
+    runtime_retry_held_payments(runtime, event->now_ms);
     if (event->type == MESHPAY_APP_EVENT_RETICULUM_TX) {
         if (runtime->packet_tx != NULL) {
             ESP_RETURN_ON_ERROR(runtime->packet_tx(&event->packet,
@@ -1913,6 +2047,19 @@ static esp_err_t runtime_process_reticulum(meshpay_app_runtime_t *runtime,
                                                      &event->packet,
                                                      event->now_ms,
                                                      &ack);
+        /* Palier F1 : insuffisance transitoire probable (le crédit du payeur
+         * n'est pas encore livré par la sync) → retenir au lieu de rejeter.
+         * L'ack-reject préparé par l'engine porte l'adresse du payeur. */
+        if (err == ESP_ERR_INVALID_STATE &&
+            runtime->app->payments.last_currency_result ==
+                MESHPAY_CURRENCY_ERR_INSUFFICIENT &&
+            ack.data_len > 0 && ack.data[0] == MESHPAY_PAYMENT_MSG_REJECT &&
+            runtime_hold_payment(runtime, &event->packet,
+                                 ack.destination_hash,
+                                 event->now_ms) == ESP_OK) {
+            runtime->processed_reticulum++;
+            return ESP_OK; /* ni reject ni feedback : revalidation en cours */
+        }
         if (err == ESP_OK && amount == 0 &&
             runtime->app->payments.has_last_received) {
             amount = runtime->app->payments.last_received_tx.amount;

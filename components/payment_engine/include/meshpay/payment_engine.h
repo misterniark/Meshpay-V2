@@ -42,6 +42,12 @@ typedef struct {
     bool has_pending;
     bool has_last_received;
     meshpay_payment_feedback_t feedback;
+    /* Palier F1 — résultat de la DERNIÈRE validation monnaie d'un paiement
+     * entrant (receive_payment). Permet à l'orchestrateur de distinguer un
+     * refus définitif (signature, frais) d'un ERR_INSUFFICIENT potentiellement
+     * transitoire (le crédit du payeur n'est pas encore arrivé par la sync) et
+     * de retenir le paiement pour revalidation au lieu de le rejeter. */
+    meshpay_currency_result_t last_currency_result;
     /* Horodatage du dernier paiement committé en attente d'accusé (ms). Sert
      * uniquement au délai d'oubli du suivi de reçu (cf. expire_pending). */
     uint64_t pending_started_ms;

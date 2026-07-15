@@ -322,3 +322,70 @@ uint32_t meshpay_currency_apply_demurrage(
     }
     return (uint32_t)current;
 }
+
+/* Palier F2 — vrai ssi `tx` est une CLAIM VALIDE de cette monnaie : réflexive
+ * (from == to) et au montant exact du crédit initial (une CLAIM forgée à un
+ * autre montant ne crédite rien et ne confère pas l'appartenance). */
+static bool currency_claim_valid(const meshpay_currency_config_t *config,
+                                 const meshpay_tx_t *tx)
+{
+    return tx != NULL && tx->type == MESHPAY_TX_TYPE_CLAIM &&
+           tx->currency_id == config->currency_id &&
+           account_equal(tx->from, tx->to) &&
+           tx->amount == config->initial_credit;
+}
+
+bool meshpay_currency_is_member(
+    const meshpay_currency_config_t *config,
+    const meshpay_dag_t *dag,
+    const uint8_t account[MESHPAY_TX_DESTINATION_HASH_SIZE])
+{
+    if (config == NULL || dag == NULL || account == NULL) {
+        return false;
+    }
+    /* Le fondateur (autorité MINT) est membre par construction, même sans
+     * CLAIM (monnaie à crédit initial nul). */
+    if (meshpay_currency_is_mint_authority(config, account)) {
+        return true;
+    }
+    for (size_t i = 0; i < meshpay_dag_count(dag); ++i) {
+        const meshpay_tx_t *tx = meshpay_dag_at(dag, i);
+        if (currency_claim_valid(config, tx) &&
+            account_equal(tx->from, account)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t meshpay_currency_member_count(
+    const meshpay_currency_config_t *config,
+    const meshpay_dag_t *dag)
+{
+    if (config == NULL || dag == NULL) {
+        return 0;
+    }
+    /* Chaque CLAIM valide = un membre distinct : l'unicité (from, seq==0)
+     * scopée par monnaie interdit deux CLAIM d'un même compte. */
+    size_t count = 0;
+    for (size_t i = 0; i < meshpay_dag_count(dag); ++i) {
+        if (currency_claim_valid(config, meshpay_dag_at(dag, i))) {
+            count++;
+        }
+    }
+    /* + les autorités MINT qui n'ont pas de CLAIM (fondateur, crédit nul). */
+    for (size_t a = 0; a < config->mint_authority_count; ++a) {
+        bool has_claim = false;
+        for (size_t i = 0; i < meshpay_dag_count(dag) && !has_claim; ++i) {
+            const meshpay_tx_t *tx = meshpay_dag_at(dag, i);
+            if (currency_claim_valid(config, tx) &&
+                account_equal(tx->from, config->mint_authorities[a])) {
+                has_claim = true;
+            }
+        }
+        if (!has_claim) {
+            count++;
+        }
+    }
+    return count;
+}

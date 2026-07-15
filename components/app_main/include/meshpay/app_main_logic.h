@@ -26,6 +26,20 @@ extern "C" {
 /* Palier E2 — capacité de la liste des monnaies découvertes (voir la zone
  * « Découverte » de meshpay_app_runtime_t et les API arm/emit/get/join). */
 #define MESHPAY_APP_DISCOVERED_MAX 4
+
+/* Palier F1 — paiements entrants retenus pour revalidation. Un paiement direct
+ * peut arriver AVANT que le crédit du payeur (sa CLAIM, ses encaissements) ne
+ * soit livré par la sync DAG : la validation échoue alors en ERR_INSUFFICIENT
+ * de façon transitoire. Au lieu de rejeter, on retient le paquet et on le
+ * rejoue après chaque batch ingéré, jusqu'au TTL. */
+#define MESHPAY_APP_HELD_PAYMENTS_MAX 2
+#define MESHPAY_APP_HELD_PAYMENT_TTL_MS 30000U
+
+typedef struct {
+    bool used;
+    rns_packet_t packet;  /* paquet paiement d'origine, rejoué tel quel */
+    uint64_t deadline_ms; /* au-delà : rejet définitif (reject envoyé) */
+} meshpay_app_held_payment_t;
 #define MESHPAY_APP_TASK_PRIORITY 5
 #define MESHPAY_APP_LEGACY_ALIAS "MeshPayV2"
 
@@ -137,6 +151,8 @@ typedef struct {
     size_t discovered_count;
     meshpay_currency_descriptor_signed_t
         discovered[MESHPAY_APP_DISCOVERED_MAX];
+    /* --- Paiements retenus (Palier F1) : revalidés après chaque batch. */
+    meshpay_app_held_payment_t held_payments[MESHPAY_APP_HELD_PAYMENTS_MAX];
     uint32_t processed_ui;
     uint32_t processed_reticulum;
     uint32_t processed_core;

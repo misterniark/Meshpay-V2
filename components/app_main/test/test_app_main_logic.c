@@ -848,6 +848,12 @@ TEST_CASE("app runtime reject packet does not undo committed payment",
     config.transfer_fee = 0;
     TEST_ASSERT_EQUAL(ESP_OK,
                       meshpay_currency_add_mint_authority(&config, master));
+    /* B valide avec des frais DIFFÉRENTS : le paiement d'A échoue chez lui en
+     * BAD_FEE = motif DÉFINITIF → reject immédiat. (Depuis F1, un échec
+     * INSUFFICIENT — l'ancienne astuce « DAG vide chez B » — est RETENU pour
+     * revalidation et ne produit plus de reject immédiat.) */
+    meshpay_currency_config_t config_b = config;
+    config_b.transfer_fee = 7;
 
     rns_identity_t identity_a;
     rns_identity_t identity_b;
@@ -859,7 +865,7 @@ TEST_CASE("app runtime reject packet does not undo committed payment",
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_a, alice, &identity_a,
                                                &config, 1, true));
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_b, bob, &identity_b,
-                                               &config, 1, true));
+                                               &config_b, 1, true));
 
     meshpay_tx_t mint;
     make_mint(&mint, master, alice, 1000, config.currency_id);
@@ -3106,4 +3112,250 @@ TEST_CASE("discovery guards: member arm refused, emit sends discover",
                       meshpay_app_runtime_join_discovered(&runtime2, 0, 3000));
 
     meshpay_app_runtime_destroy(&runtime2);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Palier F1 — rétention/revalidation des paiements entrants (course sync)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Monte le duo payeur A / récepteur B : config partagée (frais 5), un MINT de
+ * 1000 chez A SEULEMENT (B ne connaît pas encore le crédit du payeur — c'est
+ * la course de sync qu'on teste), et un paiement de A vers B prêt à injecter.
+ * Le runtime B sort armé avec la sonde TX. */
+static void held_payment_setup(meshpay_app_t **out_a,
+                               meshpay_app_t **out_b,
+                               meshpay_app_runtime_t *runtime_b,
+                               packet_tx_probe_t *probe,
+                               meshpay_tx_t *out_mint,
+                               rns_packet_t *out_payment)
+{
+    uint8_t master[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t alice[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t bob[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(master, sizeof(master), 0x18);
+    fill_sequence(alice, sizeof(alice), 0x48);
+    fill_sequence(bob, sizeof(bob), 0x78);
+
+    meshpay_currency_config_t config;
+    meshpay_currency_config_init(&config, 11);
+    config.transfer_fee = 5;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_add_mint_authority(&config, master));
+
+    rns_identity_t identity_a;
+    rns_identity_t identity_b;
+    load_identity(&identity_a, 0x13);
+    load_identity(&identity_b, 0x53);
+
+    meshpay_app_t *app_a = test_pool_app(0);
+    meshpay_app_t *app_b = test_pool_app(1);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_a, alice, &identity_a,
+                                               &config, 1, true));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_init(app_b, bob, &identity_b,
+                                               &config, 1, true));
+
+    make_mint(out_mint, master, alice, 1000, config.currency_id);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_a, out_mint));
+    /* PAS de seed chez B : son DAG ignore le crédit d'Alice. */
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_payment_engine_create_payment(
+                                  &app_a->payments, bob, 100, 1000,
+                                  out_payment));
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_init(runtime_b, app_b,
+                                                       NULL));
+    memset(probe, 0, sizeof(*probe));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_set_packet_tx(
+                                  runtime_b, packet_tx_probe_cb, probe));
+    *out_a = app_a;
+    *out_b = app_b;
+}
+
+/* Événement no-op pour faire tourner la boucle reticulum de B (le retry F1
+ * s'exécute en tête de traitement) : un DISCOVER, ignoré par un non-membre. */
+static void inject_noop_packet(meshpay_app_runtime_t *runtime, uint64_t now_ms)
+{
+    uint8_t discoverer[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(discoverer, sizeof(discoverer), 0x99);
+    rns_packet_t noop;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_descriptor_sync_build_discover(discoverer,
+                                                             &noop));
+    inject_reticulum_packet(runtime, &noop, now_ms);
+}
+
+TEST_CASE("insufficient payment is held then delivered after sync",
+          "[app_main][f1]")
+{
+    meshpay_app_t *app_a = NULL;
+    meshpay_app_t *app_b = NULL;
+    meshpay_app_runtime_t runtime_b;
+    packet_tx_probe_t probe;
+    meshpay_tx_t mint;
+    rns_packet_t payment;
+    held_payment_setup(&app_a, &app_b, &runtime_b, &probe, &mint, &payment);
+
+    /* Paiement direct AVANT que B ne connaisse le crédit d'Alice : retenu, pas
+     * de reject — le seul paquet émis est le DAG REQUEST ciblé vers Alice.
+     * NB : ce REQUEST est une enveloppe rns_request (contexte REQUEST), pas un
+     * broadcast brut 0x32 — on le décode donc comme le ferait le pair. */
+    inject_reticulum_packet(&runtime_b, &payment, 1000);
+    TEST_ASSERT_EQUAL_UINT32(1, probe.count);
+    TEST_ASSERT_EQUAL(RNS_PACKET_CONTEXT_REQUEST, probe.last_packet.context);
+    uint16_t request_known = 0xFFFF;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_dag_sync_request_known_count(&probe.last_packet,
+                                                           &request_known));
+    TEST_ASSERT_EQUAL_UINT16(0, request_known);
+    TEST_ASSERT_NOT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_RECEIVED,
+                          app_b->ui.feedback);
+    TEST_ASSERT_EQUAL_UINT32(0, app_b->ui.balance);
+
+    /* Le « batch » livre le crédit d'Alice (raccourci : seed direct), puis un
+     * paquet quelconque fait tourner la boucle → retry → ACK + livraison. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_b, &mint));
+    inject_noop_packet(&runtime_b, 2000);
+    TEST_ASSERT_EQUAL_UINT32(2, probe.count);
+    TEST_ASSERT_EQUAL_HEX8(MESHPAY_PAYMENT_MSG_ACK, probe.last_packet.data[0]);
+    TEST_ASSERT_EQUAL_UINT32(100, app_b->ui.balance);
+    TEST_ASSERT_EQUAL(MESHPAY_UI_FEEDBACK_PAYMENT_RECEIVED, app_b->ui.feedback);
+
+    /* Idempotence : un tour de plus ne rejoue rien (slot libéré). */
+    inject_noop_packet(&runtime_b, 2100);
+    TEST_ASSERT_EQUAL_UINT32(2, probe.count);
+
+    meshpay_app_runtime_destroy(&runtime_b);
+}
+
+TEST_CASE("held payment is rejected for good after the ttl",
+          "[app_main][f1]")
+{
+    meshpay_app_t *app_a = NULL;
+    meshpay_app_t *app_b = NULL;
+    meshpay_app_runtime_t runtime_b;
+    packet_tx_probe_t probe;
+    meshpay_tx_t mint;
+    rns_packet_t payment;
+    held_payment_setup(&app_a, &app_b, &runtime_b, &probe, &mint, &payment);
+
+    inject_reticulum_packet(&runtime_b, &payment, 1000);
+    TEST_ASSERT_EQUAL_UINT32(1, probe.count); /* request ciblé */
+
+    /* La sync ne livre jamais le crédit : au-delà du TTL, reject définitif. */
+    inject_noop_packet(&runtime_b,
+                       1000 + MESHPAY_APP_HELD_PAYMENT_TTL_MS + 1);
+    TEST_ASSERT_EQUAL_UINT32(2, probe.count);
+    TEST_ASSERT_EQUAL_HEX8(MESHPAY_PAYMENT_MSG_REJECT,
+                           probe.last_packet.data[0]);
+    TEST_ASSERT_EQUAL_UINT32(0, app_b->ui.balance);
+
+    meshpay_app_runtime_destroy(&runtime_b);
+}
+
+TEST_CASE("non-transient payment failure still rejects immediately",
+          "[app_main][f1]")
+{
+    meshpay_app_t *app_a = NULL;
+    meshpay_app_t *app_b = NULL;
+    meshpay_app_runtime_t runtime_b;
+    packet_tx_probe_t probe;
+    meshpay_tx_t mint;
+    rns_packet_t payment;
+    held_payment_setup(&app_a, &app_b, &runtime_b, &probe, &mint, &payment);
+    /* B connaît le crédit d'Alice : plus d'insuffisance possible. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app_b, &mint));
+
+    /* Forge un TRANSFER aux frais faux (0 ≠ 5) : BAD_FEE = motif définitif. */
+    meshpay_tx_t bad;
+    meshpay_tx_clear(&bad);
+    bad.type = MESHPAY_TX_TYPE_TRANSFER;
+    fill_sequence(bad.id, sizeof(bad.id), 0x2A);
+    memcpy(bad.from, app_a->local_destination, sizeof(bad.from));
+    memcpy(bad.to, app_b->local_destination, sizeof(bad.to));
+    bad.amount = 10;
+    bad.fee = 0;
+    bad.seq = 2;
+    bad.currency_id = app_b->currency.currency_id;
+    fill_sequence(bad.signature, sizeof(bad.signature), 0x77);
+
+    rns_packet_t forged;
+    rns_packet_clear(&forged);
+    forged.header_type = RNS_PACKET_HEADER_TYPE_1;
+    forged.packet_type = RNS_PACKET_TYPE_DATA;
+    forged.destination_type = RNS_DESTINATION_TYPE_SINGLE;
+    memcpy(forged.destination_hash, app_b->local_destination,
+           RNS_PACKET_ADDRESS_SIZE);
+    forged.data[0] = MESHPAY_PAYMENT_MSG_TX;
+    size_t tx_len = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_encode(&bad, forged.data + 1,
+                                        sizeof(forged.data) - 1, &tx_len));
+    forged.data_len = 1 + tx_len;
+
+    inject_reticulum_packet(&runtime_b, &forged, 1000);
+    /* Reject immédiat : aucun slot consommé, pas de request. */
+    TEST_ASSERT_EQUAL_UINT32(1, probe.count);
+    TEST_ASSERT_EQUAL_HEX8(MESHPAY_PAYMENT_MSG_REJECT,
+                           probe.last_packet.data[0]);
+
+    meshpay_app_runtime_destroy(&runtime_b);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Palier F2 — pairs = membres de la monnaie (filtrage par CLAIM)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Sous une monnaie à descripteur : une identité annoncée SANS CLAIM (fantôme
+ * d'un ancien flash, curieux hors monnaie) n'est ni une cible de paiement ni
+ * comptée ; le compteur réseau devient « membres de la monnaie, moi exclu ». */
+TEST_CASE("payment targets and peer count are filtered to currency members",
+          "[app_main][f2]")
+{
+    rns_announce_known_reset();
+
+    rns_identity_t founder;
+    meshpay_currency_descriptor_signed_t desc;
+    sign_named_descriptor(&founder, 0x30, "Filtre", 100, &desc);
+
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    founder_runtime_init(&runtime, app, &mock, &desc, 0x30);
+
+    /* B : membre (sa CLAIM valide est dans la DAG). C : jamais rejoint. */
+    rns_identity_t id_b;
+    rns_identity_t id_c;
+    load_identity(&id_b, 0x77);
+    load_identity(&id_c, 0x78);
+    rns_destination_t dest_b;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&id_b, &dest_b));
+
+    meshpay_tx_t claim_b;
+    meshpay_tx_clear(&claim_b);
+    claim_b.type = MESHPAY_TX_TYPE_CLAIM;
+    fill_sequence(claim_b.id, sizeof(claim_b.id), 0x2B);
+    memcpy(claim_b.from, dest_b.hash, sizeof(claim_b.from));
+    memcpy(claim_b.to, dest_b.hash, sizeof(claim_b.to));
+    claim_b.amount = 100; /* == initial_credit du descripteur */
+    claim_b.seq = 0;
+    claim_b.currency_id = app->currency.currency_id;
+    fill_sequence(claim_b.signature, sizeof(claim_b.signature), 0x66);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_seed_tx(app, &claim_b));
+
+    /* Les deux identités s'annoncent ; la seconde passe par le runtime pour
+     * déclencher le rafraîchissement pairs/compteur. */
+    remember_announced_wallet(&id_b, 0x90);
+    rns_packet_t announce_c;
+    build_wallet_announce_packet(&id_c, 0x91, &announce_c);
+    inject_reticulum_packet(&runtime, &announce_c, 1000);
+
+    /* Cible de paiement : B seul (C filtré). */
+    TEST_ASSERT_EQUAL_UINT8(1, app->ui.payment_peer_count);
+    /* Compteur réseau : CLAIM de B + fondateur-autorité (sans CLAIM) = 2
+     * membres ; l'adresse locale du test n'est pas membre, rien à déduire. */
+    TEST_ASSERT_EQUAL_UINT8(2, app->ui.network_peers);
+
+    meshpay_app_runtime_destroy(&runtime);
+    rns_announce_known_reset();
 }

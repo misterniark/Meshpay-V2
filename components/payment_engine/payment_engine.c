@@ -320,6 +320,10 @@ esp_err_t meshpay_payment_engine_receive_payment(
         packet->data_len < 2) {
         return ESP_ERR_INVALID_ARG;
     }
+    /* Neutralise le motif AVANT tout chemin d'échec : un échec pré-validation
+     * (déchiffrement, signature) ne doit pas laisser un ERR_INSUFFICIENT
+     * périmé qui ferait retenir à tort ce paquet (F1). */
+    engine->last_currency_result = MESHPAY_CURRENCY_OK;
     if (!account_equal(packet->destination_hash, engine->wallet->owner)) {
         engine->feedback = MESHPAY_PAYMENT_FEEDBACK_REJECTED;
         return ESP_ERR_NOT_FOUND;
@@ -376,6 +380,8 @@ esp_err_t meshpay_payment_engine_receive_payment(
     }
     meshpay_currency_result_t currency_result =
         meshpay_currency_validate_tx(engine->currency, engine->dag, &tx);
+    /* Palier F1 : mémorise le motif pour l'orchestrateur (voir header). */
+    engine->last_currency_result = currency_result;
     if (!tx_is_for_us || currency_result != MESHPAY_CURRENCY_OK) {
         ESP_LOGW(TAG,
                  "payment reject tx_for_us=%u currency=%d amount=%u from=%02x%02x%02x%02x dag=%u",
