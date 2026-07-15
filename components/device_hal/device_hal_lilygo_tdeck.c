@@ -446,8 +446,10 @@ static esp_err_t init_spi(meshpay_hal_lilygo_tdeck_driver_t *driver)
     };
     esp_err_t err = spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO);
     if (err == ESP_ERR_INVALID_STATE) {
-        /* Bus déjà initialisé (partagé avec LoRa) — on continue */
-        ESP_LOGD(TAG, "SPI2 bus déjà initialisé, on partage");
+        /* Bus SPI2 déjà initialisé (partagé avec le LoRa sur le MÊME host) — on
+         * s'y greffe. L'écran init normalement en premier, donc ce cas est rare ;
+         * la config DMA/max_transfer_sz est alors héritée de l'autre driver. */
+        ESP_LOGI(TAG, "SPI2 déjà initialisé, écran greffé (bus partagé)");
         err = ESP_OK;
     }
     if (err != ESP_OK) {
@@ -577,6 +579,18 @@ static esp_err_t tdeck_display_flush(void *ctx,
         return ESP_ERR_INVALID_ARG;
     }
 
+    /* Le bus SPI2 est PARTAGÉ avec le LoRa Core1262 (device à CS manuel,
+     * spics_io_num=-1) que radio_poll_task interroge en continu. On verrouille
+     * le bus pour TOUTE la trame : sans ça une transaction LoRa s'intercale
+     * entre RAMWR et les pixels et casse l'image (chaque transfert isolé renvoie
+     * pourtant ESP_OK). C'est la raison pour laquelle le fill de boot — exclusif,
+     * avant le démarrage de radio_poll_task — s'affichait, mais pas ce flush. */
+    esp_err_t err = spi_device_acquire_bus(
+        (spi_device_handle_t)driver->spi_handle, portMAX_DELAY);
+    if (err != ESP_OK) {
+        return err;
+    }
+
     /* Fenêtre colonnes (CASET) : 0..(width-1) */
     const uint16_t x2 = width - 1U;
     const uint8_t caset[4] = {
@@ -590,36 +604,36 @@ static esp_err_t tdeck_display_flush(void *ctx,
         (uint8_t)(y2 >> 8), (uint8_t)y2,
     };
 
-    esp_err_t err = send_cmd(driver, ST7789_CMD_CASET);
+    err = send_cmd(driver, ST7789_CMD_CASET);
     if (err == ESP_OK) err = send_data(driver, caset, sizeof(caset));
     if (err == ESP_OK) err = send_cmd(driver, ST7789_CMD_RASET);
     if (err == ESP_OK) err = send_data(driver, raset, sizeof(raset));
     if (err == ESP_OK) err = send_cmd(driver, ST7789_CMD_RAMWR);
-    if (err != ESP_OK) return err;
 
     /* Envoi des pixels par chunks avec conversion RGB565 → big-endian */
-    const uint16_t *src = (const uint16_t *)pixels;
-    size_t remaining = (size_t)width * (size_t)height;
-    /* Buffer local de 1024 octets = 512 pixels max par chunk */
-    uint8_t tx_buf[1024];
-    while (remaining > 0) {
-        const size_t chunk_px = (remaining < (sizeof(tx_buf) / 2U))
-                                    ? remaining
-                                    : (sizeof(tx_buf) / 2U);
-        /* RGB565 machine (little-endian) → big-endian sur le bus, en local. */
-        for (size_t i = 0; i < chunk_px; ++i) {
-            const uint16_t px = src[i];
-            tx_buf[i * 2U]      = (uint8_t)(px >> 8);
-            tx_buf[i * 2U + 1U] = (uint8_t)(px & 0xFFU);
+    if (err == ESP_OK) {
+        const uint16_t *src = (const uint16_t *)pixels;
+        size_t remaining = (size_t)width * (size_t)height;
+        /* Buffer local de 1024 octets = 512 pixels max par chunk */
+        uint8_t tx_buf[1024];
+        while (remaining > 0 && err == ESP_OK) {
+            const size_t chunk_px = (remaining < (sizeof(tx_buf) / 2U))
+                                        ? remaining
+                                        : (sizeof(tx_buf) / 2U);
+            /* RGB565 machine (little-endian) → big-endian sur le bus, en local. */
+            for (size_t i = 0; i < chunk_px; ++i) {
+                const uint16_t px = src[i];
+                tx_buf[i * 2U]      = (uint8_t)(px >> 8);
+                tx_buf[i * 2U + 1U] = (uint8_t)(px & 0xFFU);
+            }
+            err = send_data(driver, tx_buf, chunk_px * 2U);
+            src       += chunk_px;
+            remaining -= chunk_px;
         }
-        err = send_data(driver, tx_buf, chunk_px * 2U);
-        if (err != ESP_OK) {
-            return err;
-        }
-        src       += chunk_px;
-        remaining -= chunk_px;
     }
-    return ESP_OK;
+
+    spi_device_release_bus((spi_device_handle_t)driver->spi_handle);
+    return err;
 }
 
 /* Remplit tout l'écran d'une couleur unie rgb565 (utile au boot et pour les tests). */

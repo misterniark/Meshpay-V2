@@ -814,8 +814,20 @@ esp_err_t meshpay_hal_lora_core1262_driver_init(
                                  &bus_cfg,
                                  SPI_DMA_DISABLED);
         if (err == ESP_OK) {
+            /* On a initialisé le bus : on en est propriétaire, on le libèrera
+             * au deinit. */
             ctx->spi_bus_ready = true;
+        } else if (err == ESP_ERR_INVALID_STATE) {
+            /* Bus déjà initialisé par un autre driver sur le MÊME host (l'écran
+             * ST7789 du T-Deck, broches SPI partagées). On s'y greffe comme 2ᵉ
+             * device et on hérite de SA config (DMA + max_transfer_sz). On NE
+             * marque PAS spi_bus_ready : on n'est pas propriétaire, donc le
+             * deinit ne libèrera pas le bus (sinon on couperait l'affichage). */
+            err = ESP_OK;
         }
+        ESP_LOGI(TAG, "SPI host=%d : bus %s", (int)ctx->spi_host,
+                 ctx->spi_bus_ready ? "initialisé (propriétaire)"
+                                    : "partagé (greffé sur l'écran)");
     }
     if (err == ESP_OK) {
         const spi_device_interface_config_t dev_cfg = {

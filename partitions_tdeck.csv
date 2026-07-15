@@ -1,0 +1,12 @@
+# Table de partitions — T-Deck fondateur (flash CLAIRE, 16 Mo, PAS de chiffrement).
+# Contrairement au build Waveshare sécurisé (partitions_encr_nvs.csv), pas de
+# nvs_key ni de flags `encrypted` : le T-Deck n'a pas la flash encryption brûlée.
+# La partition `dagstore` (sous-type 0x40, nom recherché par
+# meshpay_dag_store_partition_backend) permet la persistance durable de la DAG ;
+# sans elle le firmware retombe en mode sans stockage (identité éphémère,
+# création de monnaie refusée).
+# Name,   Type, SubType,  Offset,  Size,     Flags
+nvs,      data, nvs,      ,        0x6000,
+phy_init, data, phy,      ,        0x1000,
+factory,  app,  factory,  ,        0x180000,
+dagstore, data, 0x40,     ,        0x40000,

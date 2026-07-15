@@ -12,14 +12,24 @@ CONFIG_SPIRAM_SPEED_80M=y
 # CONFIG_MESHPAY_BOARD_UNKNOWN is not set
 CONFIG_MESHPAY_BOARD_LILYGO_TDECK=y
 
+# Table de partitions dédiée (flash claire) AVEC la partition dagstore, sinon
+# storage_ready=false → identité non persistée + create_currency refusé (le
+# fondateur retombe en client). Cf. partitions_tdeck.csv.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_tdeck.csv"
+
 # Profil fondateur : ESP-NOW (découverte) + LoRa Core1262 (sync DAG).
 # Démarrage en ESP-NOW d'abord (bus SPI écran/LoRa partagé, cf. Task 11 du plan).
 CONFIG_MESHPAY_RADIO_ESPNOW_LORA_CORE1262=y
 CONFIG_MESHPAY_FORCE_ESPNOW_ONLY=y
 CONFIG_MESHPAY_ESPNOW_CHANNEL=1
 
-# SX1262 du T-Deck (bus SPI partagé avec l'écran).
-CONFIG_MESHPAY_LORA_C1262_SPI_HOST=2
+# SX1262 du T-Deck : MÊME host SPI que l'écran ST7789 (SPI2_HOST = valeur 1),
+# car SCK/MOSI/MISO (40/41/38) sont des broches PARTAGÉES. Mettre le LoRa sur un
+# autre host (ex. 2 = SPI3) reroute ces broches vers l'autre périphérique SPI et
+# casse l'affichage dès l'init radio (le driver écran garde le bus, le LoRa s'y
+# greffe comme 2ᵉ device — cf. tolérance INVALID_STATE côté core1262).
+CONFIG_MESHPAY_LORA_C1262_SPI_HOST=1
 CONFIG_MESHPAY_LORA_C1262_PIN_SCK=40
 CONFIG_MESHPAY_LORA_C1262_PIN_MOSI=41
 CONFIG_MESHPAY_LORA_C1262_PIN_MISO=38
