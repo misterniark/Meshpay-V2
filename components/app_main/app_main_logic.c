@@ -1281,11 +1281,22 @@ static esp_err_t runtime_handle_dag_resource(meshpay_app_runtime_t *runtime,
     ESP_LOGI(APP_RUNTIME_TAG,
              "dag resource reassembled batch_len=%u", (unsigned)batch_len);
 
+    /* Filtre d'ingestion (chantier nettoyage currency legacy) : sous une
+     * monnaie à descripteur, seules les tx du registre actif entrent — les
+     * legacy (boot-credits du repli, autres monnaies) sont skippées à la
+     * source. Config de repli : pas de filtre (comportement historique). */
+    const uint32_t *allowed =
+        runtime->app->currency.has_descriptor
+            ? &runtime->app->currency.currency_id
+            : NULL;
     size_t merged = 0;
-    err = meshpay_dag_sync_apply_batch(&runtime->app->dag,
-                                       batch,
-                                       batch_len,
-                                       &merged);
+    size_t skipped_foreign = 0;
+    err = meshpay_dag_sync_apply_batch_filtered(&runtime->app->dag,
+                                                batch,
+                                                batch_len,
+                                                allowed,
+                                                &merged,
+                                                &skipped_foreign);
     free(batch);
     if (err != ESP_OK) {
         ESP_LOGW(APP_RUNTIME_TAG,
@@ -1301,8 +1312,9 @@ static esp_err_t runtime_handle_dag_resource(meshpay_app_runtime_t *runtime,
         runtime_retry_held_payments(runtime, now_ms);
     }
     ESP_LOGI(APP_RUNTIME_TAG,
-             "dag resource merged=%u total=%u",
+             "dag resource merged=%u skipped_foreign=%u total=%u",
              (unsigned)merged,
+             (unsigned)skipped_foreign,
              (unsigned)meshpay_dag_count(&runtime->app->dag));
     return runtime_refresh_balance(runtime, now_ms);
 }
@@ -1508,6 +1520,21 @@ static esp_err_t runtime_import_currency_descriptor(
     /* Applique la config EN PLACE : l'engine de paiement tient &app->currency,
      * la mutation est donc vue immédiatement sans ré-init. */
     runtime->app->currency = derived;
+
+    /* Chantier nettoyage currency legacy : la DAG accumulée AVANT l'ancrage
+     * (mode repli, maillage ouvert) peut charrier les tx d'autres registres
+     * (boot-credits historiques...). Purge à l'ancrage ; la persistance passe
+     * par le débounce habituel (au pire, la purge est refaite au boot —
+     * idempotente). Les survivantes peuvent référencer un parent purgé :
+     * référence pendante tolérée depuis la décision fenêtre glissante. */
+    size_t purged = meshpay_dag_purge_foreign(&runtime->app->dag,
+                                              derived.currency_id);
+    if (purged > 0) {
+        runtime_dag_mark_dirty(runtime);
+        ESP_LOGI("app_runtime",
+                 "purge registre étranger: %u tx (ancrage descripteur %08x)",
+                 (unsigned)purged, (unsigned)derived.currency_id);
+    }
     return ESP_OK;
 }
 

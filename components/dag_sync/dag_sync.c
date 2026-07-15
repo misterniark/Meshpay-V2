@@ -390,15 +390,31 @@ esp_err_t meshpay_dag_sync_apply_batch(meshpay_dag_t *target_dag,
                                        size_t batch_len,
                                        size_t *merged_count)
 {
+    return meshpay_dag_sync_apply_batch_filtered(target_dag, batch, batch_len,
+                                                 NULL, merged_count, NULL);
+}
+
+esp_err_t meshpay_dag_sync_apply_batch_filtered(
+    meshpay_dag_t *target_dag,
+    const uint8_t *batch,
+    size_t batch_len,
+    const uint32_t *allowed_currency_id,
+    size_t *merged_count,
+    size_t *skipped_foreign_count)
+{
     if (target_dag == NULL || batch == NULL || batch_len < 2) {
         return ESP_ERR_INVALID_ARG;
     }
     if (merged_count != NULL) {
         *merged_count = 0;
     }
+    if (skipped_foreign_count != NULL) {
+        *skipped_foreign_count = 0;
+    }
 
     uint16_t count = get_u16(batch);
     size_t merged = 0;
+    size_t skipped_foreign = 0;
 
     /* Application MULTI-PASSES. Un batch peut contenir des tx dans un ordre non
      * topologique du point de vue du recepteur (emission concurrente, branches
@@ -437,6 +453,18 @@ esp_err_t meshpay_dag_sync_apply_batch(meshpay_dag_t *target_dag,
                                 "dag_sync", "");
             pos += encoded_len;
 
+            /* Filtre d'ingestion (chantier nettoyage currency legacy) : sous
+             * une monnaie a descripteur, les tx d'un autre registre ne rentrent
+             * jamais — ni jugees ni mergees. Compte a la passe 0 uniquement
+             * (les passes suivantes re-parsent le meme batch). */
+            if (allowed_currency_id != NULL &&
+                tx.currency_id != *allowed_currency_id) {
+                if (pass == 0) {
+                    skipped_foreign++;
+                }
+                continue;
+            }
+
             meshpay_dag_merge_result_t result =
                 meshpay_dag_merge_tx(target_dag, &tx);
             if (result == MESHPAY_DAG_MERGE_OK) {
@@ -466,6 +494,9 @@ esp_err_t meshpay_dag_sync_apply_batch(meshpay_dag_t *target_dag,
 
     if (merged_count != NULL) {
         *merged_count = merged;
+    }
+    if (skipped_foreign_count != NULL) {
+        *skipped_foreign_count = skipped_foreign;
     }
     return ESP_OK;
 }

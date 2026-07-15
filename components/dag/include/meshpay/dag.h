@@ -57,6 +57,19 @@ meshpay_dag_merge_result_t meshpay_dag_get_tips(const meshpay_dag_t *dag,
 esp_err_t meshpay_dag_digest(const meshpay_dag_t *dag,
                              uint8_t out[RNS_CRYPTO_SHA256_SIZE]);
 
+/*
+ * Purge de la fenêtre toutes les tx dont le currency_id diffère de celui donné
+ * (nettoyage des registres morts, ex. les boot-credits de la config de repli
+ * d'avant les descripteurs). Compactage en place, ordre relatif des
+ * survivantes préservé, slots libérés remis à zéro. Retourne le nombre purgé.
+ *
+ * Des survivantes peuvent référencer un parent purgé : référence pendante
+ * TOLÉRÉE (cf. la note fenêtre glissante dans meshpay_dag_validate_merge) —
+ * les parents ne sont jamais déréférencés. Ne PAS appeler en config de repli
+ * (le registre de repli y est la monnaie légitime) ni sur un monitor.
+ */
+size_t meshpay_dag_purge_foreign(meshpay_dag_t *dag, uint32_t currency_id);
+
 #ifdef __cplusplus
 }
 #endif

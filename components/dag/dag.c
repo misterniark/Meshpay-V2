@@ -139,9 +139,18 @@ meshpay_dag_merge_result_t meshpay_dag_validate_merge(const meshpay_dag_t *dag,
         if (bytes_zero(tx->parents[i], MESHPAY_TX_PARENT_ID_SIZE)) {
             return MESHPAY_DAG_MERGE_INVALID;
         }
-        if (!meshpay_dag_contains(dag, tx->parents[i])) {
-            return MESHPAY_DAG_MERGE_MISSING_PARENT;
-        }
+        /* Décision 2026-07-15 (chantier nettoyage currency legacy) : un parent
+         * ABSENT de la fenêtre n'est PLUS bloquant. La DAG est une fenêtre
+         * glissante : le parent d'une tx légitime peut être hors fenêtre
+         * (purge des tx d'une autre monnaie, futur checkpoint Phase B) ou pas
+         * encore livré par la sync (course jumelle du Palier F1). Les
+         * références parentes ne sont jamais déréférencées (comparaisons d'id
+         * uniquement : tips, conflits) — une référence pendante est donc sûre.
+         * Exiger la présence n'était pas une barrière de sécurité (l'ingestion
+         * ne vérifie pas les signatures et les tips sont publics dans les
+         * summaries), seulement une contrainte d'ordre d'application.
+         * MESHPAY_DAG_MERGE_MISSING_PARENT n'est plus jamais émis (l'enum est
+         * conservé pour la stabilité de l'ABI et des logs dag_sync). */
     }
 
     for (size_t i = 0; i < dag->count; ++i) {
@@ -282,4 +291,35 @@ esp_err_t meshpay_dag_digest(const meshpay_dag_t *dag,
         memcpy(scratch + i * MESHPAY_TX_ID_SIZE, ptrs[i]->id, MESHPAY_TX_ID_SIZE);
     }
     return rns_crypto_sha256(scratch, n * MESHPAY_TX_ID_SIZE, out);
+}
+
+size_t meshpay_dag_purge_foreign(meshpay_dag_t *dag, uint32_t currency_id)
+{
+    if (dag == NULL || dag->count > MESHPAY_DAG_MAX_TRANSACTIONS) {
+        return 0;
+    }
+    /* Compactage en place : l'ordre RELATIF des survivantes est préservé (les
+     * ordres d'insertion diffèrent déjà entre noeuds ; la purge ne doit pas
+     * créer un nouveau mode de divergence — et le découpage positionnel des
+     * batchs côté répondeur reste cohérent avec ce que le noeud possède). */
+    size_t kept = 0;
+    for (size_t i = 0; i < dag->count; ++i) {
+        if (dag->transactions[i].currency_id == currency_id) {
+            if (kept != i) {
+                memcpy(&dag->transactions[kept], &dag->transactions[i],
+                       sizeof(dag->transactions[kept]));
+            }
+            kept++;
+        }
+    }
+    size_t purged = dag->count - kept;
+    /* Hygiène : les slots libérés ne doivent pas laisser traîner de vieilles
+     * tx lisibles (la fenêtre part telle quelle dans les snapshots RAM/flash
+     * de debug ; seul count borne la partie signifiante). */
+    if (purged > 0) {
+        memset(&dag->transactions[kept], 0,
+               purged * sizeof(dag->transactions[0]));
+    }
+    dag->count = kept;
+    return purged;
 }

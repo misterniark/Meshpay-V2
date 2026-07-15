@@ -321,6 +321,74 @@ TEST_CASE("dag sync apply_batch still rejects a conflicting tx", "[dag_sync]")
     TEST_ASSERT_FALSE(meshpay_dag_contains(dag, tx_b.id));
 }
 
+/* Chantier nettoyage currency legacy : sous une monnaie à descripteur, les tx
+ * d'un autre registre (boot-credits du repli...) sont skippées à l'ingestion —
+ * jamais mergées, jamais fatales — tandis qu'une tx active dont le PARENT est
+ * une legacy filtrée passe quand même (référence pendante tolérée : c'est la
+ * topologie réelle observée au dump du 2026-07-15). Filtre NULL = tout passe. */
+TEST_CASE("dag sync apply_batch filters foreign currency txs", "[dag_sync][n2]")
+{
+    uint8_t master[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    uint8_t alice[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(master, sizeof(master), 0x10);
+    fill_sequence(alice, sizeof(alice), 0x40);
+
+    const uint32_t active = 0xC5C42609u;
+
+    /* 2 legacy (currency_id=1, celui de make_tx) + 2 actives, la première
+     * active ayant la première legacy pour parent. */
+    meshpay_tx_t legacy_a;
+    meshpay_tx_t legacy_b;
+    make_tx(&legacy_a, MESHPAY_TX_TYPE_MINT, 0x20, master, master, 10, 0,
+            NULL, 0);
+    make_tx(&legacy_b, MESHPAY_TX_TYPE_MINT, 0x21, alice, alice, 10, 0,
+            NULL, 0);
+
+    uint8_t on_legacy[1][MESHPAY_TX_PARENT_ID_SIZE];
+    memcpy(on_legacy[0], legacy_a.id, MESHPAY_TX_PARENT_ID_SIZE);
+    meshpay_tx_t claim;
+    make_tx(&claim, MESHPAY_TX_TYPE_CLAIM, 0x30, alice, alice, 8, 0,
+            on_legacy, 1);
+    claim.currency_id = active;
+
+    uint8_t on_claim[1][MESHPAY_TX_PARENT_ID_SIZE];
+    memcpy(on_claim[0], claim.id, MESHPAY_TX_PARENT_ID_SIZE);
+    meshpay_tx_t pay;
+    make_tx(&pay, MESHPAY_TX_TYPE_TRANSFER, 0x31, alice, master, 3, 1,
+            on_claim, 1);
+    pay.currency_id = active;
+
+    meshpay_tx_t all[4] = { legacy_a, claim, legacy_b, pay };
+    uint8_t batch[MESHPAY_DAG_SYNC_BATCH_MAX_SIZE];
+    size_t batch_len = 0;
+    encode_batch_manual(all, 4, batch, sizeof(batch), &batch_len);
+
+    /* Avec filtre : seules les 2 actives entrent, les 2 legacy sont comptées
+     * skipped (une seule fois malgré le multi-passes). */
+    meshpay_dag_t *dag = test_pool_dag(0);
+    size_t merged = 0;
+    size_t skipped = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_dag_sync_apply_batch_filtered(
+                          dag, batch, batch_len, &active, &merged, &skipped));
+    TEST_ASSERT_EQUAL_UINT32(2, merged);
+    TEST_ASSERT_EQUAL_UINT32(2, skipped);
+    TEST_ASSERT_EQUAL_UINT32(2, meshpay_dag_count(dag));
+    TEST_ASSERT_TRUE(meshpay_dag_contains(dag, claim.id));
+    TEST_ASSERT_TRUE(meshpay_dag_contains(dag, pay.id));
+    TEST_ASSERT_FALSE(meshpay_dag_contains(dag, legacy_a.id));
+    TEST_ASSERT_FALSE(meshpay_dag_contains(dag, legacy_b.id));
+
+    /* Sans filtre (repli/monitor) : tout passe. */
+    meshpay_dag_t *open_dag = test_pool_dag(1);
+    merged = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_dag_sync_apply_batch(open_dag, batch, batch_len,
+                                                   &merged));
+    TEST_ASSERT_EQUAL_UINT32(4, merged);
+    TEST_ASSERT_EQUAL_UINT32(4, meshpay_dag_count(open_dag));
+}
+
 
 /* PAGINATION (revue #5) : une DAG dont l'encodage depasse un seul batch doit
  * etre transferee en PLUSIEURS chunks Resource couvrant exactement [0, count)

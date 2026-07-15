@@ -83,6 +83,22 @@ esp_err_t meshpay_dag_sync_apply_batch(meshpay_dag_t *target_dag,
                                        size_t batch_len,
                                        size_t *merged_count);
 
+/*
+ * Variante avec filtre d'ingestion par registre (chantier nettoyage currency
+ * legacy) : si `allowed_currency_id` est non NULL, toute tx du batch dont le
+ * currency_id diffère est SKIPPÉE avant merge (comptée dans
+ * *skipped_foreign_count, optionnel) — elle n'est ni jugée (pas de
+ * CONFLICT/INVALID fatal sur du refusé) ni intégrée. NULL = tout accepter
+ * (config de repli, monitor). meshpay_dag_sync_apply_batch == filtre NULL.
+ */
+esp_err_t meshpay_dag_sync_apply_batch_filtered(
+    meshpay_dag_t *target_dag,
+    const uint8_t *batch,
+    size_t batch_len,
+    const uint32_t *allowed_currency_id,
+    size_t *merged_count,
+    size_t *skipped_foreign_count);
+
 #ifdef __cplusplus
 }
 #endif

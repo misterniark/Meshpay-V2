@@ -3403,6 +3403,25 @@ void app_main(void)
         if (derr == ESP_OK) {
             esp_err_t lerr = meshpay_dag_store_load(&dag_store_be, &s_app.dag);
             if (lerr == ESP_OK) {
+                /* Chantier nettoyage currency legacy : sous une monnaie a
+                 * descripteur, la fenetre restauree peut charrier les tx d'un
+                 * registre mort (boot-credits du repli d'avant descripteurs).
+                 * Purge AVANT la sync ; save immediat (les taches ne tournent
+                 * pas encore, le debounce runtime n'existe pas ici) pour figer
+                 * l'etat propre. En repli (pas de descripteur) : pas de purge,
+                 * le registre de repli est la monnaie legitime. */
+                if (s_app.currency.has_descriptor) {
+                    size_t purged = meshpay_dag_purge_foreign(
+                        &s_app.dag, s_app.currency.currency_id);
+                    if (purged > 0) {
+                        (void)meshpay_dag_store_save(&dag_store_be, &s_app.dag,
+                                                     "purge");
+                        ESP_LOGI(TAG,
+                                 "dag purge legacy: %u tx hors registre %08x",
+                                 (unsigned)purged,
+                                 (unsigned)s_app.currency.currency_id);
+                    }
+                }
                 restore_next_seq_from_dag(&s_app);
                 (void)refresh_app_balance(&s_app, 0);
                 ESP_LOGI(TAG,

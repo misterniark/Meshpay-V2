@@ -110,18 +110,113 @@ TEST_CASE("dag rejects conflict on from and seq", "[dag]")
     TEST_ASSERT_EQUAL_MEMORY(tx_a.id, existing->id, MESHPAY_TX_ID_SIZE);
 }
 
-TEST_CASE("dag rejects missing parent", "[dag]")
+TEST_CASE("dag accepts a parent absent from the window", "[dag]")
 {
     meshpay_dag_t *dag = test_pool_dag(0);
 
-    uint8_t missing[1][MESHPAY_TX_PARENT_ID_SIZE];
-    fill_sequence(missing[0], MESHPAY_TX_PARENT_ID_SIZE, 0xaa);
+    /* Fenêtre glissante (décision 2026-07-15, chantier nettoyage currency
+     * legacy) : un parent hors fenêtre (purgé, futur checkpoint, ou pas encore
+     * livré par la sync) n'est PLUS bloquant — la référence pendante est
+     * tolérée. Un parent à id ZÉRO reste en revanche une forme invalide. */
+    uint8_t absent[1][MESHPAY_TX_PARENT_ID_SIZE];
+    fill_sequence(absent[0], MESHPAY_TX_PARENT_ID_SIZE, 0xaa);
 
     meshpay_tx_t tx;
     make_tx(&tx, MESHPAY_TX_TYPE_TRANSFER, 0x42, 0x0a, 0x46,
-            1, 10, 100, missing, 1);
-    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_MISSING_PARENT,
+            1, 10, 100, absent, 1);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
                       meshpay_dag_merge_tx(dag, &tx));
+    TEST_ASSERT_EQUAL_UINT32(1, meshpay_dag_count(dag));
+
+    uint8_t zero[1][MESHPAY_TX_PARENT_ID_SIZE];
+    memset(zero[0], 0, MESHPAY_TX_PARENT_ID_SIZE);
+    meshpay_tx_t bad;
+    make_tx(&bad, MESHPAY_TX_TYPE_TRANSFER, 0x43, 0x0a, 0x46,
+            2, 10, 110, zero, 1);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_INVALID,
+                      meshpay_dag_merge_tx(dag, &bad));
+}
+
+TEST_CASE("dag purge foreign keeps only the active currency", "[dag]")
+{
+    meshpay_dag_t *dag = test_pool_dag(0);
+
+    /* DAG mixte entrelacée : 2 tx du registre de repli (0x01), 3 de la monnaie
+     * active — dont une DESCENDANTE d'une tx de repli (le cas réel observé au
+     * dump du 2026-07-15 : les CLAIM ont pris les boot-credits legacy comme
+     * parents/tips du moment). */
+    meshpay_tx_t legacy_a;
+    make_tx(&legacy_a, MESHPAY_TX_TYPE_MINT, 0x60, 0x11, 0x11,
+            0, 10, 100, NULL, 0);
+    legacy_a.currency_id = 0x01;
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
+                      meshpay_dag_merge_tx(dag, &legacy_a));
+
+    meshpay_tx_t active_claim;
+    uint8_t on_legacy[1][MESHPAY_TX_PARENT_ID_SIZE];
+    memcpy(on_legacy[0], legacy_a.id, MESHPAY_TX_PARENT_ID_SIZE);
+    make_tx(&active_claim, MESHPAY_TX_TYPE_CLAIM, 0x61, 0x12, 0x12,
+            0, 8, 200, on_legacy, 1);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
+                      meshpay_dag_merge_tx(dag, &active_claim));
+
+    meshpay_tx_t legacy_b;
+    make_tx(&legacy_b, MESHPAY_TX_TYPE_MINT, 0x62, 0x13, 0x13,
+            0, 10, 100, NULL, 0);
+    legacy_b.currency_id = 0x01;
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
+                      meshpay_dag_merge_tx(dag, &legacy_b));
+
+    meshpay_tx_t active_tx2;
+    make_tx(&active_tx2, MESHPAY_TX_TYPE_CLAIM, 0x63, 0x14, 0x14,
+            0, 8, 300, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
+                      meshpay_dag_merge_tx(dag, &active_tx2));
+
+    meshpay_tx_t active_tx3;
+    uint8_t on_active[1][MESHPAY_TX_PARENT_ID_SIZE];
+    memcpy(on_active[0], active_claim.id, MESHPAY_TX_PARENT_ID_SIZE);
+    make_tx(&active_tx3, MESHPAY_TX_TYPE_TRANSFER, 0x64, 0x12, 0x14,
+            1, 3, 400, on_active, 1);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
+                      meshpay_dag_merge_tx(dag, &active_tx3));
+    TEST_ASSERT_EQUAL_UINT32(5, meshpay_dag_count(dag));
+
+    /* Purge : les 2 tx de repli sortent, les 3 actives restent DANS L'ORDRE. */
+    TEST_ASSERT_EQUAL_UINT32(
+        2, meshpay_dag_purge_foreign(dag, active_claim.currency_id));
+    TEST_ASSERT_EQUAL_UINT32(3, meshpay_dag_count(dag));
+    TEST_ASSERT_EQUAL_MEMORY(active_claim.id, meshpay_dag_at(dag, 0)->id,
+                             MESHPAY_TX_ID_SIZE);
+    TEST_ASSERT_EQUAL_MEMORY(active_tx2.id, meshpay_dag_at(dag, 1)->id,
+                             MESHPAY_TX_ID_SIZE);
+    TEST_ASSERT_EQUAL_MEMORY(active_tx3.id, meshpay_dag_at(dag, 2)->id,
+                             MESHPAY_TX_ID_SIZE);
+    TEST_ASSERT_FALSE(meshpay_dag_contains(dag, legacy_a.id));
+    TEST_ASSERT_FALSE(meshpay_dag_contains(dag, legacy_b.id));
+
+    /* Le digest post-purge égale celui d'une DAG construite propre : la purge
+     * ne laisse aucun résidu signifiant (critère de convergence réseau). */
+    meshpay_dag_t *clean = test_pool_dag(1);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
+                      meshpay_dag_merge_tx(clean, &active_claim));
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
+                      meshpay_dag_merge_tx(clean, &active_tx2));
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
+                      meshpay_dag_merge_tx(clean, &active_tx3));
+    uint8_t digest_purged[RNS_CRYPTO_SHA256_SIZE];
+    uint8_t digest_clean[RNS_CRYPTO_SHA256_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(dag, digest_purged));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_dag_digest(clean, digest_clean));
+    TEST_ASSERT_EQUAL_MEMORY(digest_clean, digest_purged,
+                             RNS_CRYPTO_SHA256_SIZE);
+
+    /* Idempotence + garde-fous : re-purge = 0 ; DAG NULL = 0. */
+    TEST_ASSERT_EQUAL_UINT32(
+        0, meshpay_dag_purge_foreign(dag, active_claim.currency_id));
+    TEST_ASSERT_EQUAL_UINT32(3, meshpay_dag_count(dag));
+    TEST_ASSERT_EQUAL_UINT32(
+        0, meshpay_dag_purge_foreign(NULL, active_claim.currency_id));
 }
 
 TEST_CASE("dag rejects unsigned transaction shape", "[dag]")
