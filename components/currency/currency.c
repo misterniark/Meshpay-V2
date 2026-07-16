@@ -573,13 +573,19 @@ meshpay_currency_result_t meshpay_currency_ingest_check(
     return MESHPAY_CURRENCY_ERR_INVALID;
 }
 
-size_t meshpay_currency_member_count(
+/* Parcours CANONIQUE des membres, en ordre stable : annuaire du checkpoint
+ * (clé non nulle, hors autorités), puis CLAIM valides de la fenêtre, puis
+ * autorités MINT sans CLAIM. Source unique partagée par member_count et
+ * member_at : les deux restent en lock-step par construction (un index
+ * < member_count désigne toujours le même compte). `wanted` est l'index du
+ * compte à extraire dans out_account (SIZE_MAX = compter seulement).
+ * Rend le nombre TOTAL de membres parcourus. */
+static size_t currency_member_walk(
     const meshpay_currency_config_t *config,
-    const meshpay_dag_t *dag)
+    const meshpay_dag_t *dag,
+    size_t wanted,
+    uint8_t out_account[MESHPAY_TX_DESTINATION_HASH_SIZE])
 {
-    if (config == NULL || dag == NULL) {
-        return 0;
-    }
     /* Phase B : les membres refondés d'abord — comptes de l'annuaire du
      * checkpoint à clé non nulle (les soldes orphelins sans clé ne sont pas
      * des membres), hors autorités (comptées à part, comme avant). */
@@ -592,6 +598,10 @@ size_t meshpay_currency_member_count(
                 &dag->checkpoint.accounts[i];
             if (!bytes_zero(ca->member_public, RNS_IDENTITY_PUBLIC_SIZE) &&
                 !meshpay_currency_is_mint_authority(config, ca->account)) {
+                if (count == wanted && out_account != NULL) {
+                    memcpy(out_account, ca->account,
+                           MESHPAY_TX_DESTINATION_HASH_SIZE);
+                }
                 count++;
             }
         }
@@ -601,7 +611,12 @@ size_t meshpay_currency_member_count(
      * et le gate anti-rejeu interdit la CLAIM d'un compte déjà refondé (pas
      * de double compte possible avec l'annuaire ci-dessus). */
     for (size_t i = 0; i < meshpay_dag_count(dag); ++i) {
-        if (currency_claim_valid(config, meshpay_dag_at(dag, i))) {
+        const meshpay_tx_t *tx = meshpay_dag_at(dag, i);
+        if (currency_claim_valid(config, tx)) {
+            if (count == wanted && out_account != NULL) {
+                memcpy(out_account, tx->from,
+                       MESHPAY_TX_DESTINATION_HASH_SIZE);
+            }
             count++;
         }
     }
@@ -616,10 +631,39 @@ size_t meshpay_currency_member_count(
             }
         }
         if (!has_claim) {
+            if (count == wanted && out_account != NULL) {
+                memcpy(out_account, config->mint_authorities[a],
+                       MESHPAY_TX_DESTINATION_HASH_SIZE);
+            }
             count++;
         }
     }
     return count;
+}
+
+size_t meshpay_currency_member_count(
+    const meshpay_currency_config_t *config,
+    const meshpay_dag_t *dag)
+{
+    if (config == NULL || dag == NULL) {
+        return 0;
+    }
+    return currency_member_walk(config, dag, SIZE_MAX, NULL);
+}
+
+esp_err_t meshpay_currency_member_at(
+    const meshpay_currency_config_t *config,
+    const meshpay_dag_t *dag,
+    size_t index,
+    uint8_t out_account[MESHPAY_TX_DESTINATION_HASH_SIZE])
+{
+    if (config == NULL || dag == NULL || out_account == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Un seul parcours : si l'index est atteint, out_account est rempli au
+     * passage ; sinon (hors bornes) rien n'a été écrit. */
+    size_t total = currency_member_walk(config, dag, index, out_account);
+    return index < total ? ESP_OK : ESP_ERR_INVALID_ARG;
 }
 
 /* --- Phase B : construction du checkpoint côté fondateur --- */

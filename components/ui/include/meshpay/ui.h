@@ -26,6 +26,8 @@ typedef enum {
     MESHPAY_UI_SCREEN_FOUNDER_CODE,  /* affiche le code a dicter */
     MESHPAY_UI_SCREEN_CREATE,        /* wizard de creation de monnaie (D3) */
     MESHPAY_UI_SCREEN_JOIN_CODE,     /* repli : saisie manuelle du code (E3) */
+    /* Chantier crédit fondateur (K2) : émission d'un MINT vers un membre. */
+    MESHPAY_UI_SCREEN_CREDIT,        /* fondateur : créditer un membre */
 } meshpay_ui_screen_t;
 
 /* Palier D — appartenance à une monnaie, poussée depuis l'app (miroir headless
@@ -56,6 +58,8 @@ typedef enum {
     MESHPAY_UI_FEEDBACK_DISCOVERY_REFUSED, /* découverte/sélection refusée */
     MESHPAY_UI_FEEDBACK_JOIN_EXPIRED,    /* fenêtre de rejointe expirée (U3) */
     MESHPAY_UI_FEEDBACK_ACTION_FAILED,   /* repli honnête (motif inclassable) */
+    /* Chantier crédit fondateur (K2) : MINT committé et diffusé. */
+    MESHPAY_UI_FEEDBACK_CREDIT_SENT,
 } meshpay_ui_feedback_t;
 
 /* Chantier migration NVS (M4) — état du stockage persistant, poussé par le
@@ -178,6 +182,10 @@ typedef enum {
     /* Chantier migration NVS (M4) : réinitialisation du record storage
      * (deux temps : armer puis confirmer ; le backup n'est jamais touché). */
     MESHPAY_UI_ACTION_STORAGE_RESET,
+
+    /* Chantier crédit fondateur (K2). */
+    MESHPAY_UI_ACTION_CREDIT,      /* ouvre l'écran Créditer (fondateur) */
+    MESHPAY_UI_ACTION_NEXT_MEMBER, /* écran Créditer : membre suivant */
 } meshpay_ui_action_t;
 
 /* Palier E3 — une monnaie découverte, vue UI : nom + empreinte courte (hex du
@@ -223,6 +231,20 @@ typedef struct {
      * consécutifs sur le même écran). */
     meshpay_ui_storage_status_t storage_status;
     bool storage_reset_armed;
+    /* Chantier crédit fondateur (K2) — poussés par l'app : le device est-il
+     * l'autorité MINT (gate l'entrée « Crediter » du menu Monnaie), et la
+     * cible sélectionnée parmi les MEMBRES de la monnaie (annuaire dérivé de
+     * la DAG — un membre hors ligne reste créditables, la sync DAG livrera). */
+    bool is_founder;
+    uint8_t credit_member_count;
+    uint8_t selected_credit_member;
+    char credit_member_label[MESHPAY_UI_PEER_LABEL_MAX];
+    /* Revue K : le COMPTE réellement affiché à l'écran. La confirmation
+     * crédite CE compte — jamais une re-résolution par index, car l'annuaire
+     * peut être réordonné entre l'affichage et l'appui (CLAIM arrivée par
+     * sync, checkpoint adopté) et un MINT est irréversible. Nul = pas de
+     * cible (liste vide). */
+    uint8_t credit_member_account[MESHPAY_TX_DESTINATION_HASH_SIZE];
 } meshpay_ui_state_t;
 
 typedef struct {
@@ -329,6 +351,26 @@ esp_err_t meshpay_ui_on_action_failed(meshpay_ui_state_t *ui,
  * sain (le bouton n'existe pas à l'écran dans ce cas). */
 esp_err_t meshpay_ui_storage_reset_request(meshpay_ui_state_t *ui,
                                            bool *confirmed);
+
+/* Chantier crédit fondateur (K2) — statut d'autorité MINT du device local,
+ * poussé par l'app (au boot et après création de monnaie). Gate l'entrée
+ * « Crediter » du menu Monnaie ; les membres ne la voient jamais. */
+esp_err_t meshpay_ui_set_founder(meshpay_ui_state_t *ui, bool is_founder);
+/* Cible de crédit courante (miroir de set_payment_peer, mais sur la liste des
+ * MEMBRES poussée par l'app depuis l'annuaire de la DAG). `account` est le
+ * compte 16 o AFFICHÉ (celui que la confirmation créditera — anti-TOCTOU) ;
+ * NULL toléré quand member_count == 0 (cible effacée). */
+esp_err_t meshpay_ui_set_credit_member(
+    meshpay_ui_state_t *ui,
+    const char *label,
+    const uint8_t account[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    uint8_t selected_index,
+    uint8_t member_count);
+/* Sélectionne le membre suivant (cyclique). ESP_ERR_NOT_FOUND si liste vide. */
+esp_err_t meshpay_ui_next_credit_member(meshpay_ui_state_t *ui);
+/* Succès de l'émission du MINT : feedback transient + montant (l'échec passe
+ * par meshpay_ui_on_action_failed, comme les autres gestes). */
+esp_err_t meshpay_ui_on_credit_sent(meshpay_ui_state_t *ui, uint32_t amount);
 
 #ifdef __cplusplus
 }

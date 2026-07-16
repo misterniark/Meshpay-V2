@@ -623,6 +623,87 @@ TEST_CASE("currency membership follows valid claims and mint authority",
     TEST_ASSERT_EQUAL_size_t(0, meshpay_currency_member_count(&config, NULL));
 }
 
+/* --- Chantier crédit fondateur (K1) : énumération indexée des membres --- */
+
+/* member_at parcourt EXACTEMENT dans l'ordre de member_count (annuaire du
+ * checkpoint d'abord, puis CLAIM de la fenêtre, puis autorités sans CLAIM) :
+ * tout index < count rend un compte membre, hors bornes est refusé. */
+TEST_CASE("currency member_at enumerates accounts in member_count order",
+          "[currency][k1]")
+{
+    rns_identity_t founder;
+    TEST_ASSERT_EQUAL(ESP_OK, rns_identity_generate(&founder));
+    meshpay_currency_descriptor_t body;
+    fill_descriptor_body(&body); /* initial_credit = 100 */
+    meshpay_currency_descriptor_signed_t desc;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_descriptor_sign(&desc, &body, &founder));
+    meshpay_currency_config_t config;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_config_from_descriptor(&config, &desc));
+
+    uint8_t member[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(member, sizeof(member), 0x40);
+    meshpay_dag_t *dag = test_pool_dag(0);
+
+    /* Une CLAIM valide (membre) + une forgée (montant faux, ne compte pas). */
+    meshpay_tx_t claim;
+    make_tx(&claim, MESHPAY_TX_TYPE_CLAIM, 0x60,
+            member, member, 100, 0, 0, config.currency_id, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &claim));
+    uint8_t forger[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(forger, sizeof(forger), 0x41);
+    meshpay_tx_t forged;
+    make_tx(&forged, MESHPAY_TX_TYPE_CLAIM, 0x61,
+            forger, forger, 5000, 0, 0, config.currency_id, NULL, 0);
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK, meshpay_dag_merge_tx(dag, &forged));
+
+    /* 2 membres : la CLAIM de la fenêtre d'abord, puis l'autorité sans CLAIM. */
+    TEST_ASSERT_EQUAL_size_t(2, meshpay_currency_member_count(&config, dag));
+    uint8_t account[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_member_at(&config, dag, 0, account));
+    TEST_ASSERT_EQUAL_MEMORY(member, account, sizeof(account));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_member_at(&config, dag, 1, account));
+    TEST_ASSERT_EQUAL_MEMORY(config.mint_authorities[0], account,
+                             sizeof(account));
+
+    /* Annuaire Phase B : un membre refondé (clé non nulle) passe EN TÊTE de
+     * l'énumération ; un solde orphelin (clé nulle) n'apparaît pas. */
+    uint8_t rebased[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    fill_sequence(rebased, sizeof(rebased), 0x50);
+    dag->checkpoint.generation = 1;
+    dag->checkpoint.currency_id = config.currency_id;
+    dag->checkpoint.account_count = 2;
+    memcpy(dag->checkpoint.accounts[0].account, rebased, sizeof(rebased));
+    fill_sequence(dag->checkpoint.accounts[0].member_public,
+                  RNS_IDENTITY_PUBLIC_SIZE, 0x70);
+    fill_sequence(dag->checkpoint.accounts[1].account,
+                  MESHPAY_TX_DESTINATION_HASH_SIZE, 0x51);
+    /* accounts[1].member_public reste nul (orphelin) : pas un membre. */
+
+    TEST_ASSERT_EQUAL_size_t(3, meshpay_currency_member_count(&config, dag));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_member_at(&config, dag, 0, account));
+    TEST_ASSERT_EQUAL_MEMORY(rebased, account, sizeof(account));
+    /* Cohérence totale : tout index < count rend un compte MEMBRE. */
+    size_t count = meshpay_currency_member_count(&config, dag);
+    for (size_t i = 0; i < count; ++i) {
+        TEST_ASSERT_EQUAL(ESP_OK,
+                          meshpay_currency_member_at(&config, dag, i, account));
+        TEST_ASSERT_TRUE(meshpay_currency_is_member(&config, dag, account));
+    }
+
+    /* Hors bornes et NULL : refusés sans rien écrire. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_currency_member_at(&config, dag, count, account));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_currency_member_at(NULL, dag, 0, account));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_currency_member_at(&config, dag, 0, NULL));
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  * Durcissement ingestion (I2) — annuaire des clés + gate crypto
  * ══════════════════════════════════════════════════════════════════════════ */

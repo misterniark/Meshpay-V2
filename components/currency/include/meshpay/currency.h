@@ -114,6 +114,20 @@ size_t meshpay_currency_member_count(
     const meshpay_dag_t *dag);
 
 /*
+ * Chantier crédit fondateur (K1) — compte du index-ième membre, dans l'ordre
+ * EXACT du parcours de member_count (annuaire du checkpoint hors autorités,
+ * puis CLAIM valides de la fenêtre, puis autorités MINT sans CLAIM) : tout
+ * index < member_count désigne un membre stable tant que la DAG ne change
+ * pas. Sert à lister les cibles de crédit MÊME hors ligne (contrairement à la
+ * table des announces, volatile). ESP_ERR_INVALID_ARG si hors bornes ou NULL.
+ */
+esp_err_t meshpay_currency_member_at(
+    const meshpay_currency_config_t *config,
+    const meshpay_dag_t *dag,
+    size_t index,
+    uint8_t out_account[MESHPAY_TX_DESTINATION_HASH_SIZE]);
+
+/*
  * Durcissement ingestion — annuaire des clés dérivé de la DAG : la clé
  * publique d'un compte est celle publiée par sa CLAIM (wire v2), ou celle du
  * descripteur pour le fondateur. ESP_ERR_NOT_FOUND si le compte n'est pas au

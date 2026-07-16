@@ -77,6 +77,9 @@ typedef enum {
     MESHPAY_APP_EVENT_CORE_ANNOUNCE,
     MESHPAY_APP_EVENT_CORE_PAYMENT,
     MESHPAY_APP_EVENT_CORE_DAG_SUMMARY,
+    /* Chantier crédit fondateur (K3) : émission d'un MINT vers un membre
+     * (destination + amount, mêmes champs que CORE_PAYMENT). */
+    MESHPAY_APP_EVENT_CORE_CREDIT,
 } meshpay_app_event_type_t;
 
 typedef struct {
@@ -402,6 +405,23 @@ esp_err_t meshpay_app_runtime_invite_code(meshpay_app_runtime_t *runtime,
  * À appeler au boot (main/) après la restauration de la DAG ; appelée aussi
  * automatiquement à la rejointe (import réussi du descripteur) et à la création.
  */
+/*
+ * Chantier crédit fondateur (K3) — émission d'un MINT signé vers un membre.
+ * Réservé à l'autorité MINT d'une monnaie à descripteur (le device local doit
+ * être le fondateur). Le seq est alloué sur le compteur wallet PARTAGÉ avec
+ * les TRANSFER (espace (from, seq) unique) et persisté AVANT le commit DAG
+ * (Option A) ; en cas de refus de validation (plafond max_supply…), le seq
+ * est restauré et rien n'est committé. Commit-on-send : le MINT est committé
+ * localement puis livré par la sync DAG — le membre peut être HORS LIGNE.
+ * ESP_ERR_INVALID_STATE si non-fondateur ou cible non membre,
+ * ESP_ERR_INVALID_ARG si amount == 0.
+ */
+esp_err_t meshpay_app_runtime_credit_member(
+    meshpay_app_runtime_t *runtime,
+    const uint8_t to[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    uint32_t amount,
+    uint64_t now_ms);
+
 esp_err_t meshpay_app_runtime_claim_initial_credit(meshpay_app_runtime_t *runtime,
                                                    uint64_t now_ms);
 

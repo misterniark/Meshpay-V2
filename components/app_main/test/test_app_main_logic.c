@@ -3009,6 +3009,121 @@ TEST_CASE("create currency rejects invalid params before signing", "[app_main][d
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * Chantier crédit fondateur (K3) — émission d'un MINT vers un membre
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Nominal : le fondateur crédite un membre — solde et masse frappée à jour,
+ * seq consommé sur le compteur wallet PARTAGÉ avec les paiements. */
+TEST_CASE("founder credits a member with a signed mint", "[app_main][k3]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock); /* non-membre (repli) */
+    meshpay_app_currency_params_t params;
+    default_currency_params(&params); /* initial_credit=250, max=10000 */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_create_currency(&runtime,
+                                                                  &params,
+                                                                  1000));
+
+    /* Un membre distinct rejoint par CLAIM authentique (identité 0x51). */
+    rns_identity_t member_id;
+    load_identity(&member_id, 0x51);
+    rns_destination_t member_wallet;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      rns_destination_create_meshpay_wallet(&member_id,
+                                                            &member_wallet));
+    meshpay_tx_t claim;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_tx_create_claim(&claim, &member_id,
+                                              member_wallet.hash,
+                                              app->currency.initial_credit,
+                                              app->currency.currency_id,
+                                              NULL, 0, 0));
+    TEST_ASSERT_EQUAL(MESHPAY_DAG_MERGE_OK,
+                      meshpay_dag_merge_tx(&app->dag, &claim));
+
+    uint32_t seq_before = app->wallet.next_seq;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_credit_member(&runtime,
+                                                        member_wallet.hash,
+                                                        40, 2000));
+
+    /* Solde du membre = crédit initial + MINT ; seq consommé une fois. */
+    uint32_t balance = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_get_balance(&app->currency, &app->dag,
+                                                   member_wallet.hash,
+                                                   &balance));
+    TEST_ASSERT_EQUAL_UINT32(app->currency.initial_credit + 40, balance);
+    TEST_ASSERT_EQUAL_UINT32(seq_before + 1U, app->wallet.next_seq);
+
+    /* Conservation : masse frappée = 2 CLAIM (fondateur + membre) + le MINT. */
+    uint64_t total = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_total_minted(&app->currency, &app->dag,
+                                                    &total));
+    TEST_ASSERT_EQUAL_UINT64(2ULL * app->currency.initial_credit + 40, total);
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* Refus typés : non-fondateur, cible non membre, montant nul, plafond de
+ * supply — et AUCUN seq consommé par un refus (pas de trou dans (from, seq)). */
+TEST_CASE("credit member refuses non founder bad target and supply overflow",
+          "[app_main][k3]")
+{
+    meshpay_app_t *app = test_pool_app(0);
+    meshpay_storage_mock_t mock;
+    meshpay_app_runtime_t runtime;
+    member_runtime_init(&runtime, app, &mock); /* non-membre (repli) */
+
+    uint8_t stranger[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    memset(stranger, 0x5a, sizeof(stranger));
+
+    /* Sans descripteur (repli maillage ouvert), pas d'émission de crédit. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_app_runtime_credit_member(&runtime, stranger,
+                                                        10, 1000));
+
+    meshpay_app_currency_params_t params;
+    default_currency_params(&params); /* initial=250, max_supply=10000 */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_app_runtime_create_currency(&runtime,
+                                                                  &params,
+                                                                  1000));
+    uint32_t seq_before = app->wallet.next_seq;
+
+    /* Montant nul et cible inconnue (pas de CLAIM) : refusés. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_app_runtime_credit_member(
+                          &runtime, app->local_destination, 0, 2000));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_app_runtime_credit_member(&runtime, stranger,
+                                                        10, 2000));
+
+    /* Plafond : 250 déjà frappés (CLAIM fondateur), 9751 > 10000 - 250. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      meshpay_app_runtime_credit_member(
+                          &runtime, app->local_destination, 9751, 2000));
+
+    /* Aucun refus n'a consommé de seq. */
+    TEST_ASSERT_EQUAL_UINT32(seq_before, app->wallet.next_seq);
+
+    /* Le fondateur PEUT se créditer lui-même (trésorerie), dans le plafond. */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_app_runtime_credit_member(
+                          &runtime, app->local_destination, 100, 3000));
+    uint32_t balance = 0;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_currency_get_balance(&app->currency, &app->dag,
+                                                   app->local_destination,
+                                                   &balance));
+    TEST_ASSERT_EQUAL_UINT32(params.initial_credit + 100, balance);
+
+    meshpay_app_runtime_destroy(&runtime);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
  * Palier D6 — mapping wizard UI → paramètres fondateur
  * ══════════════════════════════════════════════════════════════════════════ */
 

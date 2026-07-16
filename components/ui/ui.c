@@ -76,6 +76,8 @@ static const char *feedback_text(meshpay_ui_feedback_t feedback)
         return "Rejointe expiree (aucune reponse)";
     case MESHPAY_UI_FEEDBACK_ACTION_FAILED:
         return "Echec de l'action";
+    case MESHPAY_UI_FEEDBACK_CREDIT_SENT:
+        return "Credit envoye";
     case MESHPAY_UI_FEEDBACK_NONE:
     default:
         return "";
@@ -350,6 +352,73 @@ esp_err_t meshpay_ui_next_payment_peer(meshpay_ui_state_t *ui)
     return ESP_OK;
 }
 
+esp_err_t meshpay_ui_set_founder(meshpay_ui_state_t *ui, bool is_founder)
+{
+    if (ui == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ui->is_founder = is_founder;
+    return ESP_OK;
+}
+
+esp_err_t meshpay_ui_set_credit_member(
+    meshpay_ui_state_t *ui,
+    const char *label,
+    const uint8_t account[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    uint8_t selected_index,
+    uint8_t member_count)
+{
+    if (ui == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Cohérence anti-TOCTOU : une liste non vide DOIT désigner un compte. */
+    if (member_count > 0 && account == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ui->credit_member_count = member_count;
+    ui->selected_credit_member =
+        member_count == 0 ? 0 : (uint8_t)(selected_index % member_count);
+    if (member_count > 0) {
+        memcpy(ui->credit_member_account, account,
+               MESHPAY_TX_DESTINATION_HASH_SIZE);
+    } else {
+        memset(ui->credit_member_account, 0,
+               MESHPAY_TX_DESTINATION_HASH_SIZE);
+    }
+    (void)snprintf(ui->credit_member_label,
+                   sizeof(ui->credit_member_label),
+                   "%s",
+                   label == NULL ? "" : label);
+    return ESP_OK;
+}
+
+esp_err_t meshpay_ui_next_credit_member(meshpay_ui_state_t *ui)
+{
+    if (ui == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (ui->credit_member_count == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    ui->selected_credit_member =
+        (uint8_t)((ui->selected_credit_member + 1U) % ui->credit_member_count);
+    ui->feedback = MESHPAY_UI_FEEDBACK_NONE;
+    return ESP_OK;
+}
+
+esp_err_t meshpay_ui_on_credit_sent(meshpay_ui_state_t *ui, uint32_t amount)
+{
+    if (ui == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Miroir du feedback « paiement envoyé » : montant mémorisé et retour sur
+     * l'écran Créditer (le montant saisi a été consommé par le firmware). */
+    ui->last_amount = amount;
+    ui->feedback = MESHPAY_UI_FEEDBACK_CREDIT_SENT;
+    ui->screen = MESHPAY_UI_SCREEN_CREDIT;
+    return ESP_OK;
+}
+
 esp_err_t meshpay_ui_set_history_peer(meshpay_ui_state_t *ui,
                                       const char *label)
 {
@@ -374,7 +443,7 @@ esp_err_t meshpay_ui_nav(meshpay_ui_state_t *ui, meshpay_ui_screen_t screen)
     if (!ui->has_pin && screen != MESHPAY_UI_SCREEN_SETUP_PIN) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (screen > MESHPAY_UI_SCREEN_JOIN_CODE) {
+    if (screen > MESHPAY_UI_SCREEN_CREDIT) {
         return ESP_ERR_INVALID_ARG;
     }
     ui->screen = screen;
@@ -397,6 +466,7 @@ esp_err_t meshpay_ui_input_digit(meshpay_ui_state_t *ui, uint8_t digit)
     case MESHPAY_UI_SCREEN_SETUP_PIN:
         return append_pin_digit(ui, digit);
     case MESHPAY_UI_SCREEN_PAY:
+    case MESHPAY_UI_SCREEN_CREDIT: /* K2 : même saisie de montant que PAY */
         return append_amount_digit(ui, digit);
     case MESHPAY_UI_SCREEN_CREATE:
         return wizard_input(ui, (char)('0' + digit));
@@ -420,6 +490,7 @@ esp_err_t meshpay_ui_input_char(meshpay_ui_state_t *ui, char c)
         return wizard_input(ui, c); /* routé vers le champ courant du wizard */
     case MESHPAY_UI_SCREEN_SETUP_PIN:
     case MESHPAY_UI_SCREEN_PAY:
+    case MESHPAY_UI_SCREEN_CREDIT: /* K2 : écran numérique (montant) */
         /* Écrans numériques : seuls les chiffres comptent, le reste est ignoré. */
         if (c >= '0' && c <= '9') {
             return meshpay_ui_input_digit(ui, (uint8_t)(c - '0'));
@@ -579,6 +650,7 @@ esp_err_t meshpay_ui_backspace(meshpay_ui_state_t *ui)
         }
         return ESP_OK;
     case MESHPAY_UI_SCREEN_PAY:
+    case MESHPAY_UI_SCREEN_CREDIT: /* K2 : même édition de montant que PAY */
         ui->draft_amount /= 10U;
         return ESP_OK;
     case MESHPAY_UI_SCREEN_JOIN_CODE:
@@ -643,6 +715,10 @@ bool meshpay_ui_confirm_enabled(const meshpay_ui_state_t *ui)
     }
     if (ui->screen == MESHPAY_UI_SCREEN_PAY) {
         return ui->draft_amount > 0 && ui->payment_peer_count > 0;
+    }
+    if (ui->screen == MESHPAY_UI_SCREEN_CREDIT) {
+        /* K2 : un montant saisi + au moins un membre créditables. */
+        return ui->draft_amount > 0 && ui->credit_member_count > 0;
     }
     if (ui->screen == MESHPAY_UI_SCREEN_JOIN) {
         /* E3 : on ne peut rejoindre que s'il y a une monnaie découverte. */
@@ -1031,6 +1107,10 @@ esp_err_t meshpay_ui_build_view(const meshpay_ui_state_t *ui,
                                                    : "Monnaie active");
             (void)snprintf(view->secondary, sizeof(view->secondary),
                            "Solde %lu", (unsigned long)ui->balance);
+            /* K2 : l'émission de crédit n'existe que chez l'autorité MINT. */
+            if (ui->is_founder) {
+                add_action(view, MESHPAY_UI_ACTION_CREDIT, "Crediter");
+            }
             add_action(view, MESHPAY_UI_ACTION_SHOW_CODE, "Code");
             add_action(view, MESHPAY_UI_ACTION_HOME, "Accueil");
         } else if (ui->join_state == MESHPAY_UI_JOIN_ARMED) {
@@ -1091,6 +1171,32 @@ esp_err_t meshpay_ui_build_view(const meshpay_ui_state_t *ui,
         view_text(view->primary,
                   ui->invite_code[0] != '\0' ? ui->invite_code : "Indisponible");
         view_text(view->secondary, "A dicter au nouveau membre");
+        add_action(view, MESHPAY_UI_ACTION_HOME, "Accueil");
+        break;
+    case MESHPAY_UI_SCREEN_CREDIT:
+        /* K2 — fondateur : montant saisi aux chiffres, membre cible cyclable
+         * sur le même écran (la liste vient de l'annuaire DAG, pas des
+         * announces : un membre hors ligne reste créditables). */
+        view_text(view->title, "Crediter");
+        if (ui->draft_amount == 0) {
+            view_text(view->primary, "Montant --");
+        } else {
+            (void)snprintf(view->primary, sizeof(view->primary),
+                           "Montant %lu", (unsigned long)ui->draft_amount);
+        }
+        if (ui->credit_member_count == 0) {
+            view_text(view->secondary, "Aucun membre");
+        } else {
+            (void)snprintf(view->secondary,
+                           sizeof(view->secondary),
+                           "Pour %s (%u/%u)",
+                           ui->credit_member_label,
+                           (unsigned)(ui->selected_credit_member + 1U),
+                           (unsigned)ui->credit_member_count);
+        }
+        add_action(view, MESHPAY_UI_ACTION_CONFIRM, "Envoyer");
+        add_action(view, MESHPAY_UI_ACTION_NEXT_MEMBER, "Suiv.");
+        add_action(view, MESHPAY_UI_ACTION_BACKSPACE, "Effacer");
         add_action(view, MESHPAY_UI_ACTION_HOME, "Accueil");
         break;
     case MESHPAY_UI_SCREEN_CREATE: {

@@ -799,3 +799,117 @@ TEST_CASE("ui action failure has priority over storage alert", "[ui][u1]")
     TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
     TEST_ASSERT_NOT_NULL(strstr(view.footer, "Stockage HS"));
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Chantier crédit fondateur (K2) — écran Créditer + gating fondateur
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* L'entrée « Crediter » du menu Monnaie n'existe QUE chez le fondateur
+ * (autorité MINT poussée par l'app) : un membre ne la voit jamais. */
+TEST_CASE("ui currency menu shows credit action to founder only", "[ui][k2]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_ui_set_join_state(&ui, MESHPAY_UI_JOIN_MEMBER));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_CURRENCY_MENU));
+
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    for (uint8_t i = 0; i < view.action_count; ++i) {
+        TEST_ASSERT_NOT_EQUAL(MESHPAY_UI_ACTION_CREDIT, view.actions[i]);
+    }
+
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_set_founder(&ui, true));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    bool found = false;
+    for (uint8_t i = 0; i < view.action_count; ++i) {
+        if (view.actions[i] == MESHPAY_UI_ACTION_CREDIT) {
+            found = true;
+            TEST_ASSERT_EQUAL_STRING("Crediter", view.action_labels[i]);
+        }
+    }
+    TEST_ASSERT_TRUE(found);
+}
+
+/* L'écran Créditer : montant saisi aux chiffres (backspace compris), membre
+ * cible cyclable, confirmation gated par (montant > 0 ET liste non vide). */
+TEST_CASE("ui credit screen types amount and cycles members", "[ui][k2]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_CREDIT));
+
+    /* Liste vide : la confirmation reste interdite, l'écran l'affiche. */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_ui_set_credit_member(&ui, "", NULL, 0, 0));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND, meshpay_ui_next_credit_member(&ui));
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_NOT_NULL(strstr(view.secondary, "Aucun membre"));
+    TEST_ASSERT_FALSE(meshpay_ui_confirm_enabled(&ui));
+
+    /* Deux membres poussés par l'app : saisie du montant au clavier. Le
+     * COMPTE affiché est mémorisé (anti-TOCTOU : c'est LUI qui sera crédité,
+     * jamais une re-résolution par index). Une liste non vide sans compte
+     * est refusée. */
+    uint8_t acc[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    memset(acc, 0x42, sizeof(acc));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_ui_set_credit_member(&ui, "panda agile", NULL,
+                                                   0, 2));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_ui_set_credit_member(&ui, "panda agile", acc,
+                                                   0, 2));
+    TEST_ASSERT_EQUAL_MEMORY(acc, ui.credit_member_account, sizeof(acc));
+    TEST_ASSERT_FALSE(meshpay_ui_confirm_enabled(&ui)); /* montant nul */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_input_char(&ui, '4'));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_input_char(&ui, '2'));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_input_char(&ui, 'x')); /* ignoré */
+    TEST_ASSERT_EQUAL_UINT32(42, ui.draft_amount);
+    TEST_ASSERT_TRUE(meshpay_ui_confirm_enabled(&ui));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_NOT_NULL(strstr(view.primary, "Montant 42"));
+    TEST_ASSERT_NOT_NULL(strstr(view.secondary, "panda agile"));
+    TEST_ASSERT_NOT_NULL(strstr(view.secondary, "1/2"));
+
+    /* Cycle des membres + backspace sur le montant. */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_next_credit_member(&ui));
+    TEST_ASSERT_EQUAL_UINT8(1, ui.selected_credit_member);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_next_credit_member(&ui));
+    TEST_ASSERT_EQUAL_UINT8(0, ui.selected_credit_member); /* cyclique */
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_backspace(&ui));
+    TEST_ASSERT_EQUAL_UINT32(4, ui.draft_amount);
+
+    /* La liste qui se vide efface aussi le compte mémorisé (aucun MINT ne
+     * doit pouvoir partir vers une cible fantôme). */
+    uint8_t zero[MESHPAY_TX_DESTINATION_HASH_SIZE] = {0};
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      meshpay_ui_set_credit_member(&ui, "", NULL, 0, 0));
+    TEST_ASSERT_EQUAL_MEMORY(zero, ui.credit_member_account, sizeof(zero));
+}
+
+/* Le succès de l'émission remonte en footer (transient, effacé à la nav) ;
+ * le canal des échecs refuse cette valeur de succès. */
+TEST_CASE("ui credit sent feedback is transient", "[ui][k2]")
+{
+    meshpay_ui_state_t ui;
+    meshpay_ui_init(&ui, true);
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_CREDIT));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_on_credit_sent(&ui, 50));
+    TEST_ASSERT_EQUAL(MESHPAY_UI_SCREEN_CREDIT, ui.screen);
+    TEST_ASSERT_EQUAL_UINT32(50, ui.last_amount);
+
+    meshpay_ui_view_t view;
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_NOT_NULL(strstr(view.footer, "Credit envoye"));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_nav(&ui, MESHPAY_UI_SCREEN_HOME));
+    TEST_ASSERT_EQUAL(ESP_OK, meshpay_ui_build_view(&ui, &view));
+    TEST_ASSERT_NULL(strstr(view.footer, "Credit envoye"));
+
+    /* Succès ≠ canal des échecs (même règle que PAYMENT_SENT). */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      meshpay_ui_on_action_failed(
+                          &ui, MESHPAY_UI_FEEDBACK_CREDIT_SENT));
+}

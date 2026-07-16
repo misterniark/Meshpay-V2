@@ -383,7 +383,13 @@ static void restore_next_seq_from_dag(meshpay_app_t *app)
     size_t n = meshpay_dag_count(&app->dag);
     for (size_t i = 0; i < n; ++i) {
         const meshpay_tx_t *tx = meshpay_dag_at(&app->dag, i);
-        if (tx == NULL || tx->type != MESHPAY_TX_TYPE_TRANSFER) {
+        /* Revue K : les MINT du fondateur consomment le MÊME compteur que les
+         * TRANSFER (chantier K3) — les ignorer ici laisserait next_seq sous
+         * les MINT committés après une perte NVS, et chaque tx suivante
+         * échouerait en MERGE_CONFLICT local jusqu'au rattrapage. Les CLAIM
+         * restent exclues (seq == 0 réservé, hors compteur). */
+        if (tx == NULL || (tx->type != MESHPAY_TX_TYPE_TRANSFER &&
+                           tx->type != MESHPAY_TX_TYPE_MINT)) {
             continue;
         }
         if (!meshpay_destination_equal(tx->from, app->wallet.owner)) {
@@ -423,7 +429,8 @@ static void restore_next_seq_from_dag(meshpay_app_t *app)
 static bool waveshare_input_screen(meshpay_ui_screen_t screen)
 {
     return screen == MESHPAY_UI_SCREEN_SETUP_PIN ||
-           screen == MESHPAY_UI_SCREEN_PAY;
+           screen == MESHPAY_UI_SCREEN_PAY ||
+           screen == MESHPAY_UI_SCREEN_CREDIT; /* K4 : montant au pavé */
 }
 
 static void fb_rect(uint16_t *fb,
@@ -646,7 +653,11 @@ static void render_numeric_keypad(uint16_t *fb, const meshpay_ui_view_t *view)
 static void render_soft_actions(uint16_t *fb, const meshpay_ui_view_t *view)
 {
     if (waveshare_input_screen(view->screen)) {
-        if (view->screen == MESHPAY_UI_SCREEN_PAY) {
+        /* Revue K : CREDIT reçoit la même paire de touches douces que PAY
+         * (sinon l'écran serait un cul-de-sac si un Waveshare devenait un
+         * jour fondateur) — Accueil + Cible/Suiv. selon l'écran. */
+        if (view->screen == MESHPAY_UI_SCREEN_PAY ||
+            view->screen == MESHPAY_UI_SCREEN_CREDIT) {
             fb_button(fb,
                       14,
                       WS147_SOFT_KEY_Y,
@@ -660,7 +671,8 @@ static void render_soft_actions(uint16_t *fb, const meshpay_ui_view_t *view)
                       WS147_SOFT_KEY_Y,
                       WS147_SOFT_KEY_W,
                       WS147_SOFT_KEY_H,
-                      "Cible",
+                      view->screen == MESHPAY_UI_SCREEN_PAY ? "Cible"
+                                                            : "Suiv.",
                       WS147_UI_PANEL,
                       WS147_UI_TEXT_DARK);
         }
@@ -813,7 +825,10 @@ static waveshare_touch_intent_t waveshare_map_soft_action(
         return intent;
     }
 
-    if (view->screen == MESHPAY_UI_SCREEN_PAY) {
+    if (view->screen == MESHPAY_UI_SCREEN_PAY ||
+        view->screen == MESHPAY_UI_SCREEN_CREDIT) {
+        /* Revue K : mapping symétrique du rendu — Accueil, puis Cible (PAY)
+         * ou membre suivant (CREDIT). */
         if (point_in_rect(touch->x,
                           touch->y,
                           14,
@@ -831,7 +846,9 @@ static waveshare_touch_intent_t waveshare_map_soft_action(
                           WS147_SOFT_KEY_W,
                           WS147_SOFT_KEY_H)) {
             intent.handled = true;
-            intent.action = MESHPAY_UI_ACTION_PAY;
+            intent.action = view->screen == MESHPAY_UI_SCREEN_PAY
+                                ? MESHPAY_UI_ACTION_PAY
+                                : MESHPAY_UI_ACTION_NEXT_MEMBER;
             return intent;
         }
     }
@@ -1054,6 +1071,135 @@ static esp_err_t wallet_confirm_payment_locked(void)
     }
     return err;
 }
+/* --- Chantier crédit fondateur (K4) : cibles de crédit (annuaire DAG) --- */
+
+/* Compte du index-ième membre CRÉDITABLE : l'annuaire de la monnaie
+ * (meshpay_currency_member_at — les membres MÊME hors ligne, contrairement
+ * aux announces) filtré du compte local. L'API runtime autorise l'auto-crédit
+ * mais l'écran ne le propose pas (geste accidentel trop facile). Rend le
+ * nombre total de cibles ; *out_found dit si selected_index a été résolu. */
+static uint8_t wallet_credit_member_at_index(
+    uint8_t selected_index,
+    uint8_t out_account[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    bool *out_found)
+{
+    uint8_t count = 0;
+    bool found = false;
+    size_t total = meshpay_currency_member_count(&s_app.currency, &s_app.dag);
+    for (size_t i = 0; i < total && count < UINT8_MAX; ++i) {
+        uint8_t account[MESHPAY_TX_DESTINATION_HASH_SIZE];
+        if (meshpay_currency_member_at(&s_app.currency, &s_app.dag, i,
+                                       account) != ESP_OK) {
+            break;
+        }
+        if (memcmp(account, s_app.local_destination, sizeof(account)) == 0) {
+            continue;
+        }
+        if (count == selected_index && !found) {
+            if (out_account != NULL) {
+                memcpy(out_account, account,
+                       MESHPAY_TX_DESTINATION_HASH_SIZE);
+            }
+            found = true;
+        }
+        count++;
+    }
+    if (out_found != NULL) {
+        *out_found = found;
+    }
+    return count;
+}
+
+/* Libellé d'une cible de crédit : l'alias de son announce si elle a déjà été
+ * entendue, sinon le préfixe hex de son compte (membre hors ligne depuis le
+ * boot — créditables quand même, la sync DAG livrera). */
+static void wallet_credit_member_label(
+    const uint8_t account[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    char out[MESHPAY_UI_PEER_LABEL_MAX])
+{
+    const rns_announce_known_destination_t *known =
+        rns_announce_recall(account);
+    if (known != NULL) {
+        wallet_peer_label_from_known(known, out);
+        return;
+    }
+    (void)snprintf(out, MESHPAY_UI_PEER_LABEL_MAX, "membre %02x%02x",
+                   account[0], account[1]);
+}
+
+/* Repousse la cible sélectionnée (label + compteur + COMPTE affiché) dans
+ * l'UI, en clampant la sélection si la liste a rétréci. Miroir de
+ * wallet_refresh_payment_peer. */
+static esp_err_t wallet_refresh_credit_member_locked(void)
+{
+    uint8_t account[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    bool found = false;
+    uint8_t selected = s_app.ui.selected_credit_member;
+    uint8_t count = wallet_credit_member_at_index(selected, account, &found);
+    if (count == 0) {
+        return meshpay_ui_set_credit_member(&s_app.ui, "", NULL, 0, 0);
+    }
+    if (!found) {
+        selected = 0;
+        (void)wallet_credit_member_at_index(0, account, &found);
+        if (!found) {
+            return meshpay_ui_set_credit_member(&s_app.ui, "", NULL, 0, 0);
+        }
+    }
+    char label[MESHPAY_UI_PEER_LABEL_MAX];
+    wallet_credit_member_label(account, label);
+    return meshpay_ui_set_credit_member(&s_app.ui, label, account, selected,
+                                        count);
+}
+
+/* CONFIRM sur l'écran Créditer : poste l'émission du MINT à la tâche core
+ * (même patron que le paiement — l'API runtime prend le verrou en interne,
+ * donc l'événement part par la queue, jamais d'appel direct sous verrou).
+ * Revue K (anti-TOCTOU) : la cible est le COMPTE AFFICHÉ mémorisé par l'UI,
+ * jamais une re-résolution par index — l'annuaire peut être réordonné entre
+ * l'affichage et l'appui (CLAIM arrivée par sync, checkpoint adopté) et un
+ * MINT est irréversible. Le runtime revérifie is_member de toute façon. */
+static esp_err_t wallet_confirm_credit_locked(void)
+{
+    uint32_t amount = s_app.ui.draft_amount;
+    if (amount == 0) {
+        return ESP_OK;
+    }
+
+    uint8_t account[MESHPAY_TX_DESTINATION_HASH_SIZE];
+    memcpy(account, s_app.ui.credit_member_account, sizeof(account));
+    bool has_target = false;
+    for (size_t i = 0; i < sizeof(account); ++i) {
+        if (account[i] != 0) {
+            has_target = true;
+            break;
+        }
+    }
+    if (!has_target) {
+        (void)meshpay_ui_on_action_failed(&s_app.ui,
+                                          MESHPAY_UI_FEEDBACK_ACTION_FAILED);
+        return ESP_OK;
+    }
+
+    meshpay_app_event_t event = {
+        .type = MESHPAY_APP_EVENT_CORE_CREDIT,
+        .now_ms = (uint64_t)(esp_timer_get_time() / 1000),
+        .amount = amount,
+    };
+    memcpy(event.destination, account, sizeof(event.destination));
+    esp_err_t err = meshpay_app_runtime_post(&s_runtime,
+                                             MESHPAY_APP_QUEUE_CORE,
+                                             &event,
+                                             0);
+    if (err == ESP_OK) {
+        (void)meshpay_ui_clear_entry(&s_app.ui);
+    } else {
+        (void)meshpay_ui_on_action_failed(&s_app.ui,
+                                          MESHPAY_UI_FEEDBACK_ACTION_FAILED);
+    }
+    return err;
+}
+
 /* Palier D6 — action différée hors verrou. Les API runtime (create_currency,
  * arm_join, invite_code) prennent s_runtime.lock EN INTERNE : les appeler depuis
  * un handler qui tient déjà ce verrou serait un deadlock (mutex non récursif).
@@ -1127,6 +1273,25 @@ static esp_err_t wallet_apply_action_locked(meshpay_ui_action_t action,
         }
         return wallet_refresh_payment_peer_locked();
     }
+    case MESHPAY_UI_ACTION_CREDIT:
+        /* K4 : entrée fondateur — montant repart de zéro, liste des membres
+         * rafraîchie depuis l'annuaire de la DAG. */
+        (void)meshpay_ui_clear_entry(&s_app.ui);
+        (void)wallet_refresh_credit_member_locked();
+        return meshpay_ui_nav(&s_app.ui, MESHPAY_UI_SCREEN_CREDIT);
+    case MESHPAY_UI_ACTION_NEXT_MEMBER: {
+        /* Sélection cyclique de la cible de crédit (écran Créditer). */
+        esp_err_t err = meshpay_ui_next_credit_member(&s_app.ui);
+        if (err == ESP_ERR_NOT_FOUND) {
+            /* Revue K : liste vide à l'écran — retenter un refresh, une
+             * CLAIM a pu arriver par sync depuis l'entrée sur l'écran. */
+            return wallet_refresh_credit_member_locked();
+        }
+        if (err != ESP_OK) {
+            return err;
+        }
+        return wallet_refresh_credit_member_locked();
+    }
     case MESHPAY_UI_ACTION_SHOW_CODE:
         /* Le code se lit via le runtime (verrou interne) : différé hors lock. */
         defer->kind = WALLET_DEFER_SHOW_CODE;
@@ -1164,6 +1329,10 @@ static esp_err_t wallet_apply_action_locked(meshpay_ui_action_t action,
         }
         if (s_app.ui.screen == MESHPAY_UI_SCREEN_PAY) {
             return wallet_confirm_payment_locked();
+        }
+        if (s_app.ui.screen == MESHPAY_UI_SCREEN_CREDIT) {
+            /* K4 : émission du MINT vers le membre sélectionné. */
+            return wallet_confirm_credit_locked();
         }
         if (s_app.ui.screen == MESHPAY_UI_SCREEN_CREATE) {
             /* Copie du wizard sous verrou ; la création part hors verrou. */
@@ -1433,6 +1602,14 @@ static void wallet_sync_currency_ui(int64_t now_us)
             js == MESHPAY_APP_JOIN_MEMBER  ? MESHPAY_UI_JOIN_MEMBER
             : js == MESHPAY_APP_JOIN_ARMED ? MESHPAY_UI_JOIN_ARMED
                                            : MESHPAY_UI_JOIN_IDLE);
+        /* K4 : statut d'autorité MINT — gate l'entrée « Crediter » du menu
+         * Monnaie. Recalculé au fil de l'eau (devient vrai après une création
+         * de monnaie, sans reboot). */
+        (void)meshpay_ui_set_founder(
+            &s_app.ui,
+            s_app.currency.has_descriptor &&
+                meshpay_currency_is_mint_authority(&s_app.currency,
+                                                   s_app.local_destination));
         xSemaphoreGive(s_runtime.lock);
     }
 }
@@ -1475,6 +1652,11 @@ static bool waveshare_handle_tap(const meshpay_touch_state_t *touch)
 
     meshpay_ui_view_t view;
     (void)wallet_refresh_payment_peer_locked();
+    if (s_app.ui.screen == MESHPAY_UI_SCREEN_CREDIT) {
+        /* Revue K : la liste des cibles suit la DAG (CLAIM par sync,
+         * checkpoint) — au même rythme que les pairs de paiement. */
+        (void)wallet_refresh_credit_member_locked();
+    }
     esp_err_t err = meshpay_ui_build_view(&s_app.ui, &view);
     waveshare_touch_intent_t intent = {0};
     wallet_deferred_action_t defer = {0};
@@ -1518,6 +1700,10 @@ static void waveshare_render_current(bool force)
     }
     meshpay_ui_view_t view;
     (void)wallet_refresh_payment_peer_locked();
+    if (s_app.ui.screen == MESHPAY_UI_SCREEN_CREDIT) {
+        /* Revue K : liste des cibles vivante pendant l'affichage. */
+        (void)wallet_refresh_credit_member_locked();
+    }
     esp_err_t err = meshpay_ui_build_view(&s_app.ui, &view);
     xSemaphoreGive(s_runtime.lock);
     if (err != ESP_OK) {
@@ -1671,7 +1857,8 @@ static bool tdeck_input_screen(meshpay_ui_screen_t screen)
     return screen == MESHPAY_UI_SCREEN_SETUP_PIN ||
            screen == MESHPAY_UI_SCREEN_PAY ||
            screen == MESHPAY_UI_SCREEN_JOIN_CODE ||
-           screen == MESHPAY_UI_SCREEN_CREATE;
+           screen == MESHPAY_UI_SCREEN_CREATE ||
+           screen == MESHPAY_UI_SCREEN_CREDIT; /* K4 : montant au clavier */
 }
 
 /* Peint la vue courante sur l'écran ST7789. Layout générique piloté par la
@@ -1865,7 +2052,21 @@ static void tdeck_handle_key(char key)
     } else if (key == '\b' || key == 0x7F) {
         err = wallet_apply_action_locked(MESHPAY_UI_ACTION_BACKSPACE, &defer);
     } else if (key == '\t') {
-        err = wallet_apply_action_locked(MESHPAY_UI_ACTION_NEXT_FIELD, &defer);
+        /* K4 : sur l'écran Créditer, TAB cycle la cible (le tactile T-Deck
+         * n'est pas encore calibré — le clavier doit suffire) ; ailleurs il
+         * garde son rôle wizard (champ suivant). */
+        err = wallet_apply_action_locked(
+            screen == MESHPAY_UI_SCREEN_CREDIT ? MESHPAY_UI_ACTION_NEXT_MEMBER
+                                               : MESHPAY_UI_ACTION_NEXT_FIELD,
+            &defer);
+    } else if ((key == 'a' || key == 'A') &&
+               (screen == MESHPAY_UI_SCREEN_PAY ||
+                screen == MESHPAY_UI_SCREEN_CREDIT)) {
+        /* Revue K : échappement CLAVIER des écrans numériques — sans lui,
+         * PAY et CREDIT sont des culs-de-sac tant que le tactile T-Deck n'est
+         * pas calibré ('a' = Accueil ; les lettres y sont sinon ignorées par
+         * meshpay_ui_input_char, donc aucune saisie n'est perdue). */
+        err = wallet_apply_action_locked(MESHPAY_UI_ACTION_HOME, &defer);
     } else if (!tdeck_input_screen(screen) && key >= '1' && key <= '4') {
         /* Écran menu : la touche numérique choisit l'action à cet index. */
         meshpay_ui_view_t v;
@@ -1948,6 +2149,11 @@ static void tdeck_ui_task(void *arg)
             if (s_runtime.lock != NULL &&
                 xSemaphoreTake(s_runtime.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
                 (void)wallet_refresh_payment_peer_locked();
+                if (s_app.ui.screen == MESHPAY_UI_SCREEN_CREDIT) {
+                    /* Revue K : liste des cibles vivante pendant l'affichage
+                     * (une CLAIM arrivée par sync apparaît sans re-entrer). */
+                    (void)wallet_refresh_credit_member_locked();
+                }
                 meshpay_ui_view_t view;
                 esp_err_t err = meshpay_ui_build_view(&s_app.ui, &view);
                 xSemaphoreGive(s_runtime.lock);

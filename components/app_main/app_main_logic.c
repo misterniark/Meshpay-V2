@@ -2037,6 +2037,125 @@ esp_err_t meshpay_app_runtime_claim_initial_credit(meshpay_app_runtime_t *runtim
 }
 
 /*
+ * Chantier crédit fondateur (K3) — émission d'un MINT signé vers un membre.
+ * PRÉ-REQUIS : lock déjà tenu. Miroir discipliné du chemin de paiement :
+ * seq alloué sur le compteur wallet PARTAGÉ avec les TRANSFER (l'espace
+ * (from, seq) est unique tous types confondus — un compteur séparé
+ * collisionnerait avec les paiements du fondateur), persisté AVANT le commit
+ * DAG (Option A), restitué si rien n'a été écrit.
+ */
+static esp_err_t runtime_credit_member_locked(
+    meshpay_app_runtime_t *runtime,
+    const uint8_t to[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    uint32_t amount,
+    uint64_t now_ms)
+{
+    meshpay_app_t *app = runtime->app;
+
+    if (to == NULL || amount == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Le crédit n'existe que chez le fondateur d'une monnaie à descripteur :
+     * c'est le seul compte dont les MINT passent le gate d'ingestion des
+     * pairs (signature vérifiée contre la clé publiée par le descripteur). */
+    if (!app->currency.has_descriptor ||
+        !meshpay_currency_is_mint_authority(&app->currency,
+                                            app->local_destination)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* Cible = un MEMBRE (CLAIM de la fenêtre, annuaire du checkpoint, ou le
+     * fondateur lui-même) : créditer un compte inconnu créerait de la masse
+     * qu'aucune clé publiée ne pourra jamais dépenser (trou noir comptable). */
+    if (!meshpay_currency_is_member(&app->currency, &app->dag, to)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint32_t seq = 0;
+    ESP_RETURN_ON_ERROR(meshpay_wallet_allocate_seq(&app->wallet, &seq),
+                        APP_RUNTIME_TAG, "");
+
+    /* Parents = tips courants, même topologie qu'un paiement (le MINT étend
+     * la DAG au lieu de forker depuis le genesis). */
+    const meshpay_tx_t *tips[MESHPAY_TX_MAX_PARENTS] = {0};
+    size_t tip_count = 0;
+    (void)meshpay_dag_get_tips(&app->dag, tips, MESHPAY_TX_MAX_PARENTS,
+                               &tip_count, NULL);
+    uint8_t parents[MESHPAY_TX_MAX_PARENTS][MESHPAY_TX_PARENT_ID_SIZE];
+    for (size_t i = 0; i < tip_count; ++i) {
+        memcpy(parents[i], tips[i]->id, MESHPAY_TX_PARENT_ID_SIZE);
+    }
+
+    meshpay_tx_t mint;
+    esp_err_t err = meshpay_tx_create_mint(&mint, &app->identity,
+                                           app->local_destination, to, amount,
+                                           seq, app->currency.currency_id,
+                                           tip_count > 0 ? parents : NULL,
+                                           (uint8_t)tip_count, now_ms);
+    if (err == ESP_OK) {
+        /* Validation économique : autorité + signature + plafond max_supply
+         * (en pratique, un refus ici = plafond atteint). */
+        meshpay_currency_result_t verdict =
+            meshpay_currency_validate_tx(&app->currency, &app->dag, &mint);
+        if (verdict != MESHPAY_CURRENCY_OK) {
+            ESP_LOGW(APP_RUNTIME_TAG,
+                     "credit membre refuse (verdict=%d, plafond atteint ?)",
+                     (int)verdict);
+            err = ESP_ERR_INVALID_STATE;
+        }
+    }
+    if (err == ESP_OK) {
+        /* Option A : next_seq persisté AVANT le commit — un seq committé ne
+         * doit jamais pouvoir être réutilisé après un reboot. */
+        err = runtime_persist_wallet_state(runtime);
+    }
+    if (err != ESP_OK) {
+        /* Rien n'a été écrit (ni NVS ni DAG) : le seq alloué est restitué,
+         * même règle que le payment_engine avant persistance. */
+        if (app->wallet.next_seq == seq + 1U) {
+            app->wallet.next_seq = seq;
+        }
+        return err;
+    }
+
+    meshpay_dag_merge_result_t merge = meshpay_dag_merge_tx(&app->dag, &mint);
+    if (merge != MESHPAY_DAG_MERGE_OK) {
+        /* seq DÉJÀ persisté : ne surtout pas le restituer (le réutiliser
+         * forkerait (from, seq)). Signalé, sans crédit — pas d'échec masqué. */
+        ESP_LOGW(APP_RUNTIME_TAG, "merge MINT credit inattendu (%d)",
+                 (int)merge);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Commit-on-send : persistance forcée + diffusion par la sync DAG (un
+     * membre hors ligne sera livré à son retour, comme un paiement). */
+    runtime_dag_mark_dirty(runtime);
+    runtime_dag_flush(runtime, now_ms, true, "credit");
+    (void)runtime_refresh_balance(runtime, now_ms);
+    runtime_set_history_peer(runtime, to);
+    ESP_LOGI(APP_RUNTIME_TAG,
+             "credit membre emis amount=%u seq=%u to=%02x%02x",
+             (unsigned)amount, (unsigned)seq, to[0], to[1]);
+    return ESP_OK;
+}
+
+esp_err_t meshpay_app_runtime_credit_member(
+    meshpay_app_runtime_t *runtime,
+    const uint8_t to[MESHPAY_TX_DESTINATION_HASH_SIZE],
+    uint32_t amount,
+    uint64_t now_ms)
+{
+    if (runtime == NULL || runtime->app == NULL || runtime->lock == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(runtime->lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = runtime_credit_member_locked(runtime, to, amount, now_ms);
+    xSemaphoreGive(runtime->lock);
+    return err;
+}
+
+/*
  * Palier D1 — création de monnaie côté fondateur. PRÉ-REQUIS : lock déjà tenu.
  * Réutilise le chemin d'import (persistance canonique + rollback atomique) et le
  * chemin de crédit initial (CLAIM déterministe), pour ne pas dupliquer ces
@@ -2485,6 +2604,19 @@ static esp_err_t runtime_process_core(meshpay_app_runtime_t *runtime,
     esp_err_t err = ESP_OK;
     if (event->type == MESHPAY_APP_EVENT_CORE_ANNOUNCE) {
         err = meshpay_app_announce(runtime->app);
+    } else if (event->type == MESHPAY_APP_EVENT_CORE_CREDIT) {
+        /* Chantier crédit fondateur (K3) : le verrou est déjà tenu par
+         * process_one — version _locked directe. Un refus (plafond,
+         * non-membre…) remonte à l'écran et n'est PAS fatal pour la boucle. */
+        err = runtime_credit_member_locked(runtime, event->destination,
+                                           event->amount, event->now_ms);
+        if (err == ESP_OK) {
+            (void)meshpay_ui_on_credit_sent(&runtime->app->ui, event->amount);
+        } else {
+            (void)meshpay_ui_on_action_failed(
+                &runtime->app->ui, MESHPAY_UI_FEEDBACK_ACTION_FAILED);
+            err = ESP_OK;
+        }
     } else if (event->type == MESHPAY_APP_EVENT_CORE_PAYMENT) {
         rns_packet_t packet;
         bool payment_ready = false;
