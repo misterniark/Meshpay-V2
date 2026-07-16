@@ -247,14 +247,15 @@ esp_err_t meshpay_payment_engine_create_payment(
 
 static esp_err_t verify_sender_if_known(const meshpay_tx_t *tx)
 {
-    const rns_announce_known_destination_t *known =
-        rns_announce_recall(tx->from);
-    if (known == NULL) {
+    /* Copie de la vue pair (annuaire sous verrou interne) : la clé publique
+     * lue ne peut pas être déchirée par une annonce reçue en parallèle. */
+    rns_announce_peer_info_t known;
+    if (rns_announce_recall_info(tx->from, &known) != ESP_OK) {
         return ESP_OK;
     }
 
     rns_identity_t sender;
-    esp_err_t err = rns_identity_load_public(&sender, known->public_key);
+    esp_err_t err = rns_identity_load_public(&sender, known.public_key);
     if (err == ESP_OK) {
         err = meshpay_tx_verify(tx, &sender);
     }

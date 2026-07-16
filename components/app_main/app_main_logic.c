@@ -71,7 +71,7 @@ static void runtime_refresh_depths(meshpay_app_runtime_t *runtime)
 }
 
 static bool runtime_known_is_local(const meshpay_app_t *app,
-                                   const rns_announce_known_destination_t *known)
+                                   const rns_announce_peer_info_t *known)
 {
     return app == NULL || known == NULL ||
            rns_destination_hash_equal(known->destination_hash,
@@ -97,7 +97,7 @@ static void runtime_peer_label_from_hash(
 }
 
 static void runtime_peer_label_from_known(
-    const rns_announce_known_destination_t *known,
+    const rns_announce_peer_info_t *known,
     char out[MESHPAY_UI_PEER_LABEL_MAX])
 {
     if (out == NULL) {
@@ -126,18 +126,20 @@ static void runtime_peer_label_from_known(
     }
 }
 
-static const rns_announce_known_destination_t *runtime_known_peer_at(
-    const meshpay_app_t *app,
-    uint8_t selected_index,
-    uint8_t *peer_count)
+/* Résout le selected_index-ième pair éligible au paiement dans `out` (copie —
+ * l'annuaire vit sous le verrou interne de rns_announce, jamais de pointeur
+ * vers la table vivante ici). Renvoie true si trouvé ; remplit toujours
+ * peer_count (si non NULL) avec le nombre total d'éligibles. */
+static bool runtime_known_peer_at(const meshpay_app_t *app,
+                                  uint8_t selected_index,
+                                  uint8_t *peer_count,
+                                  rns_announce_peer_info_t *out)
 {
     uint8_t count = 0;
-    const rns_announce_known_destination_t *selected = NULL;
-    size_t known_count = rns_announce_known_count();
-    for (size_t i = 0; i < known_count; ++i) {
-        const rns_announce_known_destination_t *known =
-            rns_announce_known_get(i);
-        if (runtime_known_is_local(app, known)) {
+    bool found = false;
+    rns_announce_peer_info_t known;
+    for (size_t i = 0; rns_announce_known_info(i, &known) == ESP_OK; ++i) {
+        if (runtime_known_is_local(app, &known)) {
             continue;
         }
         /* Palier F2 : sous une monnaie à descripteur, seuls les MEMBRES (CLAIM
@@ -146,18 +148,19 @@ static const rns_announce_known_destination_t *runtime_known_peer_at(
          * monnaie) n'apparaissent plus. Config de repli : maillage ouvert. */
         if (app->currency.has_descriptor &&
             !meshpay_currency_is_member(&app->currency, &app->dag,
-                                        known->destination_hash)) {
+                                        known.destination_hash)) {
             continue;
         }
-        if (count == selected_index) {
-            selected = known;
+        if (count == selected_index && out != NULL) {
+            *out = known;
+            found = true;
         }
         count++;
     }
     if (peer_count != NULL) {
         *peer_count = count;
     }
-    return selected;
+    return found;
 }
 
 static void runtime_refresh_payment_peer(meshpay_app_runtime_t *runtime)
@@ -168,19 +171,22 @@ static void runtime_refresh_payment_peer(meshpay_app_runtime_t *runtime)
 
     uint8_t peer_count = 0;
     uint8_t selected_index = runtime->app->ui.selected_payment_peer;
-    const rns_announce_known_destination_t *known =
-        runtime_known_peer_at(runtime->app, selected_index, &peer_count);
+    rns_announce_peer_info_t known;
+    bool found = runtime_known_peer_at(runtime->app,
+                                       selected_index,
+                                       &peer_count,
+                                       &known);
     if (peer_count == 0) {
         (void)meshpay_ui_set_payment_peer(&runtime->app->ui, "", 0, 0);
         return;
     }
-    if (known == NULL) {
+    if (!found) {
         selected_index = 0;
-        known = runtime_known_peer_at(runtime->app, selected_index, NULL);
+        found = runtime_known_peer_at(runtime->app, selected_index, NULL, &known);
     }
 
     char label[MESHPAY_UI_PEER_LABEL_MAX];
-    runtime_peer_label_from_known(known, label);
+    runtime_peer_label_from_known(found ? &known : NULL, label);
     (void)meshpay_ui_set_payment_peer(&runtime->app->ui,
                                       label,
                                       selected_index,
@@ -196,10 +202,9 @@ static void runtime_set_history_peer(
     }
 
     char label[MESHPAY_UI_PEER_LABEL_MAX];
-    const rns_announce_known_destination_t *known =
-        rns_announce_recall(destination);
-    if (known != NULL) {
-        runtime_peer_label_from_known(known, label);
+    rns_announce_peer_info_t known;
+    if (rns_announce_recall_info(destination, &known) == ESP_OK) {
+        runtime_peer_label_from_known(&known, label);
     } else {
         runtime_peer_label_from_hash(destination, label);
     }
@@ -213,12 +218,9 @@ static void runtime_refresh_known_peers(meshpay_app_runtime_t *runtime)
     }
 
     size_t peers = 0;
-    size_t known_count = rns_announce_known_count();
-    for (size_t i = 0; i < known_count; ++i) {
-        const rns_announce_known_destination_t *known =
-            rns_announce_known_get(i);
-        if (known != NULL &&
-            !rns_destination_hash_equal(known->destination_hash,
+    rns_announce_peer_info_t known;
+    for (size_t i = 0; rns_announce_known_info(i, &known) == ESP_OK; ++i) {
+        if (!rns_destination_hash_equal(known.destination_hash,
                                         runtime->app->local_destination)) {
             peers++;
             /* Sous une config à DESCRIPTEUR, l'autorité MINT est figée (fondateur
@@ -229,7 +231,7 @@ static void runtime_refresh_known_peers(meshpay_app_runtime_t *runtime)
             if (!runtime->app->currency.has_descriptor) {
                 (void)meshpay_currency_add_mint_authority(
                     &runtime->app->currency,
-                    known->destination_hash);
+                    known.destination_hash);
             }
         }
     }
@@ -2445,10 +2447,12 @@ static esp_err_t runtime_process_reticulum(meshpay_app_runtime_t *runtime,
         err = rns_announce_verify_and_remember(&event->packet, NULL);
         if (err == ESP_OK) {
             runtime_refresh_known_peers(runtime);
-            const rns_announce_known_destination_t *known =
-                rns_announce_recall(event->packet.destination_hash);
+            rns_announce_peer_info_t known;
+            bool has_known =
+                rns_announce_recall_info(event->packet.destination_hash,
+                                         &known) == ESP_OK;
             char label[MESHPAY_UI_PEER_LABEL_MAX];
-            runtime_peer_label_from_known(known, label);
+            runtime_peer_label_from_known(has_known ? &known : NULL, label);
             ESP_LOGI(APP_RUNTIME_TAG,
                      "peer announce accepted alias=%s peers=%u",
                      label,
@@ -2621,11 +2625,14 @@ static esp_err_t runtime_process_core(meshpay_app_runtime_t *runtime,
         rns_packet_t packet;
         bool payment_ready = false;
         bool had_pending_before = runtime->app->payments.has_pending;
-        const rns_announce_known_destination_t *known =
-            rns_announce_recall(event->destination);
-        if (known != NULL) {
+        /* Copie de la vue pair : la clé publique du destinataire ne peut pas
+         * être déchirée par une annonce ingérée en parallèle par la radio. */
+        rns_announce_peer_info_t known;
+        bool has_known =
+            rns_announce_recall_info(event->destination, &known) == ESP_OK;
+        if (has_known) {
             rns_identity_t recipient;
-            err = rns_identity_load_public(&recipient, known->public_key);
+            err = rns_identity_load_public(&recipient, known.public_key);
             if (err == ESP_OK) {
                 err = meshpay_payment_engine_create_encrypted_payment(
                     &runtime->app->payments,

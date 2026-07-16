@@ -930,7 +930,7 @@ static esp_err_t wallet_confirm_pin_locked(void)
 }
 
 static bool wallet_known_is_local(
-    const rns_announce_known_destination_t *known)
+    const rns_announce_peer_info_t *known)
 {
     return known == NULL ||
            rns_destination_hash_equal(known->destination_hash,
@@ -938,7 +938,7 @@ static bool wallet_known_is_local(
 }
 
 static void wallet_peer_label_from_known(
-    const rns_announce_known_destination_t *known,
+    const rns_announce_peer_info_t *known,
     char out[MESHPAY_UI_PEER_LABEL_MAX])
 {
     if (out == NULL) {
@@ -969,17 +969,19 @@ static void wallet_peer_label_from_known(
     }
 }
 
-static const rns_announce_known_destination_t *wallet_peer_at_index(
-    uint8_t selected_index,
-    uint8_t *peer_count)
+/* Résout le selected_index-ième pair éligible au paiement dans `out` (copie —
+ * l'annuaire rns_announce est mis à jour par la tâche radio sous son verrou
+ * interne, aucun pointeur vers la table vivante ne doit circuler ici).
+ * Renvoie true si trouvé ; remplit toujours peer_count (si non NULL). */
+static bool wallet_peer_at_index(uint8_t selected_index,
+                                 uint8_t *peer_count,
+                                 rns_announce_peer_info_t *out)
 {
     uint8_t count = 0;
-    const rns_announce_known_destination_t *selected = NULL;
-    size_t known_count = rns_announce_known_count();
-    for (size_t i = 0; i < known_count; ++i) {
-        const rns_announce_known_destination_t *known =
-            rns_announce_known_get(i);
-        if (wallet_known_is_local(known)) {
+    bool found = false;
+    rns_announce_peer_info_t known;
+    for (size_t i = 0; rns_announce_known_info(i, &known) == ESP_OK; ++i) {
+        if (wallet_known_is_local(&known)) {
             continue;
         }
         /* Palier F2 : sous une monnaie à descripteur, seuls les MEMBRES
@@ -987,49 +989,50 @@ static const rns_announce_known_destination_t *wallet_peer_at_index(
          * de paiement. Config de repli : maillage ouvert (inchangé). */
         if (s_app.currency.has_descriptor &&
             !meshpay_currency_is_member(&s_app.currency, &s_app.dag,
-                                        known->destination_hash)) {
+                                        known.destination_hash)) {
             continue;
         }
-        if (count == selected_index) {
-            selected = known;
+        if (count == selected_index && out != NULL) {
+            *out = known;
+            found = true;
         }
         count++;
     }
     if (peer_count != NULL) {
         *peer_count = count;
     }
-    return selected;
+    return found;
 }
 
 static esp_err_t wallet_refresh_payment_peer_locked(void)
 {
     uint8_t peer_count = 0;
     uint8_t selected_index = s_app.ui.selected_payment_peer;
-    const rns_announce_known_destination_t *known =
-        wallet_peer_at_index(selected_index, &peer_count);
+    rns_announce_peer_info_t known;
+    bool found = wallet_peer_at_index(selected_index, &peer_count, &known);
     if (peer_count == 0) {
         return meshpay_ui_set_payment_peer(&s_app.ui, "", 0, 0);
     }
-    if (known == NULL) {
+    if (!found) {
         selected_index = 0;
-        known = wallet_peer_at_index(selected_index, NULL);
+        found = wallet_peer_at_index(selected_index, NULL, &known);
     }
 
     char label[MESHPAY_UI_PEER_LABEL_MAX];
-    wallet_peer_label_from_known(known, label);
+    wallet_peer_label_from_known(found ? &known : NULL, label);
     return meshpay_ui_set_payment_peer(&s_app.ui,
                                        label,
                                        selected_index,
                                        peer_count);
 }
 
-static const rns_announce_known_destination_t *wallet_selected_peer_locked(void)
+static bool wallet_selected_peer_locked(rns_announce_peer_info_t *out)
 {
     if (wallet_refresh_payment_peer_locked() != ESP_OK ||
         s_app.ui.payment_peer_count == 0) {
-        return NULL;
+        return false;
     }
-    return wallet_peer_at_index(s_app.ui.selected_payment_peer, NULL);
+    return wallet_peer_at_index(s_app.ui.selected_payment_peer, NULL, out);
 }
 
 static esp_err_t wallet_confirm_payment_locked(void)
@@ -1039,9 +1042,8 @@ static esp_err_t wallet_confirm_payment_locked(void)
         return ESP_OK;
     }
 
-    const rns_announce_known_destination_t *peer =
-        wallet_selected_peer_locked();
-    if (peer == NULL) {
+    rns_announce_peer_info_t peer;
+    if (!wallet_selected_peer_locked(&peer)) {
         (void)meshpay_ui_on_payment_feedback(&s_app.ui,
                                              MESHPAY_PAYMENT_FEEDBACK_REJECTED,
                                              amount);
@@ -1054,7 +1056,7 @@ static esp_err_t wallet_confirm_payment_locked(void)
         .amount = amount,
     };
     memcpy(event.destination,
-           peer->destination_hash,
+           peer.destination_hash,
            sizeof(event.destination));
     esp_err_t err = meshpay_app_runtime_post(&s_runtime,
                                              MESHPAY_APP_QUEUE_CORE,
@@ -1117,10 +1119,11 @@ static void wallet_credit_member_label(
     const uint8_t account[MESHPAY_TX_DESTINATION_HASH_SIZE],
     char out[MESHPAY_UI_PEER_LABEL_MAX])
 {
-    const rns_announce_known_destination_t *known =
-        rns_announce_recall(account);
-    if (known != NULL) {
-        wallet_peer_label_from_known(known, out);
+    /* Copie de la vue pair (annuaire sous verrou interne de rns_announce) :
+     * le libellé ne peut pas être déchiré par une annonce reçue en parallèle. */
+    rns_announce_peer_info_t known;
+    if (rns_announce_recall_info(account, &known) == ESP_OK) {
+        wallet_peer_label_from_known(&known, out);
         return;
     }
     (void)snprintf(out, MESHPAY_UI_PEER_LABEL_MAX, "membre %02x%02x",

@@ -1,8 +1,52 @@
 #include "meshpay/rns/rns_announce.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include <string.h>
 
+/* Annuaire des destinations connues. ÉCRIT par la tâche radio (poll →
+ * verify_and_remember), LU par les tâches UI/core : tout accès passe sous
+ * s_known_lock, et les lectures sortent des COPIES (jamais de pointeur vers la
+ * table vivante). Un portMUX (initialisation statique, pas de fonction d'init
+ * à séquencer) convient : les sections sont courtes — scan de 16 entrées et
+ * memcpy ≤ ~450 octets, quelques µs — et le SHA-256 du paquet est calculé
+ * HORS section critique. */
 static rns_announce_known_destination_t s_known[RNS_ANNOUNCE_KNOWN_DESTINATIONS_MAX];
+static portMUX_TYPE s_known_lock = portMUX_INITIALIZER_UNLOCKED;
+
+/* Recherche du slot d'une destination. À appeler UNIQUEMENT sous
+ * s_known_lock ; le pointeur renvoyé ne doit jamais sortir de la section
+ * critique de l'appelant. */
+static rns_announce_known_destination_t *find_known_locked(
+    const uint8_t destination_hash[RNS_DESTINATION_HASH_SIZE])
+{
+    for (size_t i = 0; i < RNS_ANNOUNCE_KNOWN_DESTINATIONS_MAX; ++i) {
+        if (s_known[i].in_use &&
+            rns_destination_hash_equal(s_known[i].destination_hash,
+                                       destination_hash)) {
+            return &s_known[i];
+        }
+    }
+    return NULL;
+}
+
+/* Remplit une vue légère depuis un slot occupé (troncature d'app_data à la
+ * capacité de la vue). À appeler UNIQUEMENT sous s_known_lock. */
+static void fill_peer_info_locked(const rns_announce_known_destination_t *entry,
+                                  rns_announce_peer_info_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    memcpy(out->destination_hash, entry->destination_hash,
+           RNS_DESTINATION_HASH_SIZE);
+    memcpy(out->public_key, entry->public_key, RNS_ANNOUNCE_PUBLIC_KEY_SIZE);
+    size_t len = entry->app_data_len;
+    if (len > RNS_ANNOUNCE_PEER_INFO_APP_DATA_MAX) {
+        len = RNS_ANNOUNCE_PEER_INFO_APP_DATA_MAX;
+    }
+    memcpy(out->app_data, entry->app_data, len);
+    out->app_data_len = len;
+}
 
 static bool bytes_zero(const uint8_t *data, size_t len)
 {
@@ -287,6 +331,16 @@ esp_err_t rns_announce_verify_and_remember(const rns_packet_t *packet,
         return err;
     }
 
+    /* Le hash du paquet (SHA-256) est calculé AVANT la section critique :
+     * jamais de crypto sous verrou. En cas d'échec, la table n'est pas
+     * touchée — plus besoin du rollback historique. */
+    uint8_t packet_hash[RNS_CRYPTO_SHA256_SIZE];
+    err = rns_packet_hash(packet, packet_hash);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    taskENTER_CRITICAL(&s_known_lock);
     size_t slot = RNS_ANNOUNCE_KNOWN_DESTINATIONS_MAX;
     for (size_t i = 0; i < RNS_ANNOUNCE_KNOWN_DESTINATIONS_MAX; ++i) {
         if (s_known[i].in_use &&
@@ -294,6 +348,9 @@ esp_err_t rns_announce_verify_and_remember(const rns_packet_t *packet,
             if (!rns_crypto_constant_equal(s_known[i].public_key,
                                            decoded.public_key,
                                            RNS_ANNOUNCE_PUBLIC_KEY_SIZE)) {
+                /* Collision destination/clé : on refuse SANS modifier le slot
+                 * existant (usurpation d'identité annoncée). */
+                taskEXIT_CRITICAL(&s_known_lock);
                 return ESP_ERR_INVALID_STATE;
             }
             slot = i;
@@ -304,6 +361,7 @@ esp_err_t rns_announce_verify_and_remember(const rns_packet_t *packet,
         }
     }
     if (slot == RNS_ANNOUNCE_KNOWN_DESTINATIONS_MAX) {
+        taskEXIT_CRITICAL(&s_known_lock);
         return ESP_ERR_NO_MEM;
     }
 
@@ -314,11 +372,8 @@ esp_err_t rns_announce_verify_and_remember(const rns_packet_t *packet,
     memcpy(entry->public_key, decoded.public_key, RNS_ANNOUNCE_PUBLIC_KEY_SIZE);
     memcpy(entry->app_data, decoded.app_data, decoded.app_data_len);
     entry->app_data_len = decoded.app_data_len;
-    err = rns_packet_hash(packet, entry->packet_hash);
-    if (err != ESP_OK) {
-        memset(entry, 0, sizeof(*entry));
-        return err;
-    }
+    memcpy(entry->packet_hash, packet_hash, sizeof(packet_hash));
+    taskEXIT_CRITICAL(&s_known_lock);
 
     if (out != NULL) {
         memcpy(out, &decoded, sizeof(decoded));
@@ -328,45 +383,80 @@ esp_err_t rns_announce_verify_and_remember(const rns_packet_t *packet,
 
 void rns_announce_known_reset(void)
 {
+    taskENTER_CRITICAL(&s_known_lock);
     rns_crypto_secure_zero(s_known, sizeof(s_known));
+    taskEXIT_CRITICAL(&s_known_lock);
 }
 
 size_t rns_announce_known_count(void)
 {
     size_t count = 0;
+    taskENTER_CRITICAL(&s_known_lock);
     for (size_t i = 0; i < RNS_ANNOUNCE_KNOWN_DESTINATIONS_MAX; ++i) {
         if (s_known[i].in_use) {
             count++;
         }
     }
+    taskEXIT_CRITICAL(&s_known_lock);
     return count;
 }
 
-const rns_announce_known_destination_t *rns_announce_known_get(size_t index)
+esp_err_t rns_announce_recall_copy(
+    const uint8_t destination_hash[RNS_DESTINATION_HASH_SIZE],
+    rns_announce_known_destination_t *out)
 {
+    if (destination_hash == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    taskENTER_CRITICAL(&s_known_lock);
+    const rns_announce_known_destination_t *entry =
+        find_known_locked(destination_hash);
+    if (entry != NULL) {
+        memcpy(out, entry, sizeof(*out));
+        err = ESP_OK;
+    }
+    taskEXIT_CRITICAL(&s_known_lock);
+    return err;
+}
+
+esp_err_t rns_announce_recall_info(
+    const uint8_t destination_hash[RNS_DESTINATION_HASH_SIZE],
+    rns_announce_peer_info_t *out)
+{
+    if (destination_hash == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    taskENTER_CRITICAL(&s_known_lock);
+    const rns_announce_known_destination_t *entry =
+        find_known_locked(destination_hash);
+    if (entry != NULL) {
+        fill_peer_info_locked(entry, out);
+        err = ESP_OK;
+    }
+    taskEXIT_CRITICAL(&s_known_lock);
+    return err;
+}
+
+esp_err_t rns_announce_known_info(size_t index, rns_announce_peer_info_t *out)
+{
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    taskENTER_CRITICAL(&s_known_lock);
     size_t seen = 0;
     for (size_t i = 0; i < RNS_ANNOUNCE_KNOWN_DESTINATIONS_MAX; ++i) {
         if (s_known[i].in_use) {
             if (seen == index) {
-                return &s_known[i];
+                fill_peer_info_locked(&s_known[i], out);
+                err = ESP_OK;
+                break;
             }
             seen++;
         }
     }
-    return NULL;
-}
-
-const rns_announce_known_destination_t *rns_announce_recall(
-    const uint8_t destination_hash[RNS_DESTINATION_HASH_SIZE])
-{
-    if (destination_hash == NULL) {
-        return NULL;
-    }
-    for (size_t i = 0; i < RNS_ANNOUNCE_KNOWN_DESTINATIONS_MAX; ++i) {
-        if (s_known[i].in_use &&
-            rns_destination_hash_equal(s_known[i].destination_hash, destination_hash)) {
-            return &s_known[i];
-        }
-    }
-    return NULL;
+    taskEXIT_CRITICAL(&s_known_lock);
+    return err;
 }
